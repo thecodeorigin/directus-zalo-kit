@@ -1,35 +1,14 @@
 {
-	"name": "directus-endpoint-boilerplate",
-	"description": "Please enter a description for your extension",
-	"icon": "extension",
-	"version": "1.0.0",
-	"keywords": [
-		"directus",
-		"directus-extension",
-		"directus-extension-endpoint"
-	],
-	"type": "module",
-	"files": [
-		"dist"
-	],
-	"directus:extension": {
-		"type": "endpoint",
-		"path": "dist/index.js",
-		"source": "src/index.ts",
-		"host": "^10.10.0"
-	},
-	"scripts": {
-		"build": "directus-extension build",
-		"dev": "directus-extension build -w --no-minify",
-		"link": "directus-extension link",
-		"validate": "directus-extension validate"
-	},
-	"devDependencies": {
-		"@antfu/eslint-config": "^5.4.1",
-		"@directus/extensions-sdk": "16.0.2",
-		"@types/node": "^24.5.2",
-		"eslint": "^9.36.0",
-		"typescript": "^5.9.2",
-		"vitest": "^3.2.4"
-	}
+  "name": "thecodeorigin-directus-extension-boilerplate",
+  "type": "module",
+  "devDependencies": {
+    "@antfu/eslint-config": "catalog:",
+    "@directus/extensions-sdk": "catalog:",
+    "@types/node": "catalog:",
+    "@vue/tsconfig": "catalog:",
+    "eslint": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:",
+    "vue": "catalog:"
+  }
 }
