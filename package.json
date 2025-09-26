@@ -52,7 +52,10 @@
       {
         "type": "operation",
         "name": "directus-operation-boilerplate",
-        "source": "src/operation/index.ts"
+        "source": {
+          "app": "src/operation/app.ts",
+          "api": "src/operation/api.ts"
+        }
       },
       {
         "type": "panel",
