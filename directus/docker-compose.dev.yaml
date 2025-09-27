@@ -70,7 +70,7 @@ services:
 
       DB_CLIENT: "pg"
       DB_HOST: database
-      DB_PORT: 5432
+      DB_PORT: ${DB_PORT:-5432}
       DB_USER: ${DB_USER}
       DB_PASSWORD: ${DB_PASSWORD}
       DB_DATABASE: ${DB_DATABASE}
@@ -85,8 +85,8 @@ services:
       PUBLIC_URL: ${PUBLIC_URL}
 
       # Email Configuration (points to MailHog)
-      EMAIL_TRANSPORT: ${EMAIL_TRANSPORT}
-      EMAIL_FROM: ${EMAIL_FROM}
+      EMAIL_TRANSPORT: smtp
+      EMAIL_FROM: noreply@example.com
       EMAIL_SMTP_HOST: mailhog
       EMAIL_SMTP_PORT: 1025
       EMAIL_SMTP_SECURE: false
