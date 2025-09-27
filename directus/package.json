@@ -1,8 +1,0 @@
-{
-  "scripts": {
-    "dev": "docker compose up -d"
-  },
-  "devDependencies": {
-    "@types/node": "catalog:"
-  }
-}

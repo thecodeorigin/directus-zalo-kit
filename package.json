@@ -5,7 +5,8 @@
   "author": "",
   "keywords": [],
   "scripts": {
-    "database:create": "bun --env-file=.env run create.ts"
+    "database:create": "bun --env-file=.env run create.ts",
+    "dev": "docker compose -f ./directus/docker-compose.dev.yaml up -d && pnpm -F @thecodeorigin/directus-extension-kit dev"
   },
   "directus:template": {
     "name": "CMS",

@@ -1,7 +1,40 @@
-name: directus-helpcenter-template
+name: directus-extension-development-sandbox
+
 services:
+  database:
+    image: postgres:18
+    ports:
+      - "${DB_PORT_EXTERNAL:-5432}:5432"
+    volumes:
+      - ./docker/postgres_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_DATABASE}
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${ADMIN_EMAIL}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD}
+    ports:
+      - "8080:80"
+    volumes:
+      - ./docker/pgadmin_data:/var/lib/pgadmin
+    depends_on:
+      database:
+        condition: service_healthy
+    restart: always
+
   cache:
-    image: redis:6
+    image: redis:8.0
+    restart: always
     healthcheck:
       test: ["CMD-SHELL", "[ $$(redis-cli ping) = 'PONG' ]"]
       interval: 10s
@@ -10,67 +43,72 @@ services:
       start_interval: 5s
       start_period: 30s
 
+  mailhog:
+    image: mailhog/mailhog
+    ports:
+      - "1025:1025" # SMTP port
+      - "8025:8025" # Web UI port
+    restart: always
+
   directus:
-    image: directus/directus:11.7.2
+    image: directus/directus:latest
     ports:
       - ${DIRECTUS_PORT}:8055
     volumes:
-      - ./uploads:/directus/uploads
+      - ./docker/uploads:/directus/uploads
       - ./extensions:/directus/extensions
       - ./template:/directus/template
     depends_on:
       cache:
         condition: service_healthy
+      database:
+        condition: service_healthy
+      mailhog:
+        condition: service_started
     environment:
       SECRET: ${DIRECTUS_SECRET}
 
       DB_CLIENT: "pg"
-      DB_CONNECTION_STRING: ${DB_CONNECTION_STRING}
+      DB_HOST: database
+      DB_PORT: 5432
       DB_USER: ${DB_USER}
       DB_PASSWORD: ${DB_PASSWORD}
       DB_DATABASE: ${DB_DATABASE}
 
-      CACHE_ENABLED: ${CACHE_ENABLED}
-      CACHE_AUTO_PURGE: ${CACHE_AUTO_PURGE}
+      CACHE_ENABLED: ${CACHE_ENABLED:-true}
       CACHE_STORE: "redis"
       REDIS: "redis://cache:6379"
 
       ADMIN_EMAIL: ${ADMIN_EMAIL}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD}
 
-      WEBSOCKETS_ENABLED: ${WEBSOCKETS_ENABLED}
-
       PUBLIC_URL: ${PUBLIC_URL}
 
-      CORS_ENABLED: ${CORS_ENABLED}
-      CORS_ORIGIN: ${CORS_ORIGIN}
-
-      REFRESH_TOKEN_COOKIE_SECURE: ${REFRESH_TOKEN_COOKIE_SECURE}
-      REFRESH_TOKEN_COOKIE_SAME_SITE: ${REFRESH_TOKEN_COOKIE_SAME_SITE}
-      REFRESH_TOKEN_DOMAIN: ${REFRESH_TOKEN_COOKIE_DOMAIN}
-
-      SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE}
-      SESSION_COOKIE_SAME_SITE: ${SESSION_COOKIE_SAME_SITE}
-      SESSION_COOKIE_DOMAIN: ${SESSION_COOKIE_DOMAIN}
-
-      EXTENSIONS_PATH: ${EXTENSIONS_PATH}
-      EXTENSIONS_AUTO_RELOAD: ${EXTENSIONS_AUTO_RELOAD}
-
-      CONTENT_SECURITY_POLICY_DIRECTIVES__FRAME_SRC: ${CONTENT_SECURITY_POLICY_DIRECTIVES__FRAME_SRC}
-
+      # Email Configuration (points to MailHog)
       EMAIL_TRANSPORT: ${EMAIL_TRANSPORT}
       EMAIL_FROM: ${EMAIL_FROM}
-      EMAIL_SMTP_HOST: ${EMAIL_SMTP_HOST}
-      EMAIL_SMTP_PORT: ${EMAIL_SMTP_PORT}
-      EMAIL_SMTP_USER: ${EMAIL_SMTP_USER}
-      EMAIL_SMTP_PASSWORD: ${EMAIL_SMTP_PASSWORD}
+      EMAIL_SMTP_HOST: mailhog
+      EMAIL_SMTP_PORT: 1025
+      EMAIL_SMTP_SECURE: false
+
+      # Other Settings
+      WEBSOCKETS_ENABLED: ${WEBSOCKETS_ENABLED:-true}
+      CORS_ENABLED: ${CORS_ENABLED:-true}
+      CORS_ORIGIN: ${CORS_ORIGIN:-true}
+      EXTENSIONS_PATH: /directus/extensions
+      EXTENSIONS_AUTO_RELOAD: ${EXTENSIONS_AUTO_RELOAD:-true}
+      REFRESH_TOKEN_COOKIE_SECURE: false
+      SESSION_COOKIE_SECURE: false
+
   directus-template-applier:
-    image: oven/bun:1.1.13-alpine
+    image: oven/bun:1.2-alpine
     volumes:
       - ./template:/directus/template
       - ./apply-template.ts:/directus/apply-template.ts
     command: sh -c "apk update && apk add curl && bun run /directus/apply-template.ts"
     restart: "no"
+    depends_on:
+      - directus
     environment:
       ADMIN_EMAIL: ${ADMIN_EMAIL}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD}
