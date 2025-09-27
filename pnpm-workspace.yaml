@@ -1,0 +1,13 @@
+packages:
+  - 'directus/**'
+  - nuxt
+catalog:
+  '@antfu/eslint-config': ^5.4.1
+  '@directus/extensions-sdk': ^16.0.2
+  '@neondatabase/api-client': ^2.2.0
+  '@types/node': ^24.5.2
+  '@vue/tsconfig': ^0.8.1
+  eslint: ^9.36.0
+  typescript: ^5.9.2
+  vitest: ^3.2.4
+  vue: ^3.5.22

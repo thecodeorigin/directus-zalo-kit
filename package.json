@@ -1,90 +1,32 @@
 {
-  "name": "@thecodeorigin/directus-extension-kit",
-  "type": "module",
+  "name": "directus-extension-kit-development-sandbox",
   "version": "1.0.0",
-  "description": "Please enter a description for your extension",
-  "keywords": [
-    "directus",
-    "directus-extension",
-    "directus-extension-bundle"
-  ],
-  "icon": "extension",
-  "files": [
-    "dist"
-  ],
-  "directus:extension": {
-    "type": "bundle",
-    "path": {
-      "app": "dist/app.js",
-      "api": "dist/api.js"
-    },
-    "entries": [
-      {
-        "type": "display",
-        "name": "directus-display-boilerplate",
-        "source": "src/display/index.ts"
-      },
-      {
-        "type": "endpoint",
-        "name": "directus-endpoint-boilerplate",
-        "source": "src/endpoint/index.ts"
-      },
-      {
-        "type": "hook",
-        "name": "directus-hook-boilerplate",
-        "source": "src/hook/index.ts"
-      },
-      {
-        "type": "interface",
-        "name": "directus-interface-boilerplate",
-        "source": "src/interface/index.ts"
-      },
-      {
-        "type": "layout",
-        "name": "directus-layout-boilerplate",
-        "source": "src/layout/index.ts"
-      },
-      {
-        "type": "module",
-        "name": "directus-module-boilerplate",
-        "source": "src/module/index.ts"
-      },
-      {
-        "type": "operation",
-        "name": "directus-operation-boilerplate",
-        "source": {
-          "app": "src/operation/app.ts",
-          "api": "src/operation/api.ts"
-        }
-      },
-      {
-        "type": "panel",
-        "name": "directus-panel-boilerplate",
-        "source": "src/panel/index.ts"
-      },
-      {
-        "type": "theme",
-        "name": "directus-theme-boilerplate",
-        "source": "src/theme/index.ts"
-      }
-    ],
-    "host": "^10.10.0"
-  },
+  "description": "",
+  "author": "",
+  "keywords": [],
   "scripts": {
-    "build": "directus-extension build",
-    "dev": "directus-extension build -w --no-minify",
-    "link": "directus-extension link",
-    "validate": "directus-extension validate",
-    "lint": "eslint ."
+    "database:create": "bun --env-file=.env run create.ts"
+  },
+  "directus:template": {
+    "name": "CMS",
+    "description": "A ready-to-use CMS with block builder, visual editing, and integration with your favorite framework. ",
+    "template": "./directus/template",
+    "frontends": {
+      "nuxt": {
+        "name": "Nuxt",
+        "path": "./nuxt"
+      }
+    }
   },
   "devDependencies": {
-    "@antfu/eslint-config": "^5.4.1",
-    "@directus/extensions-sdk": "^16.0.2",
-    "@types/node": "^24.5.2",
-    "@vue/tsconfig": "^0.8.1",
-    "eslint": "^9.36.0",
-    "typescript": "^5.9.2",
-    "vitest": "^3.2.4",
-    "vue": "^3.5.22"
+    "@antfu/eslint-config": "catalog:",
+    "@directus/extensions-sdk": "catalog:",
+    "@neondatabase/api-client": "catalog:",
+    "@types/node": "catalog:",
+    "@vue/tsconfig": "catalog:",
+    "eslint": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:",
+    "vue": "catalog:"
   }
 }
