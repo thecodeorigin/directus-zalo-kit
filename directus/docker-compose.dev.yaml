@@ -2,9 +2,9 @@ name: directus-extension-development-sandbox
 
 services:
   database:
-    image: postgres:18
+    image: postgres:17
     ports:
-      - "${DB_PORT_EXTERNAL:-5432}:5432"
+      - "${DB_PORT:-5432}:5432"
     volumes:
       - ./docker/postgres_data:/var/lib/postgresql/data
     environment:
