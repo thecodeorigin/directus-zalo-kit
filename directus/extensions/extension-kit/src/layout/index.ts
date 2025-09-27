@@ -4,7 +4,7 @@ import LayoutComponent from './layout.vue'
 
 export default defineLayout({
   id: 'custom',
-  name: 'Custom',
+  name: 'Custom Layout',
   icon: 'box',
   component: LayoutComponent,
   slots: {

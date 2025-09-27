@@ -3,7 +3,7 @@ import ModuleComponent from './module.vue'
 
 export default defineModule({
   id: 'custom',
-  name: 'Custom',
+  name: 'Custom Module',
   icon: 'box',
   routes: [
     {

@@ -3,7 +3,7 @@ import InterfaceComponent from './interface.vue'
 
 export default defineInterface({
   id: 'custom',
-  name: 'Custom',
+  name: 'Custom Interface',
   icon: 'box',
   description: 'This is my custom interface!',
   component: InterfaceComponent,

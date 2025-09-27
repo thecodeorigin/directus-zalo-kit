@@ -2,7 +2,7 @@ import { defineOperationApp } from '@directus/extensions-sdk'
 
 export default defineOperationApp({
   id: 'custom',
-  name: 'Custom',
+  name: 'Custom Operation App',
   icon: 'box',
   description: 'This is my custom operation!',
   overview: ({ text }) => [

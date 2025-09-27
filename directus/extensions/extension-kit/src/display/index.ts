@@ -3,7 +3,7 @@ import DisplayComponent from './display.vue'
 
 export default defineDisplay({
   id: 'custom',
-  name: 'Custom',
+  name: 'Custom Display',
   icon: 'box',
   description: 'This is my custom display!',
   component: DisplayComponent,

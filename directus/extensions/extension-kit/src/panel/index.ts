@@ -3,7 +3,7 @@ import PanelComponent from './panel.vue'
 
 export default definePanel({
   id: 'custom',
-  name: 'Custom',
+  name: 'Custom Panel',
   icon: 'box',
   description: 'This is my custom panel!',
   component: PanelComponent,
