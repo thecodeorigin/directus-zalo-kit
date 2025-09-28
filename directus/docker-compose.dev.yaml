@@ -49,13 +49,25 @@ services:
       - "1025:1025" # SMTP port
       - "8025:8025" # Web UI port
     restart: always
+  
+  localstack:
+    image: localstack/localstack:latest
+    ports:
+      - "4566:4566"
+    environment:
+      - SERVICES=s3
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_DEFAULT_REGION=us-east-1
+    volumes:
+      - ./docker/localstack_data:/var/lib/localstack
+      - ./scripts/docker-init:/etc/localstack/init/ready.d
 
   directus:
     image: directus/directus:latest
     ports:
       - ${DIRECTUS_PORT}:8055
     volumes:
-      - ./docker/uploads:/directus/uploads
       - ./extensions:/directus/extensions
       - ./template:/directus/template
     depends_on:
@@ -64,6 +76,8 @@ services:
       database:
         condition: service_healthy
       mailhog:
+        condition: service_started
+      localstack:
         condition: service_started
     environment:
       SECRET: ${DIRECTUS_SECRET}
@@ -75,6 +89,7 @@ services:
       DB_PASSWORD: ${DB_PASSWORD}
       DB_DATABASE: ${DB_DATABASE}
 
+      SYNCHRONIZATION_STORE: "redis"
       CACHE_ENABLED: ${CACHE_ENABLED:-true}
       CACHE_STORE: "redis"
       REDIS: "redis://cache:6379"
@@ -83,6 +98,16 @@ services:
       ADMIN_PASSWORD: ${ADMIN_PASSWORD}
 
       PUBLIC_URL: ${PUBLIC_URL}
+
+      # S3 Configuration for LocalStack
+      STORAGE_LOCATIONS: "s3"
+      STORAGE_S3_DRIVER: "s3"
+      STORAGE_S3_KEY: "test"
+      STORAGE_S3_SECRET: "test"
+      STORAGE_S3_BUCKET: "directus-uploads"
+      STORAGE_S3_REGION: "us-east-1"
+      STORAGE_S3_ENDPOINT: "http://localstack:4566"
+      STORAGE_S3_FORCE_PATH_STYLE: "true"
 
       # Email Configuration (points to MailHog)
       EMAIL_TRANSPORT: smtp
