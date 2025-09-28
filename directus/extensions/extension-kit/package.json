@@ -26,12 +26,12 @@
       },
       {
         "type": "endpoint",
-        "name": "directus-endpoint-boilerplate",
+        "name": "zalo",
         "source": "src/endpoint/index.ts"
       },
       {
         "type": "hook",
-        "name": "directus-hook-boilerplate",
+        "name": "zalo-hook",
         "source": "src/hook/index.ts"
       },
       {
@@ -46,7 +46,7 @@
       },
       {
         "type": "module",
-        "name": "directus-module-boilerplate",
+        "name": "zalo-module",
         "source": "src/module/index.ts"
       },
       {
