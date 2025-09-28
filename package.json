@@ -22,12 +22,21 @@
   "devDependencies": {
     "@antfu/eslint-config": "catalog:",
     "@directus/extensions-sdk": "catalog:",
+    "@directus/shared": "catalog:",
+    "@directus/types": "catalog:",
     "@neondatabase/api-client": "catalog:",
     "@types/node": "catalog:",
+    "@types/qrcode-terminal": "catalog:",
     "@vue/tsconfig": "catalog:",
     "eslint": "catalog:",
+    "open": "catalog:",
+    "qrcode-terminal": "catalog:",
+    "ts-pattern": "catalog:",
+    "tsx": "catalog:",
+    "type-fest": "^5.0.1",
     "typescript": "catalog:",
     "vitest": "catalog:",
-    "vue": "catalog:"
+    "vue": "catalog:",
+    "zca-js": "catalog:"
   }
 }
