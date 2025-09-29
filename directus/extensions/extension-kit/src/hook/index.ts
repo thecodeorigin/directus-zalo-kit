@@ -1,90 +1,275 @@
-/* eslint-disable no-console */
-import { defineHook } from "@directus/extensions-sdk";
-import { ZaloService } from "../endpoint/services/ZaloService";
+// index.ts (Hook file)
+import { defineHook } from '@directus/extensions-sdk'
+import { ZaloService } from '../endpoint/services/ZaloService'
 
-export default defineHook(
-  ({ init, action }, { services, database, getSchema }) => {
-    // Initialize Zalo tables if they don't exist
-    init("app.before", async () => {
-      try {
-        const hasZaloTables = await database.schema.hasTable("zalo_users");
+export default defineHook(({ action, init, schedule }, { services, getSchema, logger }) => {
+  const { ItemsService, FlowsService } = services
+  let zaloService: ZaloService | null = null
 
-        if (!hasZaloTables) {
-          console.log("🔄 Installing Zalo Extension tables...");
+  // 1. Initialize ZaloService after server starts
+  init('app.after', async () => {
+    try {
+      const schema = await getSchema()
 
-          const { up } = await import(
-            "./migrations/20250928210000_initiate_zalo_tables.js"
-          );
-          await up(database);
-
-          console.log("Zalo Extension tables created successfully!");
-        } else {
-          console.log("Zalo Extension tables already exist.");
-        }
-      } catch (error) {
-        console.error("Error initializing Zalo Extension:", error);
-        throw error;
-      }
-    });
-
-    // Listen for new Zalo messages emitted by our service
-    action("zalo.message.new", async ({ payload }, { schema }) => {
-      if (!schema) {
-        console.error("Schema is not available in the action context.");
-        return;
+      // Custom emitter that triggers Directus actions
+      const emitter = (event: string, payload: any) => {
+        logger.info(`Event triggered: ${event}`, payload)
       }
 
-      const zaloMessagesService = new services.ItemsService("zalo_messages", {
-        schema,
-      });
-      const zaloUsersService = new services.ItemsService("zalo_users", {
-        schema,
-      });
-      const zaloConvosService = new services.ItemsService(
-        "zalo_conversations",
-        { schema }
-      );
+      zaloService = ZaloService.getInstance(emitter, schema)
+      logger.info('Zalo Hook initialized successfully')
 
-      try {
-        const sender = payload.sender;
-        const conversation = payload.thread;
-
-        // 1. Upsert (update or insert) the sender
-        await zaloUsersService.upsertOne({
-          id: sender.id,
-          display_name: sender.name,
-          avatar: sender.profilePicture,
-          last_updated: new Date().toISOString(),
-        });
-
-        // 2. Upsert the conversation
-        await zaloConvosService.upsertOne({
-          id: conversation.id,
-          display_name: conversation.name,
-          is_group: conversation.isGroup,
-          last_updated: new Date().toISOString(),
-        });
-
-        // 3. Create the new message
-        await zaloMessagesService.createOne({
-          id: payload.messageId,
-          content: payload.body,
-          sender: sender.id,
-          conversation: conversation.id,
-          sent_at: new Date(payload.timestamp).toISOString(),
-          type: payload.type,
-        });
-
-        console.log(`Synced message ${payload.messageId} to database.`);
-      } catch (error) {
-        console.error("Failed to sync Zalo message:", error);
+      // Auto-login if configured
+      const autoLogin = process.env.ZALO_AUTO_LOGIN === 'true'
+      if (autoLogin) {
+        setTimeout(() => {
+          zaloService?.initiateLogin().catch((err) => {
+            logger.error('Auto-login failed:', err)
+          })
+        }, 5000)
       }
-    });
+    }
+    catch (error) {
+      logger.error('Failed to initialize Zalo Hook:', error)
+    }
+  })
 
-    // You can add more listeners here, e.g., for reactions
-    action("zalo.reaction.new", ({ payload }) => {
-      console.log("Reaction sync logic not yet implemented.", payload);
-      // TODO: Implement logic to add/update a reaction on a message
-    });
+  // 2. Handle new messages
+  action('zalo.message.new', async ({ payload, accountability }) => {
+    logger.info(`New Zalo message received: ${payload.msgId}`)
+
+    try {
+      // Save message to database
+      const messagesService = new ItemsService('zalo_messages', {
+        schema: await getSchema(),
+        accountability,
+      })
+
+      await messagesService.createOne({
+        message_id: payload.msgId,
+        thread_id: payload.threadId,
+        sender_id: payload.senderId,
+        content: payload.content,
+        message_type: payload.type,
+        attachments: payload.attachments,
+        timestamp: new Date(payload.timestamp),
+        status: 'received',
+        raw_data: payload,
+      })
+
+      // Trigger flows if configured
+      await triggerFlows('zalo_message_received', payload)
+
+      // Process commands if message starts with '/'
+      if (payload.content?.startsWith('/')) {
+        await processCommand(payload)
+      }
+    }
+    catch (error) {
+      logger.error('Error processing message:', error)
+    }
+  })
+
+  // 3. Handle reactions
+  action('zalo.reaction.new', async ({ payload, accountability }) => {
+    logger.info(`New reaction on message: ${payload.msgId}`)
+
+    try {
+      const reactionsService = new ItemsService('zalo_reactions', {
+        schema: await getSchema(),
+        accountability,
+      })
+
+      await reactionsService.createOne({
+        message_id: payload.msgId,
+        reactor_id: payload.reactorId,
+        reaction: payload.reaction,
+        timestamp: new Date(payload.timestamp),
+        raw_data: payload,
+      })
+
+      // Trigger flows if configured
+      await triggerFlows('zalo_reaction_received', payload)
+    }
+    catch (error) {
+      logger.error('Error processing reaction:', error)
+    }
+  })
+
+  // 4. Handle QR code generation
+  action('zalo.qr.generated', async ({ payload }) => {
+    logger.info('QR code generated for login')
+
+    try {
+      const settingsService = new ItemsService('zalo_settings', {
+        schema: await getSchema(),
+      })
+
+      // Update QR code in settings
+      await settingsService.updateOne(1, {
+        qr_code: payload.qrCode,
+        login_status: 'pending_qr',
+        last_qr_generated: new Date(),
+      })
+    }
+    catch (error) {
+      logger.error('Error saving QR code:', error)
+    }
+  })
+
+  // 5. Handle successful login
+  action('zalo.login.success', async ({ payload }) => {
+    logger.info(`Zalo login successful. User ID: ${payload.userId}`)
+
+    try {
+      const settingsService = new ItemsService('zalo_settings', {
+        schema: await getSchema(),
+      })
+
+      await settingsService.updateOne(1, {
+        user_id: payload.userId,
+        login_status: 'logged_in',
+        qr_code: null,
+        last_login: new Date(),
+      })
+
+      // Trigger flows
+      await triggerFlows('zalo_login_success', payload)
+    }
+    catch (error) {
+      logger.error('Error updating login status:', error)
+    }
+  })
+
+  // 6. Handle errors
+  action('zalo.error', async ({ payload }) => {
+    logger.error(`Zalo error: ${payload.type}`, payload.error)
+
+    try {
+      const logsService = new ItemsService('zalo_logs', {
+        schema: await getSchema(),
+      })
+
+      await logsService.createOne({
+        log_type: 'error',
+        error_type: payload.type,
+        message: payload.error?.message || 'Unknown error',
+        details: payload,
+        timestamp: new Date(),
+      })
+    }
+    catch (error) {
+      logger.error('Error logging Zalo error:', error)
+    }
+  })
+
+  // 7. Handle connection lost
+  action('zalo.connection.lost', async () => {
+    logger.warn('Zalo connection lost')
+
+    try {
+      const settingsService = new ItemsService('zalo_settings', {
+        schema: await getSchema(),
+      })
+
+      await settingsService.updateOne(1, {
+        login_status: 'disconnected',
+        last_disconnect: new Date(),
+      })
+
+      // Notify administrators
+      await triggerFlows('zalo_connection_lost', {})
+    }
+    catch (error) {
+      logger.error('Error handling connection loss:', error)
+    }
+  })
+
+  // 8. Schedule periodic health checks
+  schedule('*/5 * * * *', async () => {
+    if (!zaloService)
+      return
+
+    const status = zaloService.getStatus()
+    logger.debug('Zalo health check:', status)
+
+    try {
+      const settingsService = new ItemsService('zalo_settings', {
+        schema: await getSchema(),
+      })
+
+      await settingsService.updateOne(1, {
+        health_check: new Date(),
+        is_listening: status.isListening,
+        current_status: status.status,
+      })
+
+      // Auto-reconnect if disconnected
+      if (status.status === 'logged_out' && process.env.ZALO_AUTO_RECONNECT === 'true') {
+        logger.info('Attempting auto-reconnect...')
+        await zaloService.initiateLogin()
+      }
+    }
+    catch (error) {
+      logger.error('Health check error:', error)
+    }
+  })
+
+  // Helper function to trigger Directus flows
+  async function triggerFlows(trigger: string, payload: any) {
+    try {
+      const flowsService = new FlowsService({
+        schema: await getSchema(),
+      })
+
+      const flows = await flowsService.readByQuery({
+        filter: {
+          status: { _eq: 'active' },
+          trigger: { _eq: trigger },
+        },
+      })
+
+      for (const flow of flows) {
+        await (flowsService as any).run(flow.id, {
+          payload,
+        })
+      }
+    }
+    catch (error) {
+      logger.error(`Error triggering flows for ${trigger}:`, error)
+    }
   }
-);
+
+  // Process command messages
+  async function processCommand(message: any) {
+    const command = message.content.split(' ')[0].substring(1).toLowerCase()
+
+    switch (command) {
+      case 'status': {
+        const status = zaloService?.getStatus()
+        await zaloService?.sendMessage(
+          message.threadId,
+          `🤖 Bot Status:\nStatus: ${status?.status}\nUser ID: ${status?.userId || 'Not logged in'}\nListening: ${status?.isListening ? 'Yes' : 'No'}`,
+        )
+        break
+      }
+
+      case 'help': {
+        await zaloService?.sendMessage(
+          message.threadId,
+          `📋 Available Commands:\n/status - Check bot status\n/help - Show this help message\n/ping - Test bot response`,
+        )
+        break
+      }
+
+      case 'ping': {
+        await zaloService?.sendMessage(message.threadId, '🏓 Pong!')
+        break
+      }
+
+      default: {
+        logger.debug(`Unknown command: ${command}`)
+      }
+    }
+  }
+})
