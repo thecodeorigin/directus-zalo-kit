@@ -119,8 +119,6 @@ importers:
 
   directus/extensions/extension-kit: {}
 
-  directus/template: {}
-
 packages:
 
   '@antfu/eslint-config@5.4.1':

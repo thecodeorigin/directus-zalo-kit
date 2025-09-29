@@ -1,3 +1,4 @@
+// endpoint/index
 import { defineEndpoint } from '@directus/extensions-sdk'
 import { ZaloService } from './services/ZaloService'
 
