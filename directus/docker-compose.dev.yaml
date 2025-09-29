@@ -69,6 +69,7 @@ services:
       - ${DIRECTUS_PORT}:8055
     volumes:
       - ./extensions:/directus/extensions
+      - ./migrations:/directus/migrations
       - ./template:/directus/template
     depends_on:
       cache:
@@ -121,6 +122,7 @@ services:
       CORS_ENABLED: ${CORS_ENABLED:-true}
       CORS_ORIGIN: ${CORS_ORIGIN:-true}
       EXTENSIONS_PATH: /directus/extensions
+      MIGRATIONS_PATH: /directus/migrations
       EXTENSIONS_AUTO_RELOAD: ${EXTENSIONS_AUTO_RELOAD:-true}
       REFRESH_TOKEN_COOKIE_SECURE: false
       SESSION_COOKIE_SECURE: false
