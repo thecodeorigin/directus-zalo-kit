@@ -133,7 +133,7 @@ services:
         for file in /directus/schema/*.json; do
           if [ -f \"$$file\" ]; then
             echo \"Applying schema from $$file...\";
-            npx directus schema apply --yes \"$$file\";
+            (npx directus schema apply --yes \"$$file\" || true);
           fi
         done &&
         echo \"All schemas applied. Starting Directus...\" &&
