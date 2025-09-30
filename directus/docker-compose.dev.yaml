@@ -64,15 +64,14 @@ services:
       - ./scripts/docker-init:/etc/localstack/init/ready.d
 
   directus:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: directus/directus:latest
     ports:
       - ${DIRECTUS_PORT}:8055
     volumes:
+      - ./schema:/directus/schema
       - ./extensions:/directus/extensions
-      - ./schema-sync:/directus/schema-sync
       - ./migrations:/directus/migrations
+      - ./templates:/directus/templates
     depends_on:
       cache:
         condition: service_healthy
@@ -128,17 +127,15 @@ services:
       EXTENSIONS_AUTO_RELOAD: ${EXTENSIONS_AUTO_RELOAD:-true}
       REFRESH_TOKEN_COOKIE_SECURE: false
       SESSION_COOKIE_SECURE: false
-
-  directus-template-applier:
-    image: oven/bun:1.2-alpine
-    volumes:
-      - ./template:/directus/template
-      - ./apply-template.ts:/directus/apply-template.ts
-    command: sh -c "apk update && apk add curl && bun run /directus/apply-template.ts"
-    restart: "no"
-    depends_on:
-      - directus
-    environment:
-      ADMIN_EMAIL: ${ADMIN_EMAIL}
-      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
-      DIRECTUS_URL: "http://directus:8055"
+    command: >
+      sh -c "
+        npx directus bootstrap &&
+        for file in /directus/schema/*.json; do
+          if [ -f \"$$file\" ]; then
+            echo \"Applying schema from $$file...\";
+            npx directus schema apply --yes \"$$file\";
+          fi
+        done &&
+        echo \"All schemas applied. Starting Directus...\" &&
+        npx directus start
+      "
