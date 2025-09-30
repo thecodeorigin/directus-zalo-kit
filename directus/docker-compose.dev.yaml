@@ -49,7 +49,7 @@ services:
       - "1025:1025" # SMTP port
       - "8025:8025" # Web UI port
     restart: always
-  
+
   localstack:
     image: localstack/localstack:latest
     ports:
@@ -64,13 +64,15 @@ services:
       - ./scripts/docker-init:/etc/localstack/init/ready.d
 
   directus:
-    image: directus/directus:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
     ports:
       - ${DIRECTUS_PORT}:8055
     volumes:
       - ./extensions:/directus/extensions
+      - ./schema-sync:/directus/schema-sync
       - ./migrations:/directus/migrations
-      - ./template:/directus/template
     depends_on:
       cache:
         condition: service_healthy
