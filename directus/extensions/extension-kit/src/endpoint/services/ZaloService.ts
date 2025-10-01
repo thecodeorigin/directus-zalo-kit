@@ -1,298 +1,216 @@
 // ZaloService.ts
-import type { SchemaOverview } from '@directus/types'
+import fs from 'node:fs'
+import path from 'node:path'
 import { match, P } from 'ts-pattern'
 import { LoginQRCallbackEventType, Zalo } from 'zca-js'
 
-type EmitterLike = (event: string, payload: any) => void
-
-interface ZaloMessage {
-  msgId: string
-  threadId: string
-  senderId: string
-  content: string
-  timestamp: number
-  type: string
-  attachments?: any[]
-}
-
-interface ZaloReaction {
-  msgId: string
-  reactorId: string
-  reaction: string
-  timestamp: number
+interface ZaloSession {
+  userId: string
+  loginTime: string
+  isActive: boolean
 }
 
 export class ZaloService {
   private static instance: ZaloService
-  private zalo = new Zalo({ selfListen: true, checkUpdate: false })
+  private zalo: Zalo
   private api: any = null
-  private emitter: EmitterLike
-  private schema: SchemaOverview
   private status: 'logged_out' | 'pending_qr' | 'logged_in' = 'logged_out'
   private qrCode: string | null = null
-  private loginResolver: ((value: any) => void) | null = null
-  private listenerStarted = false
-  private reconnectAttempts = 0
-  private maxReconnectAttempts = 5
-  private reconnectDelay = 5000
 
-  private constructor(emitter: EmitterLike, schema: SchemaOverview) {
-    this.emitter = emitter
-    this.schema = schema
-    console.log('ZaloService initialized')
+  private sessionFile: string
+
+  private constructor() {
+    this.sessionFile = path.join(
+      process.env.ZALO_SESSION_PATH || '/directus/storage',
+      'zalo-session.json',
+    )
+
+    // Sử dụng dataPath cho session persistence của zca-js
+    const zaloDataPath = process.env.ZALO_SESSION_PATH || '/directus/storage'
+    this.zalo = new Zalo({
+      selfListen: true,
+      checkUpdate: false,
+      dataPath: zaloDataPath,
+    })
+
+    console.log('[Zalo] Initialized')
+    console.log(`[Zalo] Session file: ${this.sessionFile}`)
+    this.loadOldSession()
   }
 
-  public static getInstance(emitter?: EmitterLike, schema?: SchemaOverview) {
-    if (!ZaloService.instance && emitter && schema) {
-      ZaloService.instance = new ZaloService(emitter, schema)
-    }
+  public static getInstance(): ZaloService {
     if (!ZaloService.instance) {
-      throw new Error('ZaloService must be initialized first')
+      ZaloService.instance = new ZaloService()
     }
     return ZaloService.instance
   }
 
+  // Load session cũ khi khởi động
+  private loadOldSession(): void {
+    try {
+      if (!fs.existsSync(this.sessionFile)) {
+        console.log('[Zalo] No session file found')
+        return
+      }
+
+      const data = fs.readFileSync(this.sessionFile, 'utf-8')
+      const session: ZaloSession = JSON.parse(data)
+
+      // Check còn hợp lệ không (24h)
+      const age = Date.now() - new Date(session.loginTime).getTime()
+      if (age > 24 * 60 * 60 * 1000) {
+        console.log('[Zalo] Session expired')
+        fs.unlinkSync(this.sessionFile)
+        return
+      }
+
+      console.log(`[Zalo] Found session: ${session.userId}`)
+      console.log('[Zalo] Need to re-login with QR')
+    }
+    catch (err) {
+      console.error('[Zalo] Load session error:', err)
+    }
+  }
+
+  // Lưu session vào file
+  private saveSessionToFile(userId: string): void {
+    try {
+      const dir = path.dirname(this.sessionFile)
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true })
+      }
+
+      const session: ZaloSession = {
+        userId,
+        loginTime: new Date().toISOString(),
+        isActive: true,
+      }
+
+      fs.writeFileSync(
+        this.sessionFile,
+        JSON.stringify(session, null, 2),
+        'utf-8',
+      )
+
+      console.log(`[Zalo] Session saved: ${userId}`)
+    }
+    catch (err) {
+      console.error('[Zalo] Save session error:', err)
+    }
+  }
+
+  // Đăng nhập
+  public async login(): Promise<{
+    success: boolean
+    userId?: string
+    qrCode?: string
+  }> {
+    if (this.status === 'logged_in') {
+      return { success: true, userId: this.api?.getOwnId?.() }
+    }
+
+    if (this.status === 'pending_qr') {
+      return { success: false, qrCode: this.qrCode || undefined }
+    }
+
+    console.log('[Zalo] Starting login...')
+    this.status = 'pending_qr'
+
+    return new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        console.log('[Zalo] Login timeout')
+        this.status = 'logged_out'
+        resolve({ success: false })
+      }, 120000)
+
+      this.zalo
+        .loginQR({}, async (response) => {
+          match(response)
+            .with(
+              {
+                type: LoginQRCallbackEventType.QRCodeGenerated,
+                data: { image: P.select(P.string) },
+              },
+              (qrImage) => {
+                console.log('[Zalo] QR generated')
+                this.qrCode = qrImage
+                resolve({ success: false, qrCode: qrImage })
+              },
+            )
+            .with({ type: LoginQRCallbackEventType.QRCodeScanned }, () => {
+              console.log('[Zalo] QR scanned')
+            })
+            .with({ type: LoginQRCallbackEventType.QRCodeExpired }, () => {
+              console.log('[Zalo] QR expired')
+              clearTimeout(timeout)
+              this.status = 'logged_out'
+            })
+            .with({ type: LoginQRCallbackEventType.QRCodeDeclined }, () => {
+              console.log('[Zalo] QR declined')
+              clearTimeout(timeout)
+              this.status = 'logged_out'
+            })
+            .otherwise(() => {})
+        })
+        .then((api) => {
+          clearTimeout(timeout)
+          this.api = api
+          this.status = 'logged_in'
+          this.qrCode = null
+
+          const userId = this.api?.getOwnId?.() || 'unknown'
+          console.log(`[Zalo] Logged in: ${userId}`)
+
+          // LƯU SESSION
+          this.saveSessionToFile(userId)
+        })
+        .catch((err) => {
+          clearTimeout(timeout)
+          console.error('[Zalo] Login error:', err)
+          this.status = 'logged_out'
+        })
+    })
+  }
+
+  // Logout
+  public async logout(): Promise<void> {
+    if (this.api) {
+      try {
+        await this.api.logout()
+        if (fs.existsSync(this.sessionFile)) {
+          fs.unlinkSync(this.sessionFile)
+        }
+        console.log('[Zalo] Logged out')
+      }
+      catch (err) {
+        console.error('[Zalo] Logout error:', err)
+      }
+    }
+    this.api = null
+    this.status = 'logged_out'
+    this.qrCode = null
+  }
+
+  // Get status
   public getStatus() {
     return {
       status: this.status,
       qrCode: this.qrCode,
-      isListening: this.listenerStarted,
-      userId: this.api?.getOwnId() || null,
+      userId: this.api?.getOwnId?.() || null,
     }
   }
 
-  public async initiateLogin(): Promise<void> {
-    if (this.status === 'logged_in') {
-      console.log('Already logged in.')
-      return
-    }
-
-    if (this.status === 'pending_qr') {
-      console.log('Login already in progress.')
-      return
-    }
-
-    this.status = 'pending_qr'
-    console.log('Starting Zalo QR login...')
-
-    const loginPromise = new Promise<any>((resolve, reject) => {
-      this.loginResolver = resolve
-
-      // Set timeout for login
-      const timeout = setTimeout(() => {
-        reject(new Error('Login timeout'))
-        this.reset()
-      }, 120000) // 2 minutes timeout
-
-      this.zalo.loginQR({}, async (response) => {
-        match(response)
-          .with(
-            { type: LoginQRCallbackEventType.QRCodeGenerated, data: { image: P.select(P.string) } },
-            (qrImage) => {
-              console.log('QR code received.')
-              this.qrCode = qrImage
-              // Emit QR code event for UI
-              this.emitter('zalo.qr.generated', { qrCode: qrImage })
-            },
-          )
-          .with({ type: LoginQRCallbackEventType.QRCodeScanned }, () => {
-            console.log('QR code has been scanned. Waiting for user confirmation...')
-            this.emitter('zalo.qr.scanned', {})
-          })
-          .with({ type: LoginQRCallbackEventType.QRCodeExpired }, () => {
-            console.error('QR code has expired. Login failed.')
-            clearTimeout(timeout)
-            this.emitter('zalo.qr.expired', {})
-            this.reset()
-          })
-          .with({ type: LoginQRCallbackEventType.QRCodeDeclined }, () => {
-            console.error('User declined the login request. Login failed.')
-            clearTimeout(timeout)
-            this.emitter('zalo.qr.declined', {})
-            this.reset()
-          })
-          .otherwise(() => {
-            console.log('Received login event:', LoginQRCallbackEventType[response.type])
-          })
-      })
-        .then((api) => {
-          clearTimeout(timeout)
-          if (this.loginResolver) {
-            this.loginResolver(api)
-          }
-        })
-        .catch((err) => {
-          clearTimeout(timeout)
-          console.error('Zalo login failed:', err)
-          reject(err)
-          this.reset()
-        })
-    })
-
+  // Get session info
+  public async getSessionInfo(): Promise<ZaloSession | null> {
     try {
-      this.api = await loginPromise
-      this.status = 'logged_in'
-      this.qrCode = null
-      const userId = this.api.getOwnId()
-      console.log(`Successfully logged in as: ${userId}`)
-
-      // Emit login success event
-      this.emitter('zalo.login.success', { userId })
-
-      // Start listening for messages
-      this.startListener()
-    }
-    catch (error: unknown) {
-      const errMsg = error instanceof Error ? error.message : String(error)
-      console.error('Error processing message:', errMsg)
-      this.emitter('zalo.error', { type: 'message_processing', error: errMsg })
-    }
-  }
-
-  private startListener() {
-    if (!this.api || this.listenerStarted)
-      return
-
-    console.log('Starting Zalo listener')
-    this.listenerStarted = true
-
-    try {
-      this.api.listener
-        .on('message', (msg: any) => {
-          try {
-            const messageData: ZaloMessage = this.parseMessage(msg.data)
-            console.log(`New message from: ${messageData.content}`)
-            this.emitter('zalo.message.new', messageData)
-          }
-          catch (error) {
-            console.error('Error processing message:', error)
-            this.emitter('zalo.error', { type: 'message_processing', error })
-          }
-        })
-        .on('reaction', (react: any) => {
-          try {
-            const reactionData: ZaloReaction = this.parseReaction(react.data)
-            console.log(`New reaction on message ${reactionData.msgId}`)
-            this.emitter('zalo.reaction.new', reactionData)
-          }
-          catch (error) {
-            console.error('Error processing reaction:', error)
-            this.emitter('zalo.error', { type: 'reaction_processing', error })
-          }
-        })
-        .on('error', (error: any) => {
-          console.error('Listener error:', error)
-          this.emitter('zalo.error', { type: 'listener_error', error })
-          this.handleListenerError()
-        })
-        .start()
-
-      console.log('Zalo listener started successfully')
-      this.emitter('zalo.listener.started', {})
-      this.reconnectAttempts = 0
-    }
-    catch (error) {
-      console.error('Failed to start listener:', error)
-      this.listenerStarted = false
-      this.handleListenerError()
-    }
-  }
-
-  private parseMessage(rawData: any): ZaloMessage {
-    // Parse and validate message data
-    return {
-      msgId: rawData.msgId || rawData.messageId,
-      threadId: rawData.threadId || rawData.conversationId,
-      senderId: rawData.senderId || rawData.from,
-      content: rawData.content || rawData.text || '',
-      timestamp: rawData.timestamp || Date.now(),
-      type: rawData.type || 'text',
-      attachments: rawData.attachments || [],
-    }
-  }
-
-  private parseReaction(rawData: any): ZaloReaction {
-    // Parse and validate reaction data
-    return {
-      msgId: rawData.msgId || rawData.messageId,
-      reactorId: rawData.reactorId || rawData.userId,
-      reaction: rawData.reaction || rawData.emoji,
-      timestamp: rawData.timestamp || Date.now(),
-    }
-  }
-
-  private handleListenerError() {
-    if (this.reconnectAttempts < this.maxReconnectAttempts) {
-      this.reconnectAttempts++
-      console.log(`Attempting to reconnect... (${this.reconnectAttempts}/${this.maxReconnectAttempts})`)
-
-      setTimeout(() => {
-        this.restartListener()
-      }, this.reconnectDelay * this.reconnectAttempts)
-    }
-    else {
-      console.error('Max reconnection attempts reached. Please re-login.')
-      this.emitter('zalo.connection.lost', {})
-      this.reset()
-    }
-  }
-
-  private restartListener() {
-    if (this.api && this.api.listener) {
-      try {
-        this.api.listener.stop()
-        this.listenerStarted = false
-        this.startListener()
+      if (!fs.existsSync(this.sessionFile)) {
+        return null
       }
-      catch (error) {
-        console.error('Failed to restart listener:', error)
-        this.handleListenerError()
-      }
+      const data = fs.readFileSync(this.sessionFile, 'utf-8')
+      return JSON.parse(data)
     }
-  }
-
-  public async sendMessage(threadId: string, content: string, options?: any): Promise<any> {
-    if (!this.api) {
-      throw new Error('Not logged in')
+    catch (err) {
+      return null
     }
-
-    try {
-      const result = await this.api.sendMessage(content, threadId, options)
-      this.emitter('zalo.message.sent', { threadId, content, messageId: result })
-      return result
-    }
-    catch (error) {
-      console.error('Failed to send message:', error)
-      this.emitter('zalo.message.send_failed', { threadId, content, error })
-      throw error
-    }
-  }
-
-  public async logout(): Promise<void> {
-    if (this.api) {
-      try {
-        if (this.api.listener) {
-          this.api.listener.stop()
-        }
-        await this.api.logout()
-        console.log('Logged out successfully')
-        this.emitter('zalo.logout', {})
-      }
-      catch (error) {
-        console.error('Logout error:', error)
-      }
-      finally {
-        this.reset()
-      }
-    }
-  }
-
-  private reset(): void {
-    this.api = null
-    this.status = 'logged_out'
-    this.qrCode = null
-    this.loginResolver = null
-    this.listenerStarted = false
-    this.reconnectAttempts = 0
   }
 }
