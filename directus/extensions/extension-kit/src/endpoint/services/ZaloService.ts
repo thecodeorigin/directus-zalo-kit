@@ -1,6 +1,4 @@
 import type { SchemaOverview } from '@directus/types'
-import fs from 'node:fs'
-import path from 'node:path'
 import Redis from 'ioredis'
 import { match, P } from 'ts-pattern'
 import { LoginQRCallbackEventType, ThreadType, Zalo } from 'zca-js'
@@ -59,7 +57,7 @@ export class ZaloService {
 
     setTimeout(() => {
       void this.tryRestoreSession()
-    }, 1000)
+    }, 10000)
   }
 
   private getRedisKey(userId: string): string {
@@ -400,80 +398,6 @@ export class ZaloService {
     }
   }
 
-  // Đăng nhập
-  public async login(): Promise<{
-    success: boolean
-    userId?: string
-    qrCode?: string
-  }> {
-    if (this.status === 'logged_in') {
-      return { success: true, userId: this.api?.getOwnId?.() }
-    }
-
-    if (this.status === 'pending_qr') {
-      return { success: false, qrCode: this.qrCode || undefined }
-    }
-
-    console.log('[Zalo] Starting login...')
-    this.status = 'pending_qr'
-
-    return new Promise((resolve) => {
-      const timeout = setTimeout(() => {
-        console.log('[Zalo] Login timeout')
-        this.status = 'logged_out'
-        resolve({ success: false })
-      }, 120000)
-
-      this.zalo
-        .loginQR({}, async (response) => {
-          match(response)
-            .with(
-              {
-                type: LoginQRCallbackEventType.QRCodeGenerated,
-                data: { image: P.select(P.string) },
-              },
-              (qrImage) => {
-                console.log('[Zalo] QR generated')
-                this.qrCode = qrImage
-                resolve({ success: false, qrCode: qrImage })
-              },
-            )
-            .with({ type: LoginQRCallbackEventType.QRCodeScanned }, () => {
-              console.log('[Zalo] QR scanned')
-            })
-            .with({ type: LoginQRCallbackEventType.QRCodeExpired }, () => {
-              console.log('[Zalo] QR expired')
-              clearTimeout(timeout)
-              this.status = 'logged_out'
-            })
-            .with({ type: LoginQRCallbackEventType.QRCodeDeclined }, () => {
-              console.log('[Zalo] QR declined')
-              clearTimeout(timeout)
-              this.status = 'logged_out'
-            })
-            .otherwise(() => {})
-        })
-        .then((api) => {
-          clearTimeout(timeout)
-          this.api = api
-          this.status = 'logged_in'
-          this.qrCode = null
-
-          const userId = this.api?.getOwnId?.() || 'unknown'
-          console.log(`[Zalo] Logged in: ${userId}`)
-
-          // LƯU SESSION
-          this.saveSessionToFile(userId)
-        })
-        .catch((err) => {
-          clearTimeout(timeout)
-          console.error('[Zalo] Login error:', err)
-          this.status = 'logged_out'
-        })
-    })
-  }
-
-  // Get status
   public getStatus() {
     return {
       status: this.status,
@@ -668,13 +592,43 @@ export class ZaloService {
     this.pendingLoginData = null
 
     this.startListener()
+    this.startKeepAlive()
+
+    console.log('Waiting for API to stabilize ....')
+    await new Promise(resolve => setTimeout(resolve, 2000))
 
     try {
+      if (!this.api) {
+        console.error('[ZaloService] API is not initialized after login success')
+        return
+      }
+
+      if (typeof this.api.getAllGroups !== 'function') {
+        console.error('[ZaloService] API does not have getAllGroups function')
+        console.error('[ZaloService] Available API methods:', Object.keys(this.api || {}))
+        return
+      }
+
+      console.log('[ZaloService] API validation passed, starting sync...')
+
+      // Sync user info
       await this.fetchAndUpsertUser(userId)
+      console.log('[ZaloService] User info synced')
+
+      // Sync groups
+      console.log('[ZaloService] Starting group sync...')
       await this.syncGroupAvatars()
+      console.log('[ZaloService] Group sync completed successfully')
     }
-    catch (err) {
-      console.warn('[ZaloService] Sync after login failed:', err)
+    catch (err: any) {
+      console.error('[ZaloService] Sync after login failed:', err.message)
+      console.error('[ZaloService] Error stack:', err.stack)
+      console.error('[ZaloService] API state:', {
+        hasApi: !!this.api,
+        apiType: typeof this.api,
+        hasGetAllGroups: typeof this.api?.getAllGroups,
+        hasGetGroupInfo: typeof this.api?.getGroupInfo,
+      })
     }
   }
 
@@ -860,52 +814,64 @@ export class ZaloService {
   }
 
   private startListener() {
-    if (!this.api || this.listenerStarted) {
+    if (!this.api || this.listenerStarted)
       return
-    }
-    this.listenerStarted = true
 
+    this.listenerStarted = true
     try {
       this.api.listener
         .on('message', async (msg: any) => {
           try {
             await this.handleIncomingMessage(msg.data || msg)
           }
-          catch (err) {
-            console.error('[ZaloService] Error handling message:', err)
+          catch (error) {
+            console.error('[ZaloService] Error handling message:', error)
           }
         })
         .on('reaction', async (react: any) => {
           try {
             await this.handleIncomingReaction(react.data || react)
           }
-          catch (err) {
-            console.error('[ZaloService] Error handling reaction:', err)
+          catch (error) {
+            console.error('[ZaloService] Error handling reaction:', error)
           }
         })
-        .on('error', async (err: any) => {
-          console.error('[ZaloService] Listener error:', err)
-          if (err.message.includes('Another connection is opened')) {
-            console.warn(
-              '[ZaloService] Detected duplicate connection, cleaning up',
-            )
-            await this.cleanup()
-            this.handleListenerError()
-          }
-          else {
-            this.handleListenerError()
-          }
+        .on('error', async (error: any) => {
+          console.error('[ZaloService] Listener error:', error)
+          this.handleListenerError()
         })
         .start()
 
       this.reconnectAttempts = 0
-      console.log('[ZaloService] Listener started')
     }
     catch (err) {
       this.listenerStarted = false
       console.error('[ZaloService] startListener failed:', err)
       this.handleListenerError()
     }
+  }
+
+  private startKeepAlive() {
+    if (this.keepAliveInterval)
+      return
+    this.keepAliveInterval = setInterval(async () => {
+      if (this.status !== 'logged_in' || !this.api)
+        return
+      try {
+        const ownId = this.api.getOwnId()
+        if (ownId) {
+          await this.api.getUserInfo(ownId)
+        }
+        else {
+          console.warn('[ZaloService] Skip keep-alive: No ownId available')
+        }
+        console.log('[ZaloService] Internal keep-alive ping sent via getUserInfo')
+      }
+      catch (err) {
+        console.error('[ZaloService] Keep-alive error:', err)
+        this.handleListenerError()
+      }
+    }, 1800000) // 30 minutes
   }
 
   private async handleIncomingMessage(rawData: any) {
@@ -961,89 +927,95 @@ export class ZaloService {
         }
       }
 
-  private startKeepAlive() {
-    if (this.keepAliveInterval)
-      return
-    this.keepAliveInterval = setInterval(async () => {
-      if (this.status !== 'logged_in' || !this.api)
-        return
-      try {
-        const ownId = this.api.getOwnId()
-        if (ownId) {
-          await this.api.getUserInfo(ownId)
-        }
-        else {
-          console.warn('[ZaloService] Skip keep-alive: No ownId available')
-        }
-        console.log('[ZaloService] Internal keep-alive ping sent via getUserInfo')
-      }
-      catch (err) {
-        console.error('[ZaloService] Keep-alive error:', err)
-        this.handleListenerError()
-      }
-    }, 1800000) // 30 minutes
-  }
-
-  private async handleIncomingMessage(rawData: any) {
-    try {
-      const schema = await this.getSchemaFn()
-      if (!schema || Object.keys(schema).length === 0) {
-        console.error('[ZaloService] Schema is empty or invalid')
-        return
-      }
-
-      const messageId = rawData.msgId
-      const senderId = rawData.uidFrom
-      const recipientId = rawData.idTo
-      const timestamp = Number.parseInt(
-        rawData.ts ?? rawData.t ?? `${Date.now()}`,
-      )
-      const clientMsgId = rawData.cliMsgId
-
       let content = ''
       let attachments: any[] = []
 
       if (typeof rawData.content === 'string') {
         content = rawData.content
+
         if (content.startsWith('/')) {
           await this.handleQuickMessage(content, recipientId, senderId)
         }
       }
-      else if (
-        typeof rawData.content === 'object'
-        && rawData.content !== null
-      ) {
-        const parsedParams = this.parseParams(rawData.content.params)
-        attachments = [this.createAttachmentObject(rawData, parsedParams)]
+      else if (typeof rawData.content === 'object' && rawData.content !== null) {
+        let parsedParams: any = {}
+        if (rawData.content.params) {
+          try {
+            parsedParams = JSON.parse(rawData.content.params)
+          }
+          catch {
+            console.warn('[ZaloService] Failed to parse params')
+          }
+        }
+
+        const attachment = {
+          title: rawData.content.title,
+          fileName: rawData.content.title,
+          name: rawData.content.title,
+          url: rawData.content.href,
+          href: rawData.content.href,
+          link: rawData.content.href,
+          thumb: rawData.content.thumb,
+          thumbnailUrl: rawData.content.thumb,
+          fileSize: parsedParams.fileSize ? Number.parseInt(parsedParams.fileSize) : null,
+          size: parsedParams.fileSize ? Number.parseInt(parsedParams.fileSize) : null,
+          fileExt: parsedParams.fileExt,
+          checksum: parsedParams.checksum,
+          type: rawData.msgType,
+          mimeType: this.getMimeTypeFromExtension(parsedParams.fileExt),
+          metadata: {
+            ...rawData.content,
+            parsedParams,
+          },
+        }
+
+        attachments = [attachment]
         content = rawData.content.description || rawData.content.title || ''
       }
 
-      const conversationId = this.getConversationId(senderId, recipientId)
+      let conversationId: string
+      if (isGroupMessage && groupId) {
+        conversationId = groupId
+      }
+      else {
+        const userIds = [senderId, recipientId].sort()
+        conversationId = `direct_${userIds[0]}_${userIds[1]}`
+      }
+
       await this.startSync(conversationId)
 
-      await this.upsertConversation(
-        conversationId,
-        rawData,
-        schema,
-        senderId,
-        recipientId,
-      )
+      await this.upsertConversation(conversationId, rawData, schema, senderId, recipientId)
+
       await this.fetchAndUpsertUser(senderId, schema)
 
-      if (recipientId && recipientId !== senderId) {
+      if (isGroupMessage && groupId) {
+        await this.ensureGroupMember(groupId, senderId, schema)
+      }
+
+      if (!isGroupMessage && recipientId && recipientId !== senderId) {
         await this.fetchAndUpsertUser(recipientId, schema)
       }
 
-      await this.createMessage(
-        messageId,
-        clientMsgId,
-        conversationId,
-        senderId,
+      const messageData = {
+        id: messageId,
+        client_id: clientMsgId || messageId,
+        conversation_id: conversationId,
+        sender_id: senderId,
         content,
-        rawData,
-        timestamp,
-        schema,
-      )
+        raw_data: rawData,
+        mentions: null,
+        forward_from_message_id: null,
+        reply_to_message_id: null,
+        is_edited: false,
+        is_undone: false,
+        sent_at: new Date(timestamp),
+        received_at: new Date(),
+        edited_at: null,
+        message_type: isGroupMessage ? 'group' : 'direct',
+        websocket_broadcast: true,
+      }
+
+      await messagesService.createOne(messageData)
 
       if (attachments.length > 0) {
         await this.createAttachments(messageId, attachments, schema)
@@ -1737,6 +1709,10 @@ export class ZaloService {
 
   private async syncGroupAvatars() {
     try {
+      if (!this.api || typeof this.api.getAllGroups !== 'function') {
+        console.error('[ZaloService] API not ready for syncGroupAvatars')
+        return
+      }
       const response = await this.api.getAllGroups()
 
       if (!response || !response.gridVerMap) {
@@ -2571,8 +2547,6 @@ export class ZaloService {
         console.error('[ZaloService] restartListener failed', err)
         this.handleListenerError()
       }
-      const data = fs.readFileSync(this.sessionFile, 'utf-8')
-      return JSON.parse(data)
     }
     else {
       this.handleListenerError()
@@ -2689,160 +2663,6 @@ export class ZaloService {
     }
     catch {
       return raw
-    }
-  }
-
-  private parseParams(params: any): any {
-    if (!params)
-      return {}
-    try {
-      return JSON.parse(params)
-    }
-    catch {
-      console.warn('[ZaloService] Failed to parse params')
-      return {}
-    }
-  }
-
-  private createAttachmentObject(rawData: any, parsedParams: any): any {
-    return {
-      title: rawData.content.title,
-      fileName: rawData.content.title,
-      name: rawData.content.title,
-      url: rawData.content.href,
-      href: rawData.content.href,
-      link: rawData.content.href,
-      thumb: rawData.content.thumb,
-      thumbnailUrl: rawData.content.thumb,
-      fileSize: parsedParams.fileSize
-        ? Number.parseInt(parsedParams.fileSize)
-        : null,
-      size: parsedParams.fileSize
-        ? Number.parseInt(parsedParams.fileSize)
-        : null,
-      fileExt: parsedParams.fileExt,
-      checksum: parsedParams.checksum,
-      type: rawData.msgType,
-      mimeType: this.getMimeTypeFromExtension(parsedParams.fileExt),
-      metadata: {
-        ...rawData.content,
-        parsedParams,
-      },
-    }
-  }
-
-  private getConversationId(senderId: string, recipientId: string): string {
-    const userIds = [senderId, recipientId].filter(Boolean).sort()
-    return userIds.length === 2
-      ? `direct_${userIds[0]}_${userIds[1]}`
-      : `thread_${recipientId || senderId}`
-  }
-
-  private async createMessage(
-    messageId: string,
-    clientMsgId: string,
-    conversationId: string,
-    senderId: string,
-    content: string,
-    rawData: any,
-    timestamp: number,
-    schema: SchemaOverview,
-  ) {
-    const messagesService = new this.ItemsService('zalo_messages', {
-      schema,
-      accountability: this.systemAccountability,
-    })
-
-    const existingMessages = await messagesService.readByQuery({
-      filter: { id: { _eq: messageId } },
-      limit: 1,
-    })
-
-    if (existingMessages.length === 0) {
-      await messagesService.createOne({
-        id: messageId,
-        client_id: clientMsgId || messageId,
-        conversation_id: conversationId,
-        sender_id: senderId,
-        content,
-        raw_data: rawData,
-        mentions: null,
-        forward_from_message_id: null,
-        reply_to_message_id: null,
-        is_edited: false,
-        is_undone: false,
-        sent_at: new Date(timestamp),
-        received_at: new Date(),
-        edited_at: null,
-      })
-    }
-  }
-
-  private async sendMessageSafe(
-    messageData: any,
-    threadId: string,
-    fallbackThreadId?: string,
-  ) {
-    try {
-      await this.sendMessage(messageData, threadId)
-    }
-    catch (error: any) {
-      if (
-        (error.code === 114 || error.message?.includes('không hợp lệ'))
-        && fallbackThreadId
-      ) {
-        await this.sendMessage(messageData, fallbackThreadId)
-      }
-      else {
-        throw error
-      }
-    }
-  }
-
-  private parseUserData(userInfo: any) {
-    const parseDateOfBirth = (dob: any): Date | null => {
-      if (!dob)
-        return null
-
-      try {
-        if (typeof dob === 'number' && dob > 0) {
-          return new Date(dob > 9999999999 ? dob : dob * 1000)
-        }
-
-        if (typeof dob === 'string' && /^\d{2}\/\d{2}\/\d{4}$/.test(dob)) {
-          const [day, month, year] = dob.split('/').map(Number)
-          const date = new Date(year ?? 0, (month ?? 1) - 1, day ?? 1)
-
-          if (
-            date.getFullYear() === (year ?? 0)
-            && date.getMonth() === (month ?? 1) - 1
-            && date.getDate() === (day ?? 1)
-          ) {
-            return date
-          }
-        }
-
-        const date = new Date(dob)
-        return Number.isNaN(date.getTime()) ? null : date
-      }
-      catch {
-        return null
-      }
-    }
-
-    return {
-      display_name: userInfo?.displayName || 'Unknown User',
-      avatar_url: userInfo?.avatar,
-      cover_url: userInfo?.cover,
-      alias: userInfo?.username,
-      date_of_birth: parseDateOfBirth(userInfo?.sdob || userInfo?.dob),
-      is_friend: userInfo?.isFr === 1 || false,
-      last_online: userInfo?.lastActionTime
-        ? new Date(Number(userInfo.lastActionTime))
-        : null,
-      status_message: userInfo?.status || null,
-      zalo_name: userInfo?.zaloName,
-      raw_data: userInfo,
     }
   }
 }
