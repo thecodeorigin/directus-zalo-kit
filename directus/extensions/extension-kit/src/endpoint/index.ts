@@ -1,33 +1,17 @@
 // endpoint/index.ts
 import { defineEndpoint } from '@directus/extensions-sdk'
-import { ZaloService } from './services/ZaloService'
+import ZaloService from './services/ZaloService'
 
-export default defineEndpoint((router) => {
-  // GET /zalo/status - Lấy trạng thái hiện tại
-  router.get('/status', async (req, res) => {
-    try {
-      const zalo = ZaloService.getInstance()
-      const status = zalo.getStatus()
+export default defineEndpoint((router, { database, getSchema, services }) => {
+  const { ItemsService } = services
 
-      res.json({
-        status: status.status,
-        qrCode: status.qrCode,
-        userId: status.userId,
-      })
-    }
-    catch (error: any) {
-      console.error('[Zalo Endpoint] Status error:', error)
-      res.status(500).json({ error: error.message })
-    }
-  })
+  // Khởi tạo ZaloService với context Directus
+  const zaloService = ZaloService.init(database, getSchema, ItemsService)
 
   // POST /zalo/init - Bắt đầu đăng nhập
   router.post('/init', async (req, res) => {
     try {
-      const zalo = ZaloService.getInstance()
-
-      console.log('[Zalo Endpoint] Starting login...')
-      const result = await zalo.login()
+      const result = await zaloService.initiateLogin()
 
       if (result.success) {
         res.json({
@@ -56,12 +40,22 @@ export default defineEndpoint((router) => {
     }
   })
 
+  // GET /zalo/status - Lấy trạng thái hiện tại
+  router.get('/status', (req, res) => {
+    try {
+      const status = zaloService.getStatus()
+      res.json(status)
+    }
+    catch (error: any) {
+      console.error('[Zalo Endpoint] Status error:', error)
+      res.status(500).json({ error: error.message })
+    }
+  })
+
   // POST /zalo/logout - Đăng xuất
   router.post('/logout', async (req, res) => {
     try {
-      const zalo = ZaloService.getInstance()
-      await zalo.logout()
-
+      await zaloService.logout()
       res.json({
         success: true,
         message: 'Logged out successfully',
@@ -76,8 +70,7 @@ export default defineEndpoint((router) => {
   // GET /zalo/session - Lấy thông tin session
   router.get('/session', async (req, res) => {
     try {
-      const zalo = ZaloService.getInstance()
-      const session = await zalo.getSessionInfo()
+      const session = await zaloService.getSessionInfo()
 
       if (session) {
         res.json({
@@ -88,9 +81,7 @@ export default defineEndpoint((router) => {
         })
       }
       else {
-        res.json({
-          exists: false,
-        })
+        res.json({ exists: false })
       }
     }
     catch (error: any) {
