@@ -2,75 +2,141 @@ import { defineEndpoint } from '@directus/extensions-sdk'
 import { ThreadType } from 'zca-js'
 import ZaloService from './services/ZaloService'
 
-export default defineEndpoint((router, { getSchema, services, database }) => {
+export default defineEndpoint(async (router, { database, getSchema, services }) => {
   const { ItemsService } = services
-  const zaloService = ZaloService.init(getSchema, ItemsService)
 
+  let zaloService: ZaloService
+  try {
+    zaloService = ZaloService.getInstance()
+    console.warn('[Zalo Endpoint] Using existing ZaloService instance')
+  }
+  catch {
+    zaloService = ZaloService.init(getSchema, ItemsService)
+    console.warn('[Zalo Endpoint] Created new ZaloService instance')
+  }
+
+  // POST /zalo/init - Initiate QR code login
   router.post('/init', async (req, res) => {
     try {
-      const status = await zaloService.initiateLogin()
-      res.json(status)
+      const result = await zaloService.initiateLogin()
+      res.json(result)
     }
-    catch (error) {
-      res.status(500).json({ error: (error as Error).message })
+    catch (error: any) {
+      console.error('[Zalo Endpoint] Init error:', error)
+      res.status(500).json({
+        error: error.message,
+        status: 'logged_out',
+        qrCode: null,
+        isListening: false,
+        userId: null,
+      })
     }
   })
 
-  router.get('/status', (req, res) => {
-    res.json(zaloService.getStatus())
-  })
-
-  router.get('/conversations', async (req, res) => {
+  // POST /zalo/login/cookies - Login using cookies from Zalo Extractor
+  router.post('/login/cookies', async (req, res) => {
     try {
-      const messages = await database('zalo_messages')
-        .select(['conversation_id', 'sender_id', 'content', 'sent_at'])
-        .orderBy('sent_at', 'desc')
-        .limit(1000)
+      const { cookies, imei, userAgent } = req.body
 
-      const conversationsMap = new Map()
-      const senderIds = new Set()
+      if (!cookies || !imei || !userAgent) {
+        return res.status(400).json({
+          ok: false,
+          message: 'Missing required fields: cookies, imei, userAgent',
+        })
+      }
 
-      messages.forEach((msg: any) => {
-        if (!conversationsMap.has(msg.conversation_id)) {
-          conversationsMap.set(msg.conversation_id, {
-            conversation_id: msg.conversation_id,
-            sender_id: msg.sender_id,
-            content: msg.content,
-            sent_at: msg.sent_at,
-          })
-          senderIds.add(msg.sender_id)
-        }
-      })
-
-      const users = await database('zalo_users')
-        .whereIn('id', Array.from(senderIds) as string[])
-        .select(['id', 'display_name', 'avatar_url', 'zalo_name'])
-
-      const userMap = new Map(users.map((u: any) => [u.id, u]))
-
-      const conversations = Array.from(conversationsMap.values()).map((conv: any) => {
-        const user = userMap.get(conv.sender_id)
-        return {
-          id: conv.conversation_id,
-          name: user?.display_name || user?.zalo_name || conv.sender_id || 'Unknown',
-          avatar: user?.avatar_url || `https://ui-avatars.com/api/?name=${encodeURIComponent(user?.display_name || 'U')}&background=random`,
-          lastMessage: conv.content || '',
-          timestamp: conv.sent_at,
-          unreadCount: 0,
-          online: true,
-        }
-      })
+      if (!Array.isArray(cookies) || cookies.length === 0) {
+        return res.status(400).json({
+          ok: false,
+          message: 'Cookies must be a non-empty array',
+        })
+      }
 
       res.json({
-        data: conversations,
+        ok: true,
+        message: 'Login session is being initialized...',
+      });
+
+      (async () => {
+        try {
+          const result = await zaloService.importSessionFromExtractor(
+            imei,
+            userAgent,
+            cookies,
+          )
+          console.log('[ZaloService] Background cookie login done:', result)
+        }
+        catch (err) {
+          console.error('[ZaloService] Background cookie login failed:', err)
+        }
+      })()
+    }
+    catch (error: any) {
+      console.error('[Zalo Endpoint] Cookies Login error:', error)
+      res.status(500).json({
+        ok: false,
+        message: error.message,
+      })
+    }
+  })
+
+  // GET /zalo/status - Get current login status
+  router.get('/status', async (req, res) => {
+    try {
+      const status = zaloService.getStatus()
+      res.json(status)
+    }
+    catch (error: any) {
+      console.error('[Zalo Endpoint] Status error:', error)
+      res.status(500).json({
+        error: error.message,
+        status: 'logged_out',
+        qrCode: null,
+        isListening: false,
+        userId: null,
+      })
+    }
+  })
+
+  // POST /zalo/logout - Logout
+  router.post('/logout', async (req, res) => {
+    try {
+      await zaloService.logout()
+      res.json({
+        success: true,
+        message: 'Logged out successfully',
       })
     }
     catch (error: any) {
-      console.error('[Endpoint] Error:', error)
+      console.error('[Zalo Endpoint] Logout error:', error)
       res.status(500).json({ error: error.message })
     }
   })
 
+  // GET /zalo/session - Get session info
+  router.get('/session', async (req, res) => {
+    try {
+      const session = await zaloService.getSessionInfo()
+
+      if (session) {
+        res.json({
+          exists: true,
+          userId: session.userId,
+          loginTime: session.loginTime,
+          isActive: session.isActive,
+        })
+      }
+      else {
+        res.json({ exists: false })
+      }
+    }
+    catch (error: any) {
+      console.error('[Zalo Endpoint] Session error:', error)
+      res.status(500).json({ error: error.message })
+    }
+  })
+
+  // POST /zalo/send-message - Send a message
   router.get('/messages/:conversationId', async (req, res) => {
     try {
       const { conversationId } = req.params
