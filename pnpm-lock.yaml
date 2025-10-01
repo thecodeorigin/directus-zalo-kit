@@ -21,6 +21,9 @@ catalogs:
     '@neondatabase/api-client':
       specifier: ^2.2.0
       version: 2.2.0
+    '@rollup/plugin-image':
+      specifier: ^3.0.3
+      version: 3.0.3
     '@types/node':
       specifier: ^24.5.2
       version: 24.5.2
@@ -45,6 +48,9 @@ catalogs:
     tsx:
       specifier: ^4.20.6
       version: 4.20.6
+    type-fest:
+      specifier: ^5.0.1
+      version: 5.0.1
     typescript:
       specifier: ^5.9.2
       version: 5.9.2
@@ -78,7 +84,7 @@ importers:
         specifier: 'catalog:'
         version: 2.2.0
       '@rollup/plugin-image':
-        specifier: ^3.0.3
+        specifier: 'catalog:'
         version: 3.0.3(rollup@4.46.2)
       '@types/node':
         specifier: 'catalog:'
@@ -105,7 +111,7 @@ importers:
         specifier: 'catalog:'
         version: 4.20.6
       type-fest:
-        specifier: ^5.0.1
+        specifier: 'catalog:'
         version: 5.0.1
       typescript:
         specifier: 'catalog:'
@@ -123,17 +129,20 @@ importers:
   directus/extensions/extension-kit:
     dependencies:
       sass:
-        specifier: ^1.93.2
+        specifier: 'catalog:'
         version: 1.93.2
     devDependencies:
+      '@directus/sdk':
+        specifier: 'catalog:'
+        version: 20.1.0
       autoprefixer:
-        specifier: ^10.4.14
+        specifier: 'catalog:'
         version: 10.4.21(postcss@8.5.6)
       postcss:
-        specifier: ^8.4.24
+        specifier: 'catalog:'
         version: 8.5.6
       tailwindcss:
-        specifier: ^3.3.0
+        specifier: 'catalog:'
         version: 3.4.18(tsx@4.20.6)(yaml@2.8.1)
 
 packages:
@@ -259,6 +268,10 @@ packages:
 
   '@directus/schema@13.0.3':
     resolution: {integrity: sha512-Ls3QdpDDbsaI+/JiRH1WvPzc8zMdaQv+Rww2oyF1GFkXGQFb3RvYM3MX9WTU4RpD4/6YWrAeCaz+jeJlNVz/UQ==}
+
+  '@directus/sdk@20.1.0':
+    resolution: {integrity: sha512-EV2bwfiOXc1QFYAIqfGgyZ7JcKgHF43UVEYivUpMjOLiihI9tpmNfcz/qmOXju7LCZrBmSwTOHMRtOXPdZWiLQ==}
+    engines: {node: '>=22'}
 
   '@directus/shared@9.24.0':
     resolution: {integrity: sha512-NMLhwi4K5URm312DKvCg1tn5DiUaK8adteu1oWK6IvNazYkdFGMcjqErSpfD13U77Hk/senzK5BXBofXH0n6MQ==}
@@ -4657,6 +4670,8 @@ snapshots:
       - sqlite3
       - supports-color
       - tedious
+
+  '@directus/sdk@20.1.0': {}
 
   '@directus/shared@9.24.0':
     dependencies:
