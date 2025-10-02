@@ -1,5 +1,7 @@
 import type { SchemaOverview } from '@directus/types'
 import type Redis from 'ioredis'
+import fs from 'node:fs'
+import path from 'node:path'
 import { match, P } from 'ts-pattern'
 import { LoginQRCallbackEventType, ThreadType, Zalo } from 'zca-js'
 
@@ -29,6 +31,9 @@ export class ZaloService {
   private readonly reconnectDelay = 5000
   private isRestoringSession = false
 
+  private sessionFile: string
+
+  // System accountability (use system admin by default)
   private systemAccountability = {
     admin: true,
     role: null,
@@ -113,7 +118,7 @@ export class ZaloService {
 
   public static getInstance(): ZaloService {
     if (!ZaloService.instance) {
-      throw new Error('ZaloService chưa được init')
+      throw new Error('ZaloService has not been initialized yet')
     }
     return ZaloService.instance
   }
@@ -2577,6 +2582,30 @@ export class ZaloService {
     }
     catch (error: any) {
       throw new Error(`Failed to send via Zalo: ${error.message}`)
+    }
+  }
+
+  public async getSessionInfo() {
+    try {
+      if (!fs.existsSync(this.sessionFile)) {
+        return null
+      }
+
+      const raw = fs.readFileSync(this.sessionFile, 'utf-8')
+      if (!raw)
+        return null
+
+      const session = JSON.parse(raw)
+
+      return {
+        userId: session.userId || null,
+        loginTime: session.loginTime || null,
+        isActive: session.isActive ?? false,
+      }
+    }
+    catch (err) {
+      console.error('[ZaloService] getSessionInfo error:', err)
+      return null
     }
   }
 }
