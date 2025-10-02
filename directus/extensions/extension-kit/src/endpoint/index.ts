@@ -1,14 +1,12 @@
-// endpoint/index.ts
 import { defineEndpoint } from '@directus/extensions-sdk'
 import ZaloService from './services/ZaloService'
 
 export default defineEndpoint((router, { database, getSchema, services }) => {
   const { ItemsService } = services
 
-  // Khởi tạo ZaloService với context Directus
   const zaloService = ZaloService.init(database, getSchema, ItemsService)
 
-  // POST /zalo/init - Bắt đầu đăng nhập
+  // POST /zalo/init
   router.post('/init', async (req, res) => {
     try {
       const result = await zaloService.initiateLogin()
@@ -40,7 +38,7 @@ export default defineEndpoint((router, { database, getSchema, services }) => {
     }
   })
 
-  // GET /zalo/status - Lấy trạng thái hiện tại
+  // GET /zalo/status
   router.get('/status', (req, res) => {
     try {
       const status = zaloService.getStatus()
@@ -52,7 +50,7 @@ export default defineEndpoint((router, { database, getSchema, services }) => {
     }
   })
 
-  // POST /zalo/logout - Đăng xuất
+  // POST /zalo/logout
   router.post('/logout', async (req, res) => {
     try {
       await zaloService.logout()
@@ -67,7 +65,7 @@ export default defineEndpoint((router, { database, getSchema, services }) => {
     }
   })
 
-  // GET /zalo/session - Lấy thông tin session
+  // GET /zalo/session
   router.get('/session', async (req, res) => {
     try {
       const session = await zaloService.getSessionInfo()
