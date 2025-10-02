@@ -1,6 +1,5 @@
 import type { SchemaOverview } from '@directus/types'
 import type { Knex } from 'knex'
-// ZaloService.ts
 import fs from 'node:fs'
 import path from 'node:path'
 import { match, P } from 'ts-pattern'
@@ -31,7 +30,7 @@ export class ZaloService {
 
   private sessionFile: string
 
-  // System accountability
+  // System accountability (use system admin by default)
   private systemAccountability = {
     admin: true,
     role: null,
@@ -49,7 +48,6 @@ export class ZaloService {
     this.zalo = new Zalo({
       selfListen: true,
       checkUpdate: false,
-      dataPath: zaloDataPath,
     })
 
     console.log('[ZaloService] Initialized')
@@ -71,7 +69,7 @@ export class ZaloService {
 
   public static getInstance(): ZaloService {
     if (!ZaloService.instance) {
-      throw new Error('ZaloService chưa được init')
+      throw new Error('ZaloService has not been initialized yet')
     }
     return ZaloService.instance
   }
@@ -195,7 +193,6 @@ export class ZaloService {
     })
   }
 
-  /** Bắt đầu listener */
   private startListener() {
     if (!this.api || this.listenerStarted)
       return
@@ -226,62 +223,105 @@ export class ZaloService {
         .start()
       this.reconnectAttempts = 0
     }
-    catch {
+    catch (err) {
       this.listenerStarted = false
+      console.error('[ZaloService] startListener error:', err)
       this.handleListenerError()
     }
   }
 
-  /** Xử lý tin nhắn đến - tạo các items */
+  /**
+   * Xử lý tin nhắn đến - tạo/ cập nhật các items
+   *  Hỗ trợ cả 2 dạng payload: direct raw fields (msgId, uidFrom...)
+   *  hoặc wrapped under rawData.message.*
+   */
   private async handleIncomingMessage(rawData: any) {
     try {
       const schema = await this.getSchemaFn()
 
-      // Parse fields từ Zalo format
-      const messageId = rawData.msgId
-      const senderId = rawData.uidFrom
-      const recipientId = rawData.idTo
-      const displayName = rawData.dName
-      const content = rawData.content || ''
-      const timestamp = rawData.ts ? Number.parseInt(rawData.ts) : Date.now()
-      const clientMsgId = rawData.cliMsgId
+      // Normalize possible shapes
+      const messageRoot = rawData.message ?? rawData
+      const messageId = messageRoot.msgId ?? messageRoot.msg_id ?? messageRoot.id ?? messageRoot.messageId
+      const senderId = messageRoot.uidFrom ?? messageRoot.senderId ?? messageRoot.sender?.id ?? messageRoot.uid_from
+      const recipientId = messageRoot.idTo ?? messageRoot.recipientId ?? messageRoot.recipient?.id ?? messageRoot.id_to
+      const displayName = messageRoot.dName ?? messageRoot.sender?.dName ?? messageRoot.sender?.name ?? messageRoot.d_name
+      const content = messageRoot.content ?? messageRoot.text ?? messageRoot.body ?? ''
+      const timestamp = messageRoot.ts ? Number.parseInt(String(messageRoot.ts)) : (messageRoot.timestamp ? Number.parseInt(String(messageRoot.timestamp)) : Date.now())
+      const clientMsgId = messageRoot.cliMsgId ?? messageRoot.client_id ?? null
+      const attachments = messageRoot.attachments ?? messageRoot.attach ?? messageRoot.files ?? null
 
-      // Validation
+      // Basic validation
       if (!messageId || !senderId) {
-        console.error('[ZaloService] Missing required fields:', { messageId, senderId })
+        console.error('[ZaloService] Missing required message fields:', { messageId, senderId })
         return
       }
 
-      // Tạo conversation ID từ 2 user IDs
-      const userIds = [senderId, recipientId].filter(Boolean).sort()
-      const conversationId = userIds.length === 2
-        ? `direct_${userIds[0]}_${userIds[1]}`
-        : `direct_${senderId}`
+      // Create conversationId deterministically
+      const userIds = [String(senderId), String(recipientId)].filter(Boolean).sort()
+      const conversationId = userIds.length === 2 ? `direct_${userIds[0]}_${userIds[1]}` : `direct_${String(senderId)}`
 
-      console.log('[ZaloService] Processing:', {
-        messageId,
-        conversationId,
-        senderId,
-        displayName,
+      console.log('[ZaloService] Processing message:', { messageId, conversationId, senderId, displayName })
+
+      // Prepare services
+      const usersService = new this.ItemsService('zalo_users', {
+        knex: this.db,
+        schema,
+        accountability: this.systemAccountability,
+      })
+      const conversationsService = new this.ItemsService('zalo_conversations', {
+        knex: this.db,
+        schema,
+        accountability: this.systemAccountability,
+      })
+      const messagesService = new this.ItemsService('zalo_messages', {
+        knex: this.db,
+        schema,
+        accountability: this.systemAccountability,
       })
 
-      // 1. Upsert conversation
-      await this.upsertConversation(conversationId, rawData, schema, senderId, recipientId)
+      // 1) Upsert sender
+      const userData = {
+        id: String(senderId),
+        display_name: displayName || String(senderId),
+        avatar_url: (messageRoot.avatar || messageRoot.sender?.avatar) ?? null,
+        phone: null,
+        status: 'active',
+        updated_at: new Date(),
+      }
+      await this.upsertItem(usersService, String(senderId), userData)
 
-      // 2. Upsert sender
-      await this.upsertUser(senderId, rawData, schema)
-
-      // 3. Upsert recipient if different
-      if (recipientId && recipientId !== senderId) {
-        await this.upsertUser(recipientId, { id: recipientId, dName: 'Unknown' }, schema)
+      // 2) Upsert recipient if different
+      if (recipientId && String(recipientId) !== String(senderId)) {
+        const recData = {
+          id: String(recipientId),
+          display_name: 'Unknown',
+          updated_at: new Date(),
+        }
+        await this.upsertItem(usersService, String(recipientId), recData)
       }
 
-      // 4. Create message
-      const messageData = {
-        id: messageId,
-        client_id: clientMsgId || messageId,
+      // 3) Upsert conversation
+      const conversationData = {
+        id: conversationId,
+        type: 'direct',
+        participant_id: recipientId ? String(recipientId) : null,
+        group_id: null,
+        is_pinned: false,
+        is_muted: false,
+        is_archived: false,
+        is_hidden: false,
+        unread_count: 0,
+        created_at: new Date(),
+        updated_at: new Date(),
+      }
+      await this.upsertItem(conversationsService, conversationId, conversationData)
+
+      // 4) Upsert message
+      const messageData: any = {
+        id: String(messageId),
+        client_id: clientMsgId || String(messageId),
         conversation_id: conversationId,
-        sender_id: senderId,
+        sender_id: String(senderId),
         content,
         raw_data: JSON.stringify(rawData),
         mentions: null,
@@ -296,97 +336,46 @@ export class ZaloService {
         updated_at: new Date(),
       }
 
-      const messagesService = new this.ItemsService('zalo_messages', {
-        knex: this.db,
-        schema,
-        accountability: this.systemAccountability,
-      })
+      await this.upsertItem(messagesService, String(messageId), messageData)
 
-      await messagesService.createOne(messageData)
-      // 5. Update conversation last message
-      await this.updateConversationLastMessage(
-        conversationId,
-        messageId,
-        messageData.sent_at,
-        schema,
-      )
+      // 5) Attachments (if any)
+      if (attachments && Array.isArray(attachments) && attachments.length > 0) {
+        await this.createAttachments(String(messageId), attachments, schema)
+      }
+
+      // 6) Update conversation last message
+      await this.updateConversationLastMessage(conversationId, String(messageId), new Date(timestamp), schema)
     }
     catch (error) {
       console.error('[ZaloService] Error handling message:', error)
     }
   }
 
-  /** Upsert conversation */
-  private async upsertConversation(
-    conversationId: string,
-    rawData: any,
-    schema: SchemaOverview,
-    senderId?: string,
-    recipientId?: string,
-  ) {
+  /** Upsert helper: nếu tồn tại -> updateOne, ngược lại -> createOne */
+  private async upsertItem(service: any, id: string, data: any) {
     try {
-      const conversationsService = new this.ItemsService('zalo_conversations', {
-        knex: this.db,
-        schema,
-        accountability: this.systemAccountability,
-      })
-
-      const existing = await conversationsService.readByQuery({
-        filter: { id: { _eq: conversationId } },
+      const existing = await service.readByQuery({
+        filter: { id: { _eq: id } },
         limit: 1,
       })
 
       if (!existing || existing.length === 0) {
-        await conversationsService.createOne({
-          id: conversationId,
-          type: 'direct', // Tin nhắn 1-1
-          participant_id: recipientId || null,
-          group_id: null,
-          is_pinned: false,
-          is_muted: false,
-          is_archived: false,
-          is_hidden: false,
-          unread_count: 0,
-          created_at: new Date(),
-          updated_at: new Date(),
-        })
-        console.log('[ZaloService] Created conversation:', conversationId)
+        await service.createOne(data)
+        console.log(`[ZaloService][Upsert] Created item id=${id}`)
+      }
+      else {
+        try {
+          await service.updateOne(id, data)
+          console.log(`[ZaloService][Upsert] Updated item id=${id}`)
+        }
+        catch {
+          await service.updateByQuery({ filter: { id: { _eq: id } } }, data)
+          console.log(`[ZaloService][Upsert] UpdatedByQuery item id=${id}`)
+        }
       }
     }
-    catch (error) {
-      console.error('[ZaloService] Error upserting conversation:', error)
-    }
-  }
-
-  /** Upsert user */
-  private async upsertUser(userId: string, rawData: any, schema: SchemaOverview) {
-    try {
-      const usersService = new this.ItemsService('zalo_users', {
-        knex: this.db,
-        schema,
-        accountability: this.systemAccountability,
-      })
-
-      const existing = await usersService.readByQuery({
-        filter: { id: { _eq: userId } },
-        limit: 1,
-      })
-
-      if (!existing || existing.length === 0) {
-        await usersService.createOne({
-          id: userId,
-          display_name: rawData.dName || 'Unknown User',
-          avatar_url: null,
-          phone: null,
-          status: 'active',
-          created_at: new Date(),
-          updated_at: new Date(),
-        })
-        console.log('[ZaloService] Created user:', userId)
-      }
-    }
-    catch (error) {
-      console.error('[ZaloService] Error upserting user:', error)
+    catch (err) {
+      console.error(`[ZaloService][Upsert] Error upserting id=${id}:`, err)
     }
   }
 
@@ -400,21 +389,24 @@ export class ZaloService {
       })
 
       for (const att of attachments) {
-        await attachmentsService.createOne({
+        // normalize fields
+        const payload = {
           message_id: messageId,
-          type: att.type || 'file',
-          url: att.url || '',
-          file_name: att.fileName || null,
-          file_size: att.fileSize || null,
-          mime_type: att.mimeType || null,
-          thumbnail_url: att.thumbnailUrl || null,
-          width: att.width || null,
-          height: att.height || null,
-          duration: att.duration || null,
+          type: att.type ?? att.mediaType ?? 'file',
+          url: att.url ?? att.fileUrl ?? '',
+          file_name: att.fileName ?? att.name ?? null,
+          file_size: att.fileSize ?? att.size ?? null,
+          mime_type: att.mimeType ?? att.type ?? null,
+          thumbnail_url: att.thumbnailUrl ?? att.thumb ?? null,
+          width: att.width ?? null,
+          height: att.height ?? null,
+          duration: att.duration ?? null,
           metadata: att.metadata ? JSON.stringify(att.metadata) : null,
           created_at: new Date(),
           updated_at: new Date(),
-        })
+        }
+
+        await attachmentsService.createOne(payload)
       }
       console.log(`[ZaloService] Created ${attachments.length} attachments for message:`, messageId)
     }
@@ -454,47 +446,38 @@ export class ZaloService {
   /** Xử lý reaction */
   private async handleIncomingReaction(rawData: any) {
     try {
-    // Debug log để xem cấu trúc dữ liệu
-      console.log('[ZaloService] Raw reaction data:', JSON.stringify(rawData, null, 2))
-
       const schema = await this.getSchemaFn()
-
-      // Parse reaction data với field names đúng theo schema
-      const messageId = rawData.msgId || rawData.messageId || rawData.msg_id
-      const userId = rawData.reactorId || rawData.userId || rawData.user_id || rawData.uidFrom
-      const reactionIcon = rawData.reaction || rawData.emoji || rawData.icon || '❤️' // Default heart
-
-      // Validation
-      if (!messageId) {
-        return
-      }
-
-      if (!userId) {
-        return
-      }
-
-      console.log('[ZaloService] Parsed reaction:', {
-        messageId,
-        userId,
-        reactionIcon,
-      })
-
       const reactionsService = new this.ItemsService('zalo_reactions', {
         knex: this.db,
         schema,
         accountability: this.systemAccountability,
       })
 
-      await reactionsService.createOne({
-        message_id: messageId, // ✅ message_id (không phải msg_id)
-        user_id: userId, // ✅ user_id (không phải reactor_id)
-        reaction_icon: reactionIcon, // ✅ reaction_icon (không phải reaction)
+      const messageId = rawData.msgId
+      const userId = rawData.uidFrom
+      const reactionIcon = rawData.content?.rIcon || null
+
+      if (!messageId || !userId || !reactionIcon) {
+        console.warn('[ZaloService] Reaction missing fields, skip:', {
+          messageId,
+          userId,
+          reactionIcon,
+        })
+        return
+      }
+
+      const payload = {
+        message_id: messageId,
+        user_id: userId,
+        reaction_icon: reactionIcon,
         created_at: new Date(),
-      })
+      }
+
+      console.log('[ZaloService] Saving reaction:', payload)
+      await reactionsService.createOne(payload)
     }
-    catch (error) {
-      console.error('[ZaloService] Error handling reaction:', error)
-      console.error('[ZaloService] Failed raw data:', JSON.stringify(rawData, null, 2))
+    catch (err) {
+      console.error('[ZaloService] Error saving reaction:', err)
     }
   }
 
@@ -515,7 +498,8 @@ export class ZaloService {
         this.listenerStarted = false
         this.startListener()
       }
-      catch {
+      catch (err) {
+        console.error('[ZaloService] restartListener error:', err)
         this.handleListenerError()
       }
     }
@@ -536,7 +520,9 @@ export class ZaloService {
         if (fs.existsSync(this.sessionFile))
           fs.unlinkSync(this.sessionFile)
       }
-      catch {}
+      catch (err) {
+        console.error('[ZaloService] logout error:', err)
+      }
       finally {
         this.reset()
       }
@@ -550,6 +536,30 @@ export class ZaloService {
     this.loginResolver = null
     this.listenerStarted = false
     this.reconnectAttempts = 0
+  }
+
+  public async getSessionInfo() {
+    try {
+      if (!fs.existsSync(this.sessionFile)) {
+        return null
+      }
+
+      const raw = fs.readFileSync(this.sessionFile, 'utf-8')
+      if (!raw)
+        return null
+
+      const session = JSON.parse(raw)
+
+      return {
+        userId: session.userId || null,
+        loginTime: session.loginTime || null,
+        isActive: session.isActive ?? false,
+      }
+    }
+    catch (err) {
+      console.error('[ZaloService] getSessionInfo error:', err)
+      return null
+    }
   }
 }
 
