@@ -10,5 +10,13 @@ export default defineModule({
       path: '',
       component: ModuleComponent,
     },
+    {
+      path: '/messages',
+      component: ModuleComponent,
+    },
+    {
+      path: '/:page',
+      component: ModuleComponent,
+    },
   ],
 })

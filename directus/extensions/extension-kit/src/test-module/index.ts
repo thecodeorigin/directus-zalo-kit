@@ -1,19 +1,23 @@
 import { defineModule } from '@directus/extensions-sdk'
 import ModuleComponent from './module.vue';
 
-export default {
-  id: 'my-module',
-  name: 'My Module',
-  icon: 'star',
+export default defineModule({
+  id: 'chat-ui-test',
+  name: 'Chat UI Test',
+  icon: 'chat',
   routes: [
     {
       path: '',
       component: ModuleComponent,
     },
     {
-      path: ':page',
+      path: '/messages',
+      component: ModuleComponent,
+    },
+    {
+      path: '/:page',
       component: ModuleComponent,
       props: true,
     },
   ],
-};
+});
