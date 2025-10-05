@@ -25,6 +25,7 @@
     "@directus/shared": "catalog:",
     "@directus/types": "catalog:",
     "@neondatabase/api-client": "catalog:",
+    "@rollup/plugin-image": "^3.0.3",
     "@types/node": "catalog:",
     "@types/qrcode-terminal": "catalog:",
     "@vue/tsconfig": "catalog:",
