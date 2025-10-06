@@ -170,6 +170,78 @@ const messages = ref<Message[]>([
     time: '00:00',
     avatar: oliviaAvatar,
   },
+  {
+    id: '10',
+    direction: 'in',
+    text: 'Great. Also, make sure to highlight the key features—they\'re very focused on functionality this time.',
+    senderName: 'Olivia Rhye',
+    time: '00:00',
+    avatar: oliviaAvatar,
+  },
+  {
+    id: '11',
+    direction: 'in',
+    text: 'Great. Also, make sure to highlight the key features—they\'re very focused on functionality this time.',
+    senderName: 'Olivia Rhye',
+    time: '00:00',
+    avatar: oliviaAvatar,
+  },
+  {
+    id: '12',
+    direction: 'in',
+    text: 'Great. Also, make sure to highlight the key features—they\'re very focused on functionality this time.',
+    senderName: 'Olivia Rhye',
+    time: '00:00',
+    avatar: oliviaAvatar,
+  },
+  {
+    id: '13',
+    direction: 'in',
+    text: 'Great. Also, make sure to highlight the key features—they\'re very focused on functionality this time.',
+    senderName: 'Olivia Rhye',
+    time: '00:00',
+    avatar: oliviaAvatar,
+  },
+  {
+    id: '14',
+    direction: 'in',
+    text: 'Great. Also, make sure to highlight the key features—they\'re very focused on functionality this time.',
+    senderName: 'Olivia Rhye',
+    time: '00:00',
+    avatar: oliviaAvatar,
+  },
+  {
+    id: '15',
+    direction: 'in',
+    text: 'Great. Also, make sure to highlight the key features—they\'re very focused on functionality this time.',
+    senderName: 'Olivia Rhye',
+    time: '00:00',
+    avatar: oliviaAvatar,
+  },
+  {
+    id: '16',
+    direction: 'in',
+    text: 'Great. Also, make sure to highlight the key features—they\'re very focused on functionality this time.',
+    senderName: 'Olivia Rhye',
+    time: '00:00',
+    avatar: oliviaAvatar,
+  },
+  {
+    id: '17',
+    direction: 'in',
+    text: 'Great. Also, make sure to highlight the key features—they\'re very focused on functionality this time.',
+    senderName: 'Olivia Rhye',
+    time: '00:00',
+    avatar: oliviaAvatar,
+  },
+  {
+    id: '18',
+    direction: 'in',
+    text: 'Great. Also, make sure to highlight the key features—they\'re very focused on functionality this time.',
+    senderName: 'Olivia Rhye',
+    time: '00:00',
+    avatar: oliviaAvatar,
+  },
 ])
 
 // Computed properties
@@ -289,7 +361,7 @@ onMounted(() => {
     </template>
     <template #navigation>
       <!-- Search and Filter Section -->
-      <div class="p-3  border-b border-neutral-200 space-y-3">
+      <div class="p-3 border-neutral-200 space-y-3">
         <div class="relative">
           <input
             v-model="navSearchQuery"
@@ -385,15 +457,24 @@ onMounted(() => {
         </div>
       </div>
     </template>
+    <template #sidebar>
+    <sidebar-detail icon="info" title="Information" close>
+        <div v-md="page_description" class="page-description" />
+    </sidebar-detail>
+    <sidebar-detail icon="layers" title="SIDEBAR ITEM">
+        SIDEBAR ITEM CONTENT
+    </sidebar-detail>
+    </template>
 
-    <!-- Main Chat Area -->
-    <div class="h-full flex flex-col ">
-      <!-- Chat Header -->
+
+    <!-- Main Chat Area với absolute positioning -->
+    <div class="chat-container">
+      <!-- Chat Header - Fixed tại top -->
       <div
         v-if="activeConversation"
-        class="pl-10 flex-shrink-0 p-4 border-y border-neutral-200"
+        class="chat-header"
       >
-        <div class="flex items-center justify-between">
+        <div class="flex items-center justify-between w-full">
           <div class="flex items-center gap-4">
             <div class="relative inline-block">
               <div class="w-10 h-10 relative rounded-full overflow-hidden bg-neutral-100 border border-black/8">
@@ -449,11 +530,11 @@ onMounted(() => {
         </div>
       </div>
 
-      <!-- Messages area -->
+      <!-- Messages area - Scrollable với padding cho header và input -->
       <div
         v-if="activeConversation"
         ref="messagesContainer"
-        class="pl-2 flex-1 overflow-y-auto"
+        class="messages-area"
       >
         <div class="space-y-1">
           <div
@@ -536,10 +617,10 @@ onMounted(() => {
         </div>
       </div>
 
-      <!-- Message input -->
+      <!-- Message input - Fixed tại bottom -->
       <div
         v-if="activeConversation"
-        class="flex-shrink-0 p-4 border-t border-neutral-200"
+        class="message-input"
       >
         <div class="flex items-end gap-3">
           <div class="flex gap-2">
@@ -593,6 +674,7 @@ onMounted(() => {
           </div>
         </div>
       </div>
+      
 
       <!-- Empty state -->
       <div
@@ -607,11 +689,91 @@ onMounted(() => {
             Choose a conversation from the sidebar to start messaging
           </p>
         </div>
-      </div>
+      </div>  
     </div>
   </private-view>
 </template>
 
 <style scoped>
 @import '../styles/tailwind.css';
+
+/* Override Directus global styles */
+.chat-container {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: calc(100vh - 65px); /* Trừ đi header của Directus */
+  background: white;
+  overflow: hidden;
+  position: relative;
+}
+
+/* Header cố định */
+.chat-header {
+  flex-shrink: 0;
+  height: 80px;
+  padding: 16px 40px;
+  border-top: 1px solid var(--border-normal, #D3DAE4);
+  border-bottom: 1px solid var(--border-normal, #D3DAE4);
+  background: var(--background-page, white);
+  z-index: 10;
+  display: flex;
+  align-items: center;
+}
+
+/* Messages area - flex-grow để chiếm không gian còn lại */
+.messages-area {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 12px 16px;
+  background: var(--background-page, white);
+  min-height: 0; /* Important cho flex shrinking */
+  height:10px !important;
+}
+
+/* Input cố định ở dưới */
+.message-input {
+  flex-shrink: 0;
+  height: 120px !important;
+  min-height: 80px;
+  padding: 16px;
+  border-top: 1px solid var(--border-normal, #D3DAE4);
+  background: var(--background-page, white);
+  z-index: 10;
+}
+
+/* Reset Directus global styles that interfere */
+.chat-container * {
+  box-sizing: border-box;
+}
+
+/* Ensure proper scrolling behavior */
+.messages-area::-webkit-scrollbar {
+  width: 6px;
+}
+
+.messages-area::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.messages-area::-webkit-scrollbar-thumb {
+  background: var(--border-normal, #D3DAE4);
+  border-radius: 3px;
+}
+
+.messages-area::-webkit-scrollbar-thumb:hover {
+  background: var(--border-subdued, #A2B5CD);
+}
+html, body, #app, .directus, .private-view, main.content, .content--wrap, .main-content.content {
+    height: 100% !important;
+    min-height: 0 !important;
+    overflow: hidden !important;
+}
+:deep(main.content),
+:deep(.content--wrap),
+:deep(.private-view) {
+  overflow: hidden !important;
+  height: 100% !important;
+}
 </style>
