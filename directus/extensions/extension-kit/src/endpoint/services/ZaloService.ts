@@ -1445,11 +1445,6 @@ export class ZaloService {
     recipientId?: string,
   ) {
     try {
-      console.warn('[ZaloService] 💬 upsertConversation', {
-        conversationId,
-        sender: senderId,
-        recipient: recipientId,
-      })
       const conversationsService = new this.ItemsService('zalo_conversations', {
         schema,
         accountability: this.systemAccountability,
@@ -1675,30 +1670,21 @@ export class ZaloService {
 
   private async syncGroupAvatars() {
     try {
-      console.log('[ZaloService] 🚀 Starting group sync...')
       const response = await this.api.getAllGroups()
 
       if (!response || !response.gridVerMap) {
-        console.log('[ZaloService] No gridVerMap found')
         return
       }
 
       const gridVerMap = response.gridVerMap
       const groupIds = Object.keys(gridVerMap)
 
-      console.log(`[ZaloService] Found ${groupIds.length} groups`)
-
       const schema = await this.getSchemaFn()
 
-      // ✅ GIẢM batch size từ 5 → 2
       const BATCH_SIZE = 2
-
-      let groupCount = 0
 
       for (let i = 0; i < groupIds.length; i += BATCH_SIZE) {
         const batch = groupIds.slice(i, i + BATCH_SIZE)
-
-        console.log(`[ZaloService] 📦 Processing batch ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(groupIds.length / BATCH_SIZE)}`)
 
         const batchPromises = batch.map(async (groupId) => {
           try {
@@ -1710,9 +1696,6 @@ export class ZaloService {
               return
             }
 
-            groupCount++
-            console.log(`[ZaloService] [${groupCount}/${groupIds.length}] Processing:`, groupInfo.name)
-
             await this.upsertGroup(groupId, groupInfo, schema)
             await this.upsertConversation(groupId, {
               groupId: groupInfo.groupId || groupId,
@@ -1721,10 +1704,7 @@ export class ZaloService {
               type: 'group',
             }, schema)
 
-            // ✅ Log trước khi sync members
-            console.log(`[ZaloService] 👥 Syncing ${groupInfo.memVerList?.length || 0} members for:`, groupInfo.name)
             await this.syncGroupMembers(groupId, groupInfo)
-            console.log(`[ZaloService] ✅ Completed:`, groupInfo.name)
           }
           catch (error: any) {
             console.error('[ZaloService] ❌ Error syncing group', groupId, ':', error.message)
@@ -1733,14 +1713,10 @@ export class ZaloService {
 
         await Promise.all(batchPromises)
 
-        // ✅ TĂNG delay giữa các batch từ 1s → 3s
         if (i + BATCH_SIZE < groupIds.length) {
-          console.log('[ZaloService] ⏸️ Waiting 3s before next batch...')
           await new Promise(resolve => setTimeout(resolve, 3000))
         }
       }
-
-      console.log('[ZaloService] ✅ Completed syncing', groupIds.length, 'groups')
     }
     catch (error: any) {
       console.error('[ZaloService] Error syncing group avatars:', error)
@@ -1750,12 +1726,8 @@ export class ZaloService {
   private async syncGroupMembers(groupId: string, groupInfo: any) {
     try {
       if (!groupInfo.memVerList || !Array.isArray(groupInfo.memVerList)) {
-        console.log('[ZaloService] No members for group:', groupId)
         return
       }
-
-      const totalMembers = groupInfo.memVerList.length
-      console.log(`[ZaloService] 👥 START syncing ${totalMembers} members for group:`, groupId)
 
       const MEMBER_BATCH_SIZE = 20
 
@@ -1784,17 +1756,10 @@ export class ZaloService {
           }),
         )
 
-        // Progress logging
-        const processed = Math.min(i + MEMBER_BATCH_SIZE, totalMembers)
-        console.log(`[ZaloService] 👥 Progress: ${processed}/${totalMembers} members`)
-
-        // Small delay between member batches
         if (i + MEMBER_BATCH_SIZE < groupInfo.memVerList.length) {
           await new Promise(resolve => setTimeout(resolve, 500))
         }
       }
-
-      console.log(`[ZaloService] ✅ COMPLETED syncing ${totalMembers} members for group:`, groupId)
     }
     catch (error: any) {
       console.error('[ZaloService] Error syncing group members:', error.message)
@@ -2373,12 +2338,6 @@ export class ZaloService {
     },
   ) {
     try {
-      console.warn('[ZaloService] 👥 upsertGroupMember', {
-        groupId,
-        userId,
-        isActive: data.is_active,
-        action: data.left_at ? 'leave' : (data.joined_at ? 'join' : 'update'),
-      })
       const schema = await this.getSchemaFn()
 
       const collectionExists = schema.collections.zalo_group_members
