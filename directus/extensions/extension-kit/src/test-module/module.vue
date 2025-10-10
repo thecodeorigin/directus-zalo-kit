@@ -2812,7 +2812,9 @@ const filteredConversations = computed(() => {
 })
 
 const activeConversation = computed(() => {
-  return conversations.value.find(conv => conv.id === activeConversationId.value)
+  return conversations.value.find(
+    conv => conv.id === activeConversationId.value,
+  )
 })
 
 const conversationStats = computed(() => {
@@ -3954,6 +3956,7 @@ watch(activeConversationId, (newId) => {
 
 .messages-area {
   flex: 1;
+  min-height: 0;
   overflow-y: auto;
   background: var(--theme--background);
 }
