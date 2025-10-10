@@ -3492,7 +3492,7 @@ watch(activeConversationId, (newId) => {
 </script>
 
 <template>
-  <private-view title="Messages">
+  <private-view title="Messages aLO">
     <template #title-outer:prepend>
       <v-button class="header-icon" rounded disabled icon secondary>
         <v-icon name="inbox" />
