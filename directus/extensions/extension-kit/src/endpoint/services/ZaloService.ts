@@ -1,6 +1,6 @@
 import type { SchemaOverview } from '@directus/types'
 import { match, P } from 'ts-pattern'
-import { LoginQRCallbackEventType, Zalo } from 'zca-js'
+import { LoginQRCallbackEventType, ThreadType, Zalo } from 'zca-js'
 
 export class ZaloService {
   private static instance: ZaloService | null = null
@@ -18,7 +18,6 @@ export class ZaloService {
   private maxReconnectAttempts = 5
   private reconnectDelay = 5000
 
-  // System accountability
   private systemAccountability = {
     admin: true,
     role: null,
@@ -59,9 +58,6 @@ export class ZaloService {
     }
   }
 
-  /**
-   * Khởi tạo login bằng QR - trả về object status (bao gồm qrCode khi pending)
-   */
   public async initiateLogin(): Promise<any> {
     if (this.status !== 'logged_out')
       return this.getStatus()
@@ -76,7 +72,6 @@ export class ZaloService {
         this.reset()
       }, 120000)
 
-      // Gọi zca-js loginQR (callback-based)
       this.zalo.loginQR({}, async (response: any) => {
         match(response)
           .with(
@@ -129,7 +124,6 @@ export class ZaloService {
     return loginPromise
   }
 
-  /** Bắt đầu lắng nghe tin nhắn/reaction */
   private startListener() {
     if (!this.api || this.listenerStarted)
       return
@@ -170,17 +164,56 @@ export class ZaloService {
 
   private async handleIncomingMessage(rawData: any) {
     try {
-      console.warn('[ZaloService] 📥 handleIncomingMessage START', {
-        msgId: rawData.msgId,
-        from: rawData.uidFrom,
-        to: rawData.idTo,
-      })
       const schema = await this.getSchemaFn()
       const messageId = rawData.msgId
       const senderId = rawData.uidFrom
       const recipientId = rawData.idTo
+
+      const currentUserId = this.api?.getOwnId?.()
+
+      if (!senderId || !recipientId) {
+        console.error('[ZaloService] Missing senderId or recipientId:', {
+          senderId,
+          recipientId,
+          rawData,
+        })
+        return
+      }
+
+      const messagesService = new this.ItemsService('zalo_messages', {
+        schema,
+        accountability: this.systemAccountability,
+      })
+
+      const existingMessages = await messagesService.readByQuery({
+        filter: { id: { _eq: messageId } },
+        limit: 1,
+      })
+
+      if (existingMessages.length > 0) {
+        return
+      }
+
       const timestamp = Number.parseInt(rawData.ts ?? rawData.t ?? `${Date.now()}`)
       const clientMsgId = rawData.cliMsgId
+
+      let isGroupMessage = !!rawData.groupId
+      let groupId = rawData.groupId
+
+      if (groupId) {
+        isGroupMessage = true
+      }
+      else if (recipientId && recipientId.startsWith('group_')) {
+        isGroupMessage = true
+        groupId = recipientId
+      }
+      else {
+        const existingConv = await this.findExistingConversation(recipientId, schema)
+        if (existingConv && existingConv.group_id) {
+          isGroupMessage = true
+          groupId = existingConv.id
+        }
+      }
 
       let content = ''
       let attachments: any[] = []
@@ -188,7 +221,6 @@ export class ZaloService {
       if (typeof rawData.content === 'string') {
         content = rawData.content
 
-        // Handle commands
         if (content.startsWith('/')) {
           await this.handleQuickMessage(content, recipientId, senderId)
         }
@@ -229,56 +261,54 @@ export class ZaloService {
         content = rawData.content.description || rawData.content.title || ''
       }
 
-      const userIds = [senderId, recipientId].filter(Boolean).sort()
-      const conversationId = userIds.length === 2
-        ? `direct_${userIds[0]}_${userIds[1]}`
-        : `thread_${recipientId || senderId}`
+      let conversationId: string
+      if (isGroupMessage && groupId) {
+        conversationId = groupId
+      }
+      else {
+        const userIds = [senderId, recipientId].sort()
+        conversationId = `direct_${userIds[0]}_${userIds[1]}`
+      }
 
       await this.startSync(conversationId)
 
       await this.upsertConversation(conversationId, rawData, schema, senderId, recipientId)
-      console.warn('[ZaloService] 👤 Fetching sender:', senderId)
+
       await this.fetchAndUpsertUser(senderId, schema)
 
-      if (recipientId && recipientId !== senderId) {
+      if (isGroupMessage && groupId) {
+        await this.ensureGroupMember(groupId, senderId, schema)
+      }
+
+      if (!isGroupMessage && recipientId && recipientId !== senderId) {
         await this.fetchAndUpsertUser(recipientId, schema)
       }
 
-      const messagesService = new this.ItemsService('zalo_messages', {
-        schema,
-        accountability: this.systemAccountability,
-      })
-
-      const existingMessages = await messagesService.readByQuery({
-        filter: { id: { _eq: messageId } },
-        limit: 1,
-      })
-
-      if (existingMessages.length === 0) {
-        await messagesService.createOne({
-          id: messageId,
-          client_id: clientMsgId || messageId,
-          conversation_id: conversationId,
-          sender_id: senderId,
-          content,
-          raw_data: rawData,
-          mentions: null,
-          forward_from_message_id: null,
-          reply_to_message_id: null,
-          is_edited: false,
-          is_undone: false,
-          sent_at: new Date(timestamp),
-          received_at: new Date(),
-          edited_at: null,
-        })
+      const messageData = {
+        id: messageId,
+        client_id: clientMsgId || messageId,
+        conversation_id: conversationId,
+        sender_id: senderId,
+        content,
+        raw_data: rawData,
+        mentions: null,
+        forward_from_message_id: null,
+        reply_to_message_id: null,
+        is_edited: false,
+        is_undone: false,
+        sent_at: new Date(timestamp),
+        received_at: new Date(),
+        edited_at: null,
+        message_type: isGroupMessage ? 'group' : 'direct',
+        websocket_broadcast: true,
       }
 
-      // 4. Create attachments
+      await messagesService.createOne(messageData)
+
       if (attachments.length > 0) {
         await this.createAttachments(messageId, attachments, schema)
       }
 
-      // 5. Update conversation
       await this.updateConversationLastMessage(
         conversationId,
         messageId,
@@ -286,7 +316,6 @@ export class ZaloService {
         schema,
       )
 
-      // 6. Auto-label
       if (typeof rawData.content === 'string' && rawData.content.trim() && !rawData.content.startsWith('/')) {
         try {
           await this.autoLabelConversation(conversationId, rawData.content)
@@ -296,14 +325,202 @@ export class ZaloService {
         }
       }
 
-      // 7. Complete sync
       await this.completeSync(conversationId, messageId)
     }
     catch (error) {
       console.error('[ZaloService] Error handling message:', error)
-
-      const conversationId = `direct_${rawData.uidFrom}_${rawData.idTo}`
+      const conversationId = rawData.groupId || `direct_${rawData.uidFrom}_${rawData.idTo}`
       await this.failSync(conversationId, error)
+    }
+  }
+
+  public async sendMessageWithBroadcast(data: {
+    conversationId: string
+    content: string
+    senderId: string
+  }): Promise<{ success: boolean, messageId?: string, error?: string }> {
+    try {
+      if (!this.api) {
+        throw new Error('Zalo API not connected')
+      }
+
+      const { conversationId, content, senderId } = data
+
+      let threadId: string
+      let recipientId: string | null = null
+
+      if (conversationId.startsWith('direct_')) {
+        const parts = conversationId.split('_')
+        const userId1 = parts[1]
+        const userId2 = parts[2]
+        const currentUserId = this.api.getOwnId?.()
+
+        recipientId = (userId1 === currentUserId ? userId2 : userId1) ?? null
+        if (!recipientId) {
+          throw new Error('Could not determine recipient ID from conversation ID')
+        }
+        threadId = recipientId
+      }
+      else {
+        threadId = conversationId
+      }
+
+      const result = await this.api.sendMessage({ msg: content }, threadId)
+
+      if (!result || result.error) {
+        throw new Error(result?.error?.message || 'Send failed')
+      }
+
+      const messageId = result.data?.msg_Id || result.msg_Id || `msg_${Date.now()}`
+
+      const schema = await this.getSchemaFn()
+      const messagesService = new this.ItemsService('zalo_messages', {
+        schema,
+        accountability: this.systemAccountability,
+      })
+
+      await messagesService.createOne({
+        id: messageId,
+        conversation_id: conversationId,
+        sender_id: senderId,
+        content,
+        sent_at: new Date(),
+        received_at: new Date(),
+        is_edited: false,
+        is_undone: false,
+        raw_data: result,
+        websocket_broadcast: true,
+      })
+      await this.updateConversationLastMessage(
+        conversationId,
+        messageId,
+        new Date(),
+        schema,
+      )
+
+      return {
+        success: true,
+        messageId,
+      }
+    }
+    catch (error: any) {
+      console.error('[ZaloService] sendMessageWithBroadcast failed:', error)
+      return {
+        success: false,
+        error: error.message,
+      }
+    }
+  }
+
+  private async findExistingConversation(id: string, schema: SchemaOverview): Promise<any | null> {
+    try {
+      const conversationsService = new this.ItemsService('zalo_conversations', {
+        schema,
+        accountability: this.systemAccountability,
+      })
+
+      const result = await conversationsService.readByQuery({
+        filter: { id: { _eq: id } },
+        fields: ['id', 'group_id'],
+        limit: 1,
+      })
+
+      if (result.length > 0) {
+        return result[0]
+      }
+
+      const groupResult = await conversationsService.readByQuery({
+        filter: { group_id: { _eq: id } },
+        fields: ['id', 'group_id'],
+        limit: 1,
+      })
+
+      return groupResult.length > 0 ? groupResult[0] : null
+    }
+    catch (error) {
+      console.error('[ZaloService] Error finding conversation:', error)
+      return null
+    }
+  }
+
+  private validateConversationId(
+    conversationId: string,
+    senderId?: string,
+    recipientId?: string,
+  ): boolean {
+    if (!conversationId.startsWith('direct_')) {
+      return true
+    }
+
+    const match = conversationId.match(/^direct_([^_]+)_([^_]+)$/)
+    if (!match) {
+      console.error('[ZaloService] Invalid conversation ID format:', conversationId)
+      return false
+    }
+
+    const [, userId1, userId2] = match
+
+    if (senderId && recipientId) {
+      const hasUser1 = senderId === userId1 || recipientId === userId1
+      const hasUser2 = senderId === userId2 || recipientId === userId2
+
+      if (!hasUser1 || !hasUser2) {
+        console.error('[ZaloService] ConversationId mismatch:', {
+          conversationId,
+          senderId,
+          recipientId,
+          expected: [userId1, userId2],
+        })
+        return false
+      }
+    }
+
+    return true
+  }
+
+  private async ensureGroupMember(
+    groupId: string,
+    userId: string,
+    schema: SchemaOverview,
+  ) {
+    try {
+      const membersService = new this.ItemsService('zalo_group_members', {
+        schema,
+        accountability: this.systemAccountability,
+      })
+
+      const existing = await membersService.readByQuery({
+        filter: {
+          _and: [
+            { group_id: { _eq: groupId } },
+            { user_id: { _eq: userId } },
+          ],
+        },
+        limit: 1,
+      })
+
+      if (existing.length > 0) {
+        if (!existing[0].isactive) {
+          await membersService.updateOne(existing[0].id, {
+            isactive: true,
+            joinedat: new Date(),
+            leftat: null,
+            updatedat: new Date(),
+          })
+        }
+        return
+      }
+
+      await membersService.createOne({
+        group_id: groupId,
+        user_id: userId,
+        isactive: true,
+        joinedat: new Date(),
+        leftat: null,
+      })
+    }
+    catch (error: any) {
+      console.error('[ZaloService] Error ensuring group member:', error.message)
     }
   }
 
@@ -369,7 +586,6 @@ export class ZaloService {
     try {
       const trimmedContent = content.trim()
 
-      // Check label commands
       if (trimmedContent.startsWith('/label ')) {
         const userIds = [senderId, recipientId].filter(Boolean).sort()
         const conversationId = userIds.length === 2
@@ -380,19 +596,16 @@ export class ZaloService {
         return
       }
 
-      // Check quick messages
       const quickMsg = await this.findQuickMessageByKeyword(trimmedContent)
 
       if (quickMsg) {
         await this.incrementQuickMessageUsage(quickMsg.id)
 
-        // ✅ Silent retry cho quick messages
         try {
           await this.sendMessage({ msg: quickMsg.content }, senderId)
         }
         catch (error: any) {
           if (error.code === 114 || error.message?.includes('không hợp lệ')) {
-          // Silent retry, không log
             await this.sendMessage({ msg: quickMsg.content }, recipientId)
           }
           else {
@@ -419,11 +632,10 @@ export class ZaloService {
           await this.sendMessage({ msg }, senderId)
         }
         catch (error: any) {
-          if (error.code === 114 || error.message?.includes('không hợp lệ')) {
+          if (error.code === 114 || error.message?.includes('not valid')) {
             await this.sendMessage({ msg }, recipientId)
           }
           else {
-            console.error('[ZaloService] Send message error:', error.message)
             throw error
           }
         }
@@ -467,11 +679,11 @@ export class ZaloService {
 
       if (action === 'add') {
         await this.addLabelToConversation(conversationId, label.id)
-        await sendReply(`✓ Added label "${label.name}"`)
+        await sendReply(`Added label "${label.name}"`)
       }
       else if (action === 'remove') {
         await this.removeLabelFromConversation(conversationId, label.id)
-        await sendReply(`✓ Removed label "${label.name}"`)
+        await sendReply(`Removed label "${label.name}"`)
       }
       else {
         await sendReply(`Invalid action "${action}". Use "add" or "remove"`)
@@ -496,7 +708,6 @@ export class ZaloService {
     }
   }
 
-  // Helper function để get MIME type từ extension
   private getMimeTypeFromExtension(ext: string | undefined): string | null {
     if (!ext)
       return null
@@ -536,61 +747,111 @@ export class ZaloService {
         accountability: this.systemAccountability,
       })
 
-      // Check if exists
       const existing = await conversationsService.readByQuery({
         filter: { id: { _eq: conversationId } },
         limit: 1,
       })
 
       if (existing.length === 0) {
+        const isGroup = !!rawData.groupId || !conversationId.startsWith('direct_')
+
+        let finalParticipantId: string | null = null
+
+        if (!isGroup) {
+          if (senderId && recipientId && recipientId) {
+            const currentUserId = this.api?.getOwnId?.()
+
+            if (currentUserId) {
+              finalParticipantId = senderId === currentUserId
+                ? recipientId
+                : senderId
+            }
+            else {
+              finalParticipantId = recipientId
+            }
+
+            console.warn(`Direct conversation - participant: ${finalParticipantId}`)
+          }
+        }
+        else {
+          console.warn(`Group conversation - no participant`)
+        }
+
+        console.warn(`Creating conversation: ${conversationId}, type: ${isGroup ? 'group' : 'direct'}, participant: ${finalParticipantId}`)
+
         await conversationsService.createOne({
           id: conversationId,
-          type: 'direct',
-          participant_id: recipientId || null,
-          group_id: rawData.groupId || rawData.threadId || null,
+          type: isGroup ? 'group' : 'direct',
+          participant_id: finalParticipantId,
+          group_id: isGroup ? (rawData.groupId || conversationId) : null,
           is_pinned: false,
           is_muted: false,
           is_archived: false,
           is_hidden: false,
           unread_count: 0,
+          last_message_time: new Date().toISOString(),
+        })
+
+        console.warn(`Conversation created successfully`)
+      }
+      else {
+        console.warn(`Conversation exists, updating last_message_time`)
+        await conversationsService.updateOne(conversationId, {
+          last_message_time: new Date().toISOString(),
         })
       }
     }
-    catch (error) {
-      console.error('[ZaloService] Error upserting conversation:', error)
+    catch (error: any) {
+      console.error('[ZaloService] Error upserting conversation:', error.message)
     }
   }
 
   private async fetchAndUpsertUser(userId: string, schema?: SchemaOverview) {
-    console.warn('[ZaloService] Starting fetchAndUpsertUser for:', userId)
-
-    // Check for recursive calls
-    const currentStack = new Error('Checking recursion depth').stack || ''
-    const fetchCallCount = (currentStack.match(/fetchAndUpsertUser/g) || []).length
-    console.warn('[ZaloService] Call depth:', fetchCallCount, 'for user:', userId)
+    const currentStack = new Error('Checking recursion depth').stack
+    const fetchCallCount = (currentStack!.match(/fetchAndUpsertUser/g) || []).length
 
     if (fetchCallCount > 3) {
-      console.error('[ZaloService] Excessive recursion detected for user:', userId)
       throw new Error('Excessive recursion in fetchAndUpsertUser')
     }
 
-    if (!this.api) {
-      console.warn('[ZaloService] API not available, creating basic user record')
-      await this.createBasicUser(userId)
-      return
-    }
-
     try {
-      const currentSchema = schema || await this.getSchemaFn()
+      const currentSchema = schema ?? await this.getSchemaFn()
+      const usersService = new this.ItemsService('zalo_users', {
+        schema: currentSchema,
+        accountability: this.systemAccountability,
+      })
+
+      const existingUsers = await usersService.readByQuery({
+        filter: { id: { _eq: userId } },
+        limit: 1,
+      })
+
+      if (existingUsers.length > 0) {
+        const existingUser = existingUsers[0]
+        if (existingUser.display_name && existingUser.display_name !== 'Unknown User') {
+          return
+        }
+      }
+
+      if (!this.api) {
+        await this.createBasicUser(userId)
+        return
+      }
+
       let userInfo: any = null
 
       try {
         const apiResponse = await this.api.getUserInfo(userId)
-        userInfo = apiResponse?.changed_profiles?.[userId] || apiResponse || null
+        userInfo = apiResponse?.changed_profiles?.[userId] ?? null
       }
-      catch (err: any) {
-        console.warn('[ZaloService] Failed to fetch user info:', err.message)
-        userInfo = null
+      catch {
+        await this.createBasicUser(userId)
+        return
+      }
+
+      if (!userInfo) {
+        await this.createBasicUser(userId)
+        return
       }
 
       const parseDateOfBirth = (dob: any): Date | null => {
@@ -602,11 +863,15 @@ export class ZaloService {
             return new Date(dob > 9999999999 ? dob : dob * 1000)
           }
 
-          if (typeof dob === 'string' && /^\d{2}\/\d{2}\/\d{4}$/.test(dob)) {
+          if (typeof dob === 'string' && /\d{2}\/\d{2}\/\d{4}/.test(dob)) {
             const [day, month, year] = dob.split('/').map(Number)
             const date = new Date(year ?? 0, (month ?? 1) - 1, day ?? 1)
 
-            if (date.getFullYear() === (year ?? 0) && date.getMonth() === ((month ?? 1) - 1) && date.getDate() === (day ?? 1)) {
+            if (
+              date.getFullYear() === (year ?? 0)
+              && date.getMonth() === (month ?? 1) - 1
+              && date.getDate() === (day ?? 1)
+            ) {
               return date
             }
           }
@@ -619,25 +884,17 @@ export class ZaloService {
         }
       }
 
-      const displayName = userInfo?.displayName || 'Unknown User'
+      const displayName = userInfo?.displayName ?? 'Unknown User'
       const avatarUrl = userInfo?.avatar
       const coverUrl = userInfo?.cover
       const alias = userInfo?.username
-      const dateOfBirth = parseDateOfBirth(userInfo?.sdob || userInfo?.dob)
-      const isFriend = userInfo?.isFr === 1 || false
-      const lastOnline = userInfo?.lastActionTime ? new Date(Number(userInfo.lastActionTime)) : null
-      const statusMessage = userInfo?.status || null
+      const dateOfBirth = parseDateOfBirth(userInfo?.sdob ?? userInfo?.dob)
+      const isFriend = userInfo?.isFr === 1
+      const lastOnline = userInfo?.lastActionTime
+        ? new Date(Number(userInfo.lastActionTime))
+        : null
+      const statusMessage = userInfo?.status ?? null
       const zaloName = userInfo?.zaloName
-
-      const usersService = new this.ItemsService('zalo_users', {
-        schema: currentSchema,
-        accountability: this.systemAccountability,
-      })
-
-      const existingUsers = await usersService.readByQuery({
-        filter: { id: { _eq: userId } },
-        limit: 1,
-      })
 
       const userData = {
         display_name: displayName,
@@ -652,14 +909,14 @@ export class ZaloService {
         raw_data: userInfo,
       }
 
-      if (existingUsers.length === 0) {
+      if (existingUsers.length > 0) {
+        await usersService.updateOne(userId, userData)
+      }
+      else {
         await usersService.createOne({
           id: userId,
           ...userData,
         })
-      }
-      else if (userInfo) {
-        await usersService.updateOne(userId, userData)
       }
     }
     catch (error) {
@@ -670,7 +927,6 @@ export class ZaloService {
 
   private async createBasicUser(userId: string) {
     try {
-      console.warn('[ZaloService] 👤 createBasicUser for:', userId)
       const schema = await this.getSchemaFn()
 
       const usersService = new this.ItemsService('zalo_users', {
@@ -720,7 +976,6 @@ export class ZaloService {
         limit: 1,
       })
 
-      // ✅ Map theo structure thật
       const groupData = {
         name: groupInfo.name || `Group ${groupId}`,
         description: groupInfo.desc || null,
@@ -764,10 +1019,8 @@ export class ZaloService {
 
       const gridVerMap = response.gridVerMap
       const groupIds = Object.keys(gridVerMap)
-
       const schema = await this.getSchemaFn()
-
-      const BATCH_SIZE = 2
+      const BATCH_SIZE = 20
 
       for (let i = 0; i < groupIds.length; i += BATCH_SIZE) {
         const batch = groupIds.slice(i, i + BATCH_SIZE)
@@ -778,29 +1031,27 @@ export class ZaloService {
             const groupInfo = response?.gridInfoMap?.[groupId]
 
             if (!groupInfo) {
-              console.warn('[ZaloService] No groupInfo for:', groupId)
               return
             }
-
-            await this.upsertGroup(groupId, groupInfo, schema)
-            await this.upsertConversation(groupId, {
-              groupId: groupInfo.groupId || groupId,
-              name: groupInfo.name || `Group ${groupId}`,
-              avatar: groupInfo.fullAvt || groupInfo.avt || null,
-              type: 'group',
-            }, schema)
-
-            await this.syncGroupMembers(groupId, groupInfo)
+            await Promise.all([
+              this.upsertGroup(groupId, groupInfo, schema),
+              this.upsertConversation(groupId, {
+                groupId: groupInfo.groupId || groupId,
+                name: groupInfo.name || `Group ${groupId}`,
+                avatar: groupInfo.fullAvt || groupInfo.avt || null,
+                type: 'group',
+              }, schema),
+            ])
           }
           catch (error: any) {
-            console.error('[ZaloService] ❌ Error syncing group', groupId, ':', error.message)
+            console.error('[ZaloService] Error syncing group', groupId, ':', error.message)
           }
         })
 
         await Promise.all(batchPromises)
 
         if (i + BATCH_SIZE < groupIds.length) {
-          await new Promise(resolve => setTimeout(resolve, 3000))
+          await new Promise(resolve => setTimeout(resolve, 1000))
         }
       }
     }
@@ -815,29 +1066,65 @@ export class ZaloService {
         return
       }
 
-      const MEMBER_BATCH_SIZE = 20
+      const schema = await this.getSchemaFn()
+      const membersService = new this.ItemsService('zalo_group_members', {
+        schema,
+        accountability: this.systemAccountability,
+      })
 
+      const existingMembers = await membersService.readByQuery({
+        filter: { group_id: { _eq: groupId } },
+        fields: ['user_id'],
+      })
+
+      const existingUserIds = new Set(existingMembers.map((m: any) => m.user_id))
+
+      const userIdsToFetch = groupInfo.memVerList
+        .map((memVer: string) => memVer.split('|')[0])
+        .filter((userId: string) => userId && !existingUserIds.has(userId))
+
+      const USER_BATCH_SIZE = 10
+      for (let i = 0; i < userIdsToFetch.length; i += USER_BATCH_SIZE) {
+        const userBatch = userIdsToFetch.slice(i, i + USER_BATCH_SIZE)
+
+        await Promise.all(
+          userBatch.map(async (userId: string) => {
+            try {
+              await this.fetchAndUpsertUser(userId, schema)
+            }
+            catch (error: any) {
+              console.error('[ZaloService] Failed to fetch user:', userId, error.message)
+            }
+          }),
+        )
+
+        if (i + USER_BATCH_SIZE < userIdsToFetch.length) {
+          await new Promise(resolve => setTimeout(resolve, 2000))
+        }
+      }
+
+      const MEMBER_BATCH_SIZE = 20
       for (let i = 0; i < groupInfo.memVerList.length; i += MEMBER_BATCH_SIZE) {
         const memberBatch = groupInfo.memVerList.slice(i, i + MEMBER_BATCH_SIZE)
 
         await Promise.all(
           memberBatch.map(async (memVer: string) => {
             try {
-              const userId = memVer.split('_')[0]
-
-              if (!userId) {
-                console.warn('[ZaloService] Invalid member format:', memVer)
+              const userId = memVer.split('|')[0]
+              if (!userId || existingUserIds.has(userId)) {
                 return
               }
 
               await this.upsertGroupMember(groupId, userId, {
-                is_active: true,
-                joined_at: new Date(),
-                left_at: null,
+                isactive: true,
+                joinedat: new Date(),
+                leftat: null,
               })
+
+              existingUserIds.add(userId)
             }
             catch (error: any) {
-              console.error('[ZaloService] Error processing member', memVer, ':', error.message)
+              console.error('[ZaloService] Error creating member:', memVer, error.message)
             }
           }),
         )
@@ -883,7 +1170,7 @@ export class ZaloService {
           await attachmentsService.createOne(attachmentData)
         }
         catch (attError: any) {
-          console.error('[ZaloService] ❌ Error creating attachment:', attError.message)
+          console.error('[ZaloService] Error creating attachment:', attError.message)
         }
       }
     }
@@ -936,7 +1223,6 @@ export class ZaloService {
         accountability: this.systemAccountability,
       })
 
-      // Upsert reaction
       const existing = await service.readByQuery({
         filter: {
           _and: [
@@ -1111,7 +1397,6 @@ export class ZaloService {
         accountability: this.systemAccountability,
       })
 
-      // Check if already exists
       const existing = await service.readByQuery({
         filter: {
           _and: [
@@ -1414,57 +1699,17 @@ export class ZaloService {
     }
   }
 
-  public async upsertGroupMember(
+  private async upsertGroupMember(
     groupId: string,
     userId: string,
     data: {
-      is_active?: boolean
-      joined_at?: Date | null
-      left_at?: Date | null
+      isactive?: boolean
+      joinedat?: Date | null
+      leftat?: Date | null
     },
   ) {
     try {
       const schema = await this.getSchemaFn()
-
-      const collectionExists = schema.collections.zalo_group_members
-
-      if (!collectionExists) {
-        console.error('[ZaloService] Available collections:', Object.keys(schema.collections))
-        return
-      }
-
-      const groupsService = new this.ItemsService('zalo_groups', {
-        schema,
-        accountability: this.systemAccountability,
-      })
-
-      const groupExists = await groupsService.readByQuery({
-        filter: { id: { _eq: groupId } },
-        limit: 1,
-      })
-
-      if (groupExists.length === 0) {
-        console.warn('[ZaloService] Group not found:', groupId)
-        return
-      }
-
-      const usersService = new this.ItemsService('zalo_users', {
-        schema,
-        accountability: this.systemAccountability,
-      })
-
-      const userExists = await usersService.readByQuery({
-        filter: { id: { _eq: userId } },
-        limit: 1,
-      })
-
-      if (userExists.length === 0) {
-        await usersService.createOne({
-          id: userId,
-          display_name: `User ${userId.slice(-6)}`,
-          created_at: new Date(),
-        })
-      }
 
       const membersService = new this.ItemsService('zalo_group_members', {
         schema,
@@ -1481,22 +1726,28 @@ export class ZaloService {
         limit: 1,
       })
 
-      if (existing.length === 0) {
-        await membersService.createOne({
-          group_id: groupId,
-          user_id: userId,
-          is_active: data.is_active ?? true,
-          joined_at: data.joined_at ?? new Date(),
-          left_at: data.left_at ?? null,
-        })
+      if (existing.length > 0) {
+        const current = existing[0]
+        const needsUpdate
+          = (data.isactive !== undefined && current.isactive !== data.isactive)
+            || (data.leftat !== undefined && current.leftat !== data.leftat)
+
+        if (needsUpdate) {
+          await membersService.updateOne(existing[0].id, {
+            isactive: data.isactive,
+            leftat: data.leftat,
+            updatedat: new Date(),
+          })
+        }
+        return
       }
-      else {
-        await membersService.updateOne(existing[0].id, {
-          is_active: data.is_active,
-          joined_at: data.joined_at,
-          left_at: data.left_at,
-        })
-      }
+      await membersService.createOne({
+        group_id: groupId,
+        user_id: userId,
+        isactive: data.isactive ?? true,
+        joinedat: data.joinedat ?? new Date(),
+        leftat: data.leftat ?? null,
+      })
     }
     catch (error: any) {
       console.error('[ZaloService] Error upserting group member:', error.message)
@@ -1532,16 +1783,16 @@ export class ZaloService {
 
   public async markMemberLeft(groupId: string, userId: string) {
     await this.upsertGroupMember(groupId, userId, {
-      is_active: false,
-      left_at: new Date(),
+      isactive: false,
+      leftat: new Date(),
     })
   }
 
   public async markMemberRejoined(groupId: string, userId: string) {
     await this.upsertGroupMember(groupId, userId, {
-      is_active: true,
-      joined_at: new Date(),
-      left_at: null,
+      isactive: true,
+      joinedat: new Date(),
+      leftat: null,
     })
   }
 
@@ -1576,11 +1827,9 @@ export class ZaloService {
     if (this.reconnectAttempts < this.maxReconnectAttempts) {
       this.reconnectAttempts++
       const delay = this.reconnectDelay * this.reconnectAttempts
-      console.warn(`[ZaloService] Listener error - will retry in ${delay}ms (attempt ${this.reconnectAttempts})`)
       setTimeout(() => this.restartListener(), delay)
     }
     else {
-      console.error('[ZaloService] Max reconnect attempts reached, resetting service')
       this.reset()
     }
   }
@@ -1602,18 +1851,29 @@ export class ZaloService {
     }
   }
 
-  public async sendMessage(messageData: any, threadId: string): Promise<any> {
+  public async sendMessage(
+    content: { msg: string },
+    threadId: string,
+    threadType: typeof ThreadType.User | typeof ThreadType.Group = ThreadType.User,
+  ): Promise<any> {
     if (!this.api) {
-      throw new Error('Not logged in')
+      throw new Error('Zalo API not initialized. Please login first.')
+    }
+
+    if (this.status !== 'logged_in') {
+      throw new Error(`Zalo not logged in. Current status: ${this.status}`)
     }
 
     try {
-      const result = await this.api.sendMessage(messageData, threadId)
+      const result = await this.api.sendMessage(content, threadId, threadType)
+      if (result?.error) {
+        throw new Error(result.error.message || 'Zalo API returned error')
+      }
+
       return result
     }
     catch (error: any) {
-      console.error('[ZaloService] Send message error:', error.message)
-      throw error
+      throw new Error(`Failed to send via Zalo: ${error.message}`)
     }
   }
 

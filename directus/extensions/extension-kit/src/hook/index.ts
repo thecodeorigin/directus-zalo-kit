@@ -249,7 +249,7 @@ export default defineHook(({ action, init, schedule }, { services, getSchema, lo
         const status = zaloService?.getStatus()
         await zaloService?.sendMessage(
           message.threadId,
-          `🤖 Bot Status:\nStatus: ${status?.status}\nUser ID: ${status?.userId || 'Not logged in'}\nListening: ${status?.isListening ? 'Yes' : 'No'}`,
+          ` Bot Status:\nStatus: ${status?.status}\nUser ID: ${status?.userId || 'Not logged in'}\nListening: ${status?.isListening ? 'Yes' : 'No'}`,
         )
         break
       }
@@ -257,13 +257,13 @@ export default defineHook(({ action, init, schedule }, { services, getSchema, lo
       case 'help': {
         await zaloService?.sendMessage(
           message.threadId,
-          `📋 Available Commands:\n/status - Check bot status\n/help - Show this help message\n/ping - Test bot response`,
+          ` Available Commands:\n/status - Check bot status\n/help - Show this help message\n/ping - Test bot response`,
         )
         break
       }
 
       case 'ping': {
-        await zaloService?.sendMessage(message.threadId, '🏓 Pong!')
+        await zaloService?.sendMessage(message.threadId, 'Pong!')
         break
       }
 

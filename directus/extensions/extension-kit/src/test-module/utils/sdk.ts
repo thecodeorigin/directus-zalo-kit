@@ -35,4 +35,4 @@ const client = createDirectus<Schema>('http://localhost:8055')
   .with(rest())
   .with(authentication('json'))
 
-export default client
+export { client }
