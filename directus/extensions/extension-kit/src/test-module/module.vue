@@ -2696,8 +2696,9 @@ watch(activeConversationId, (newId) => {
 =======
 >>>>>>> d0ac1a5 (feat:create_UI_Chat_V3)
 <script setup lang="ts">
-import { readItems } from '@directus/sdk'
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { authentication, createDirectus, readItems, readMe, realtime, rest } from '@directus/sdk'
+import { computed, nextTick, onBeforeUnmount, onMounted, onUnmounted, ref, watch } from 'vue'
+
 import client from './utils/sdk'
 
 interface Conversation {
@@ -2708,6 +2709,8 @@ interface Conversation {
   timestamp: string
   unreadCount: number
   online: boolean
+  type: 'group' | 'direct'
+  members?: string[]
 }
 
 interface Message {
@@ -2718,12 +2721,14 @@ interface Message {
   senderId: string
   time: string
   avatar?: string
-  status?: 'sent' | 'delivered' | 'read'
+  status?: 'sent' | 'delivered' | 'read' | 'failed'
+  type?: 'system' | 'user'
+  clientId?: string
 }
-
-// Reactive data
+const currentFunction = ref<string | null>(null)
 const searchQuery = ref('')
 const navSearchQuery = ref('')
+const messageSearchQuery = ref('')
 const messageText = ref('')
 const activeConversationId = ref<string>('')
 const messagesContainer = ref<HTMLElement | null>(null)
@@ -2733,248 +2738,131 @@ const loading = ref(false)
 const sendingMessage = ref(false)
 const currentUserId = ref('system')
 const isAuthenticated = ref(false)
+const isLoadingMessages = ref(false)
+const isLoadingConversations = ref(false)
+const showFilterDropdown = ref(false)
+const highlightedMessageId = ref<string | null>(null)
+const showMembersDialog = ref(false)
+const memberSearchQuery = ref('')
+const selectedMembers = ref<string[]>([])
+
+const conversationTypeFilter = ref<'all' | 'group' | 'direct'>('all')
+
+const filterOptions = ref({
+  status: {
+    online: false,
+    offline: false,
+  },
+  messageType: {
+    unread: false,
+    important: false,
+    archived: false,
+  },
+})
+
+function showFunctionA() {
+  currentFunction.value = 'A'
+}
+
+function showFunctionB() {
+  currentFunction.value = 'B'
+}
+
+const directusClient = createDirectus('http://localhost:8055')
+  .with(authentication())
+  .with(realtime())
+  .with(rest())
+
+let subscriptionCleanup: (() => void) | null = null
 
 const filteredConversations = computed(() => {
   const query = navSearchQuery.value || searchQuery.value
-  if (!query)
-    return conversations.value
+  let filtered = conversations.value
 
-  return conversations.value.filter(conv =>
-    conv.name.toLowerCase().includes(query.toLowerCase())
-    || conv.lastMessage.toLowerCase().includes(query.toLowerCase()),
-  )
+  if (conversationTypeFilter.value !== 'all') {
+    filtered = filtered.filter(conv => conv.type === conversationTypeFilter.value)
+  }
+
+  if (query) {
+    filtered = filtered.filter(conv =>
+      conv.name.toLowerCase().includes(query.toLowerCase())
+      || conv.lastMessage.toLowerCase().includes(query.toLowerCase()),
+    )
+  }
+
+  const { status, messageType } = filterOptions.value
+
+  if (status.online || status.offline) {
+    filtered = filtered.filter((conv) => {
+      if (status.online && status.offline)
+        return true
+      if (status.online)
+        return conv.online
+      if (status.offline)
+        return !conv.online
+      return true
+    })
+  }
+
+  if (messageType.unread) {
+    filtered = filtered.filter(conv => conv.unreadCount > 0)
+  }
+
+  return filtered
 })
 
 const activeConversation = computed(() => {
   return conversations.value.find(conv => conv.id === activeConversationId.value)
 })
 
-async function autoLogin() {
-  try {
-    await client.login({
-      email: 'admin@example.com',
-      password: 'd1r3ctu5',
-    })
-
-    isAuthenticated.value = true
-    console.log('Authenticated with Directus')
+const conversationStats = computed(() => {
+  return {
+    all: conversations.value.length,
+    group: conversations.value.filter(c => c.type === 'group').length,
+    direct: conversations.value.filter(c => c.type === 'direct').length,
   }
-  catch (error) {
-    console.error('Authentication failed:', error)
-    isAuthenticated.value = false
-  }
-}
+})
 
-async function loadConversations() {
-  if (!isAuthenticated.value) {
-    console.warn(' Not authenticated')
-    return
+const searchFilteredMessages = computed(() => {
+  if (!messageSearchQuery.value.trim()) {
+    return []
   }
 
-  try {
-    loading.value = true
+  const query = messageSearchQuery.value.toLowerCase().trim()
 
-    const data = await client.request(
-      readItems('zalo_conversations', {
-        fields: [
-          '*',
-          {
-            participant_id: ['id', 'display_name', 'zalo_name', 'avatar_url'],
-          },
-          {
-            group_id: ['id', 'name', 'avatar_url'],
-          },
-          {
-            last_message_id: ['content'],
-          },
-        ],
-        filter: {
-          is_hidden: { _eq: false },
-        },
-        sort: ['-is_pinned', '-last_message_time'],
-        limit: 50,
-      }),
-    )
+  return messages.value.filter(message =>
+    message.text.toLowerCase().includes(query),
+  ).map(message => ({
+    ...message,
+    highlightedText: highlightSearchText(message.text, messageSearchQuery.value),
+  }))
+})
 
-    conversations.value = data.map((conv: any) => {
-      let name = 'Unknown'
-      if (conv.participant_id?.display_name) {
-        name = conv.participant_id.display_name
-      }
-      else if (conv.participant_id?.zalo_name) {
-        name = conv.participant_id.zalo_name
-      }
-      else if (conv.group_id?.name) {
-        name = conv.group_id.name
-      }
+const selectedMemberObjects = computed(() => {
+  return conversations.value.filter(member =>
+    selectedMembers.value.includes(member.id) && member.type === 'direct',
+  )
+})
 
-      let avatar = ''
-      if (conv.participant_id?.avatar_url) {
-        avatar = conv.participant_id.avatar_url
-      }
-      else if (conv.group_id?.avatar_url) {
-        avatar = conv.group_id.avatar_url
-      }
-      else {
-        avatar = `https://ui-avatars.com/api/?name=${encodeURIComponent(name)}&background=random`
-      }
+const filteredMembers = computed(() => {
+  const directChats = conversations.value.filter(c => c.type === 'direct')
 
-      return {
-        id: conv.id,
-        name,
-        avatar,
-        lastMessage: conv.last_message_id?.content || '',
-        timestamp: formatTime(conv.last_message_time),
-        unreadCount: conv.unread_count || 0,
-        online: true,
-      }
-    })
-
-    console.log('Loaded conversations:', conversations.value.length)
-
-    if (conversations.value.length > 0 && !activeConversationId.value) {
-      selectConversation(conversations.value[0].id)
-    }
-  }
-  catch (error: any) {
-    console.error('Error loading conversations:', error)
-  }
-  finally {
-    loading.value = false
-  }
-}
-
-async function loadMessages(conversationId: string) {
-  if (!isAuthenticated.value)
-    return
-
-  try {
-    loading.value = true
-
-    const data = await client.request(
-      readItems('zalo_messages', {
-        fields: [
-          '*',
-          {
-            sender_id: ['id', 'display_name', 'zalo_name', 'avatar_url'],
-          },
-        ],
-        filter: {
-          conversation_id: { _eq: conversationId },
-        },
-        sort: ['sent_at'],
-        limit: 100,
-      }),
-    )
-
-    messages.value = data.map((msg: any) => {
-      let senderName = 'Unknown'
-      let senderAvatar = ''
-
-      if (msg.sender_id?.display_name) {
-        senderName = msg.sender_id.display_name
-      }
-      else if (msg.sender_id?.zalo_name) {
-        senderName = msg.sender_id.zalo_name
-      }
-      else if (typeof msg.sender_id === 'string') {
-        senderName = msg.sender_id
-      }
-
-      if (msg.sender_id?.avatar_url) {
-        senderAvatar = msg.sender_id.avatar_url
-      }
-      else {
-        senderAvatar = `https://ui-avatars.com/api/?name=${encodeURIComponent(senderName)}&background=random`
-      }
-
-      const senderId = typeof msg.sender_id === 'object' ? msg.sender_id.id : msg.sender_id
-      const direction = senderId === currentUserId.value ? 'out' : 'in'
-
-      return {
-        id: msg.id,
-        direction,
-        text: msg.content || '',
-        senderName,
-        senderId,
-        time: formatTime(msg.sent_at),
-        avatar: direction === 'in' ? senderAvatar : undefined,
-        status: direction === 'out' ? 'read' : undefined,
-      }
-    })
-
-    console.log(`Loaded ${messages.value.length} messages`)
-
-    nextTick(() => {
-      scrollToBottom()
-    })
-  }
-  catch (error: any) {
-    console.error(' Error loading messages:', error)
-  }
-  finally {
-    loading.value = false
-  }
-}
-
-async function sendMessage() {
-  if (!messageText.value.trim() || !activeConversationId.value || sendingMessage.value) {
-    return
+  if (!memberSearchQuery.value.trim()) {
+    return directChats
   }
 
-  const tempMessage: Message = {
-    id: `temp_${Date.now()}`,
-    direction: 'out',
-    text: messageText.value.trim(),
-    senderName: 'You',
-    senderId: currentUserId.value,
-    time: formatTime(new Date().toISOString()),
-    status: 'sent',
-  }
+  return directChats.filter(member =>
+    member.name.toLowerCase().includes(memberSearchQuery.value.toLowerCase()),
+  )
+})
 
-  messages.value.push(tempMessage)
-  const messageContent = messageText.value.trim()
-  messageText.value = ''
+// ==================== HELPER FUNCTIONS ====================
+function highlightSearchText(text: string, searchTerm: string): string {
+  if (!searchTerm.trim())
+    return text
 
-  nextTick(() => {
-    scrollToBottom()
-  })
-
-  try {
-    sendingMessage.value = true
-
-    const token = await client.getToken()
-    const response = await fetch(`http://localhost:8055/zalo/conversations/${activeConversationId.value}/messages`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${token}`,
-      },
-      body: JSON.stringify({ content: messageContent }),
-    })
-
-    if (!response.ok) {
-      throw new Error('Failed to send message')
-    }
-
-    console.log(' Message sent')
-
-    setTimeout(() => {
-      loadMessages(activeConversationId.value)
-    }, 1000)
-  }
-  catch (error: any) {
-    console.error(' Error sending message:', error)
-    messages.value = messages.value.filter(m => m.id !== tempMessage.id)
-  }
-  finally {
-    sendingMessage.value = false
-  }
-}
-
-function selectConversation(id: string) {
-  activeConversationId.value = id
-  loadMessages(id)
+  const regex = new RegExp(`(${searchTerm.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi')
+  return text.replace(regex, '<mark class="bg-yellow-200 px-1 rounded">$1</mark>')
 }
 
 function formatTime(dateString: string): string {
@@ -2989,6 +2877,501 @@ function formatTime(dateString: string): string {
   }
 }
 
+function handleImageError(event: Event, conversationName: string) {
+  const img = event.target as HTMLImageElement
+
+  if (img.src.includes('ui-avatars.com')) {
+    img.onerror = null
+    img.src = 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iNDAiIGhlaWdodD0iNDAiIHZpZXdCb3g9IjAgMCA0MCA0MCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPGNpcmNsZSBjeD0iMjAiIGN5PSIyMCIgcj0iMjAiIGZpbGw9IiNFNUU3RUIiLz4KPHN2ZyB3aWR0aD0iMjQiIGhlaWdodD0iMjQiIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIiB4PSI4IiB5PSI4Ij4KPHBhdGggZD0iTTEyIDEyQzE0LjIwOTEgMTIgMTYgMTAuMjA5MSAxNiA4QzE2IDUuNzkwODYgMTQuMjA5MSA0IDEyIDRDOS43OTA4NiA0IDggNS43OTA4NiA4IDhDOCAxMC4yMDkxIDkuNzkwODYgMTIgMTIgMTJaIiBmaWxsPSIjOUM5Q0EwIi8+CjxwYXRoIGQ9Ik0xMiAxNEM5LjMzOTcyIDE0IDYuOTIxNzggMTUuMzMzNSA1LjY4MTc4IDE3LjYzNTFDNS4wNzc4IDE4Ljc0OTEgNS4wNzc4IDE5Ljk4NDcgNS42ODE3OCAyMS4wOTg3QzYuOTIxNzggMjMuNDAwMyA5LjMzOTcyIDI0LjczMzggMTIgMjQuNzMzOEMxNC42NjAzIDI0LjczMzggMTcuMDc4MiAyMy40MDAzIDE4LjMxODIgMjEuMDk4N0MxOC45MjIyIDE5Ljk4NDcgMTguOTIyMiAxOC43NDkxIDE4LjMxODIgMTcuNjM1MUMxNy4wNzgyIDE1LjMzMzUgMTQuNjYwMyAxNCAxMiAxNFoiIGZpbGw9IiM5QzlDQTAiLz4KPC9zdmc+Cjwvc3ZnPgo='
+    return
+  }
+
+  img.src = `https://ui-avatars.com/api/?name=${encodeURIComponent(conversationName)}&background=random`
+}
+
+async function autoLogin() {
+  try {
+    // 1. Login REST client
+    await client.login({
+      email: 'admin@example.com',
+      password: 'd1r3ctu5',
+    })
+
+    isAuthenticated.value = true
+
+    // 2. Connect & login WebSocket
+    await directusClient.connect()
+    await directusClient.login({
+      email: 'admin@example.com',
+      password: 'd1r3ctu5',
+    })
+    console.log('✅ WebSocket connected and authenticated')
+
+    // 3. Get current Zalo user ID
+    try {
+      const token = await client.getToken()
+      const response = await fetch('http://localhost:8055/zalo/status', {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      })
+
+      const data = await response.json()
+      if (data?.userId) {
+        currentUserId.value = data.userId
+        console.log('✅ Current Zalo user ID:', currentUserId.value)
+      }
+    }
+    catch (e) {
+      console.warn('⚠️ Could not get Zalo User ID:', e)
+    }
+  }
+  catch (error) {
+    console.error('❌ Authentication failed:', error)
+    isAuthenticated.value = false
+  }
+}
+
+const processedMessageIds = new Set<string>()
+
+async function subscribeToMessages(conversationId: string) {
+  if (subscriptionCleanup) {
+    console.log('🔴 Unsubscribing from previous conversation')
+    subscriptionCleanup()
+    subscriptionCleanup = null
+  }
+
+  if (!conversationId)
+    return
+
+  console.log('🔵 Subscribing to conversation:', conversationId)
+  processedMessageIds.clear()
+  console.log('🔵 Cleared processed message IDs')
+
+  try {
+    const { subscription, unsubscribe } = await directusClient.subscribe('zalo_messages', {
+      event: 'create',
+      query: {
+        fields: ['*'],
+        filter: {
+          conversation_id: { _eq: conversationId },
+        },
+        sort: ['sent_at'],
+      },
+      uid: `messages-${conversationId}`,
+    })
+
+    subscriptionCleanup = unsubscribe
+    console.log('✅ Subscribed with UID:', `messages-${conversationId}`)
+    let eventCount = 0
+
+    // Handle messages
+    ;(async () => {
+      for await (const item of subscription) {
+        eventCount++
+        console.log('📩 WebSocket event:', item.type, item.event)
+
+        if (item.type === 'subscription' && item.event === 'init') {
+          console.log('✅ Subscription initialized for:', conversationId)
+        }
+        else if (item.type === 'subscription' && item.event === 'create') {
+          // Validate
+          if (!item.data || item.data.length === 0) {
+            console.warn('⚠️ Empty data')
+            continue
+          }
+
+          const newMsg = item.data[0]
+
+          if (!newMsg?.id) {
+            console.warn('⚠️ Invalid message')
+            continue
+          }
+
+          console.log('📥 New message from WebSocket:', newMsg.id)
+          if (processedMessageIds.has(newMsg.id)) {
+            console.log('⏭️ [DEDUPE] Already processed message:', newMsg.id)
+            continue
+          }
+
+          // ✅ Check duplicate bằng ID HOẶC client_id
+          const exists = messages.value.some(m =>
+            m.id === newMsg.id
+            || (newMsg.client_id && m.clientId === newMsg.client_id),
+          )
+
+          if (exists) {
+            console.log('⏭️ Message already exists:', newMsg.id)
+            continue
+          }
+          processedMessageIds.add(newMsg.id)
+
+          // Fetch sender info
+          let senderName = 'Unknown'
+          let senderAvatar = ''
+
+          if (newMsg.sender_id) {
+            try {
+              const users = await client.request(
+                readItems('zalo_users' as any, {
+                  fields: ['display_name', 'zalo_name', 'avatar_url'],
+                  filter: { id: { _eq: newMsg.sender_id } },
+                  limit: 1,
+                }),
+              )
+
+              const user = users[0]
+
+              if (user) {
+                senderName = user.display_name || user.zalo_name || 'Unknown'
+                senderAvatar = user.avatar_url
+                  || `https://ui-avatars.com/api/?name=${encodeURIComponent(senderName)}`
+              }
+            }
+            catch (e) {
+              console.warn('Could not fetch sender info:', e)
+            }
+          }
+
+          // Determine direction
+          const direction: 'in' | 'out' = newMsg.sender_id === currentUserId.value ? 'out' : 'in'
+
+          // ✅ Add message với clientId
+          messages.value.push({
+            id: newMsg.id,
+            direction,
+            text: newMsg.content || '',
+            senderName,
+            senderId: newMsg.sender_id,
+            time: formatTime(newMsg.sent_at),
+            avatar: senderAvatar,
+            status: direction === 'out' ? 'delivered' : undefined,
+            clientId: newMsg.client_id, // ✅ Track clientId
+          })
+
+          console.log('✅ Message added via WebSocket')
+          nextTick(scrollToBottom)
+        }
+      }
+    })()
+  }
+  catch (error) {
+    console.error('❌ Failed to subscribe:', error)
+  }
+}
+async function loadConversations() {
+  if (!isAuthenticated.value) {
+    console.warn('⚠️ Not authenticated')
+    return
+  }
+
+  if (isLoadingConversations.value) {
+    console.log('⏳ Already loading conversations, skipping...')
+    return
+  }
+
+  try {
+    loading.value = true
+    isLoadingConversations.value = true
+
+    const data = await client.request(
+      readItems('zalo_conversations', {
+        fields: ['*'],
+        filter: {
+          is_hidden: { _eq: false },
+        } as any,
+        sort: ['-is_pinned', '-last_message_time'],
+        limit: 100,
+      }),
+    )
+
+    console.log(`📥 Loaded ${data.length} conversations`)
+
+    const groupIds = [...new Set(
+      data
+        .filter((conv: any) => conv.group_id && conv.group_id !== null)
+        .map((conv: any) => conv.group_id),
+    )]
+
+    const participantIds = [...new Set(
+      data
+        .filter((conv: any) => conv.participant_id && conv.participant_id !== null)
+        .map((conv: any) => String(conv.participant_id)),
+    )]
+
+    let groupsMap = new Map()
+    if (groupIds.length > 0) {
+      const groups = await client.request(
+        readItems('zalo_groups' as any, {
+          fields: ['id', 'name', 'avatar_url'],
+          filter: { id: { _in: groupIds } },
+          limit: -1,
+        }),
+      )
+      groupsMap = new Map(groups.map((g: any) => [g.id, g]))
+    }
+
+    let usersMap = new Map()
+    if (participantIds.length > 0) {
+      const users = await client.request(
+        readItems('zalo_users' as any, {
+          fields: ['id', 'display_name', 'zalo_name', 'avatar_url'],
+          filter: { id: { _in: participantIds } },
+          limit: -1,
+        }),
+      )
+      usersMap = new Map(users.map((u: any) => [u.id, u]))
+    }
+
+    conversations.value = data.map((conv: any) => {
+      let name = 'Unknown'
+      let avatar = ''
+      let type: 'group' | 'direct' = 'group'
+
+      if (conv.participant_id && conv.participant_id !== null) {
+        type = 'direct'
+        const user = usersMap.get(conv.participant_id)
+        if (user) {
+          name = user.display_name || user.zalo_name || 'Unknown User'
+          avatar = user.avatar_url || `https://ui-avatars.com/api/?name=${encodeURIComponent(name)}&background=4F46E5`
+        }
+        else {
+          name = `User ${conv.participant_id.substring(0, 8)}`
+          avatar = `https://ui-avatars.com/api/?name=U&background=4F46E5`
+        }
+      }
+      else if (conv.group_id && conv.group_id !== null) {
+        type = 'group'
+        const group = groupsMap.get(conv.group_id)
+        if (group) {
+          name = group.name || 'Unknown Group'
+          avatar = group.avatar_url || `https://ui-avatars.com/api/?name=${encodeURIComponent(name)}&background=10B981`
+        }
+        else {
+          name = `Group ${conv.group_id.substring(0, 8)}`
+          avatar = `https://ui-avatars.com/api/?name=G&background=10B981`
+        }
+      }
+
+      return {
+        id: conv.id,
+        name,
+        avatar,
+        lastMessage: '',
+        timestamp: formatTime(conv.last_message_time),
+        unreadCount: conv.unread_count || 0,
+        online: true,
+        type,
+      }
+    })
+
+    console.log(`✅ Groups: ${conversationStats.value.group} | Direct: ${conversationStats.value.direct}`)
+
+    if (conversations.value.length > 0 && !activeConversationId.value) {
+      conversations.value[0]?.id && selectConversation(conversations.value[0].id)
+    }
+  }
+  catch (error: any) {
+    console.error('❌ Error loading conversations:', error)
+  }
+  finally {
+    loading.value = false
+    isLoadingConversations.value = false
+  }
+}
+
+async function loadMessages(conversationId: string) {
+  if (!isAuthenticated.value || !conversationId)
+    return
+
+  if (isLoadingMessages.value) {
+    console.log('⏭️ Already loading messages')
+    return
+  }
+
+  console.log('🔵 Loading initial messages for:', conversationId)
+
+  try {
+    isLoadingMessages.value = true
+
+    // Get current user ID if needed
+    if (currentUserId.value === 'system') {
+      try {
+        const me = await client.request(readMe({ fields: ['id'] }))
+        if (me?.id)
+          currentUserId.value = me.id
+      }
+      catch (e) {
+        console.warn('⚠️ Could not get current user ID:', e)
+      }
+    }
+
+    // Fetch messages from DB
+    const data = await client.request(
+      readItems('zalo_messages' as any, {
+        fields: ['*'],
+        filter: {
+          conversation_id: { _eq: conversationId },
+        },
+        sort: ['sent_at'],
+        limit: 50,
+      }),
+    )
+
+    console.log('📥 Loaded', data.length, 'messages from DB')
+
+    // Get unique sender IDs
+    const senderIds = [...new Set(data.map((msg: any) => msg.sender_id).filter(Boolean))]
+
+    // Fetch users
+    let usersMap = new Map()
+    if (senderIds.length > 0) {
+      const users = await client.request(
+        readItems('zalo_users' as any, {
+          fields: ['id', 'display_name', 'zalo_name', 'avatar_url'],
+          filter: { id: { _in: senderIds } },
+          limit: -1,
+        }),
+      )
+      usersMap = new Map(users.map((u: any) => [u.id, u]))
+    }
+
+    // Map messages
+    messages.value = data.map((msg: any) => {
+      const user = usersMap.get(msg.sender_id)
+      const senderName = user?.display_name || user?.zalo_name || 'Unknown'
+      const senderAvatar = user?.avatar_url
+        || `https://ui-avatars.com/api/?name=${encodeURIComponent(senderName)}`
+
+      // ✅ Fix direction logic
+      const direction: 'in' | 'out' = msg.sender_id === currentUserId.value ? 'out' : 'in'
+
+      return {
+        id: msg.id,
+        direction,
+        text: msg.content || '',
+        senderName,
+        senderId: msg.sender_id,
+        time: formatTime(msg.sent_at),
+        avatar: senderAvatar,
+        status: direction === 'out' ? 'read' : undefined,
+      }
+    })
+
+    console.log('✅ Loaded', messages.value.length, 'messages')
+
+    nextTick(scrollToBottom)
+  }
+  catch (error: any) {
+    console.error('❌ Error loading messages:', error)
+  }
+  finally {
+    isLoadingMessages.value = false
+  }
+}
+
+async function sendMessage() {
+  if (!messageText.value.trim())
+    return
+
+  sendingMessage.value = true
+
+  // ✅ Tạo client_id duy nhất
+  const clientId = `client_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
+  const tempId = `temp_${Date.now()}`
+
+  try {
+    // 1. Create temp message
+    const tempMessage: Message = {
+      id: tempId,
+      direction: 'out',
+      text: messageText.value,
+      senderName: 'You',
+      senderId: currentUserId.value,
+      time: formatTime(new Date().toISOString()),
+      status: 'sent',
+      clientId, // ✅ Thêm clientId để track
+    }
+
+    messages.value.push(tempMessage)
+    const messageContent = messageText.value
+    messageText.value = ''
+
+    nextTick(scrollToBottom)
+
+    console.log('🔵 [SEND] Sending with clientId:', clientId)
+
+    // 2. Send via API với clientId
+    const token = await client.getToken()
+    const response = await fetch('http://localhost:8055/zalo/send', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        conversationId: activeConversationId.value,
+        message: messageContent,
+        clientId, // ✅ Gửi clientId lên backend
+      }),
+    })
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({ error: 'Unknown error' }))
+      throw new Error(`HTTP ${response.status}: ${errorData.error || response.statusText}`)
+    }
+
+    const result = await response.json()
+    console.log('✅ [SEND] Success:', result)
+
+    // 3. ✅ Remove temp message (sẽ được thay bằng message từ WebSocket)
+    const tempIndex = messages.value.findIndex(m => m.id === tempId)
+    if (tempIndex !== -1) {
+      messages.value.splice(tempIndex, 1)
+      console.log('✅ [SEND] Removed temp message, waiting for WebSocket...')
+    }
+  }
+  catch (error: any) {
+    console.error('❌ [SEND] Error:', error)
+
+    // Mark temp message as failed
+    const messageIndex = messages.value.findIndex(m => m.id === tempId)
+    if (messageIndex !== -1) {
+      messages.value[messageIndex].status = 'failed'
+    }
+  }
+  finally {
+    sendingMessage.value = false
+  }
+}
+let isSelectingConversation = false
+
+function selectConversation(id: string) {
+  if (isSelectingConversation) {
+    console.log('⏭️ Already selecting conversation, skipping')
+    return
+  }
+
+  if (activeConversationId.value === id) {
+    console.log('⏭️ Conversation already active:', id)
+    return
+  }
+
+  isSelectingConversation = true
+
+  console.log('🔵 Selecting conversation:', id)
+
+  activeConversationId.value = id
+  messages.value = []
+
+  loadMessages(id).finally(() => {
+    if (isAuthenticated.value) {
+      subscribeToMessages(id)
+    }
+    isSelectingConversation = false
+  })
+}
+
 function autoResize(event: Event) {
   const textarea = event.target as HTMLTextAreaElement
   textarea.style.height = 'auto'
@@ -3001,73 +3384,190 @@ function scrollToBottom() {
   }
 }
 
-function handleImageError(event: Event, name: string) {
-  const img = event.target as HTMLImageElement
-  img.src = `https://ui-avatars.com/api/?name=${encodeURIComponent(name)}&background=random`
-}
+function navigateToMessage(messageId: string) {
+  highlightedMessageId.value = messageId
 
-let refreshInterval: any = null
+  nextTick(() => {
+    const messageElement = document.querySelector(`[data-message-id="${messageId}"]`)
+    if (messageElement && messagesContainer.value) {
+      messageElement.scrollIntoView({
+        behavior: 'smooth',
+        block: 'center',
+      })
 
-function startAutoRefresh() {
-  refreshInterval = setInterval(() => {
-    if (activeConversationId.value) {
-      loadMessages(activeConversationId.value)
+      setTimeout(() => {
+        highlightedMessageId.value = null
+      }, 3000)
     }
-  }, 10000)
+  })
 }
 
-function stopAutoRefresh() {
-  if (refreshInterval) {
-    clearInterval(refreshInterval)
-    refreshInterval = null
+function handleFilter() {
+  showFilterDropdown.value = !showFilterDropdown.value
+}
+
+function handleAddUser() {
+  showMembersDialog.value = true
+}
+
+function openMembersDialog() {
+  showMembersDialog.value = true
+}
+
+function closeMembersDialog() {
+  showMembersDialog.value = false
+  memberSearchQuery.value = ''
+  selectedMembers.value = []
+}
+
+function toggleMemberSelection(memberId: string) {
+  const index = selectedMembers.value.indexOf(memberId)
+  if (index > -1) {
+    selectedMembers.value.splice(index, 1)
+  }
+  else {
+    selectedMembers.value.push(memberId)
+  }
+}
+
+function removeMember(memberId: string) {
+  const index = selectedMembers.value.indexOf(memberId)
+  if (index > -1) {
+    selectedMembers.value.splice(index, 1)
+  }
+}
+
+function createGroup() {
+  if (selectedMembers.value.length === 0) {
+    return
+  }
+
+  const memberNames = selectedMemberObjects.value.map(member => member.name)
+
+  console.log('🔨 Creating group with members:', memberNames)
+
+  closeMembersDialog()
+}
+
+function handleClickOutside(event: Event) {
+  const target = event.target as HTMLElement
+  const filterButton = target.closest('.filter-dropdown-container')
+  if (!filterButton && showFilterDropdown.value) {
+    showFilterDropdown.value = false
   }
 }
 
 onMounted(async () => {
-  console.log(' Zalo Messages module mounted')
+  console.log('🔵 Component mounted')
 
   await autoLogin()
+  await loadConversations()
 
-  if (isAuthenticated.value) {
-    await loadConversations()
-    startAutoRefresh()
+  document.addEventListener('click', handleClickOutside)
+})
+
+onBeforeUnmount(() => {
+  console.log(' Cleaning up WebSocket')
+
+  if (subscriptionCleanup) {
+    subscriptionCleanup()
   }
 
-  document.addEventListener('visibilitychange', () => {
-    if (document.hidden) {
-      stopAutoRefresh()
-    }
-    else {
-      if (isAuthenticated.value) {
-        loadConversations()
-        if (activeConversationId.value) {
-          loadMessages(activeConversationId.value)
-        }
-        startAutoRefresh()
-      }
-    }
-  })
+  directusClient.disconnect()
 })
 
 onUnmounted(() => {
   stopAutoRefresh()
+  document.removeEventListener('click', handleClickOutside)
 })
 
-watch(activeConversationId, () => {
-  if (activeConversationId.value) {
-    nextTick(() => {
-      scrollToBottom()
-    })
+watch(activeConversationId, (newId) => {
+  if (newId && isAuthenticated.value) {
+    subscribeToMessages(newId)
+    nextTick(scrollToBottom)
   }
 })
 </script>
 
 <template>
-  <private-view title="Zalo Messages">
+  <private-view title="Messages">
     <template #title-outer:prepend>
       <v-button class="header-icon" rounded disabled icon secondary>
-        <v-icon name="chat" />
+        <v-icon name="inbox" />
       </v-button>
+    </template>
+
+    <!-- Sidebar -->
+    <template #sidebar>
+      <sidebar-detail v-if="currentFunction === 'A'" icon="search" class="my-sidebar-detail" title="Search for messages" close>
+        <div class="search-container space-y-4">
+          <div class="search-input-section">
+            <div class="relative border rounded-xl shadow-sm">
+              <input
+                v-model="messageSearchQuery"
+                type="text"
+                placeholder="Search in conversation"
+                class="w-full pl-9 pr-3 py-4 text-sm bg-gray-50 rounded-xl focus:outline-none focus:bg-white focus:ring-1 focus:ring-blue-500 placeholder-gray-500"
+              >
+            </div>
+          </div>
+
+          <div v-if="!messageSearchQuery.trim()" class="text-center py-8">
+            <svg class="mx-auto h-12 w-12 text-gray-400 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+            </svg>
+            <p class="text-gray-500 text-sm">
+              Enter a search term to find messages
+            </p>
+          </div>
+
+          <div v-else-if="searchFilteredMessages.length === 0" class="text-center py-8">
+            <svg class="mx-auto h-12 w-12 text-gray-400 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.172 16.172a4 4 0 515.656 0M9 12h6m-6-4h6m2 5.291A7.962 7.962 0 0112 15c-2.34 0-4.291.974-5.709 2.291" />
+            </svg>
+            <p class="text-gray-500 text-sm">
+              No messages found for "{{ messageSearchQuery }}"
+            </p>
+          </div>
+
+          <div v-else class="search-results space-y-3">
+            <div class="search-results-summary py-3">
+              <div class="flex items-center justify-between">
+                <label class="text-xl font-semibold text-gray-900">Messages</label>
+                <span class="text-sm text-gray-500">
+                  {{ searchFilteredMessages.length }} {{ searchFilteredMessages.length === 1 ? 'message' : 'messages' }} found
+                </span>
+              </div>
+            </div>
+
+            <div
+              v-for="message in searchFilteredMessages"
+              :key="message.id"
+              class="result-item cursor-pointer transition-all p-3 hover:bg-gray-50 rounded-lg"
+              @click="navigateToMessage(message.id)"
+            >
+              <div class="flex items-start gap-3">
+                <div class="w-9 h-9 rounded-full flex items-center justify-center flex-shrink-0">
+                  <img
+                    :src="message.avatar"
+                    :alt="message.senderName"
+                    class="w-full h-full rounded-full object-cover"
+                  >
+                </div>
+                <div class="flex-1 min-w-0">
+                  <div class="flex items-center gap-2 mb-1 justify-between">
+                    <span class="text-sm font-semibold text-gray-900">{{ message.senderName }}</span>
+                    <span class="text-xs text-gray-500">{{ message.time }}</span>
+                  </div>
+                  <p class="text-sm text-gray-600 leading-relaxed" v-html="message.highlightedText" />
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </sidebar-detail>
+
+      <sidebar-detail v-if="currentFunction === 'B'" class="my-sidebar-detail" icon="info" title="Conversation information" close />
     </template>
 
     <template #navigation>
@@ -3082,24 +3582,59 @@ watch(activeConversationId, () => {
           >
         </div>
 
-        <v-button :loading="loading" small secondary full-width @click="loadConversations">
-          <v-icon name="refresh" left />
-          Refresh
-        </v-button>
+        <div class="flex gap-1">
+          <v-button
+            small
+            :secondary="conversationTypeFilter !== 'all'"
+
+            @click="conversationTypeFilter = 'all'"
+          >
+            Filter ({{ conversationStats.all }})
+          </v-button>
+          <v-button
+            small
+            :secondary="conversationTypeFilter !== 'direct'"
+            full-width
+            @click="conversationTypeFilter = 'direct'"
+          >
+            <v-icon name="person" left x-small />
+            {{ conversationStats.direct }}
+          </v-button>
+          <v-button
+            small
+            :secondary="conversationTypeFilter !== 'group'"
+            full-width
+            @click="conversationTypeFilter = 'group'"
+          >
+            <v-icon name="group" left x-small />
+            {{ conversationStats.group }}
+          </v-button>
+        </div>
+
+        <div class="flex items-center justify-between gap-2">
+          <v-button :loading="loading" small secondary full-width @click="loadConversations">
+            <v-icon name="refresh" left />
+            Refresh
+          </v-button>
+
+          <v-button small secondary icon @click="handleAddUser">
+            <v-icon name="person_add" />
+          </v-button>
+        </div>
       </div>
 
       <div class="flex-1 overflow-y-auto">
         <div v-if="loading && conversations.length === 0" class="p-4 text-center">
           <v-progress-circular indeterminate />
           <p class="text-sm mt-2" style="color: var(--theme--foreground-subdued);">
-            Loading conversations...
+            Loading...
           </p>
         </div>
 
-        <div v-else-if="conversations.length === 0" class="p-4 text-center">
+        <div v-else-if="filteredConversations.length === 0" class="p-4 text-center">
           <v-icon name="chat_bubble_outline" large style="color: var(--theme--foreground-subdued);" class="mb-2" />
           <p class="text-sm" style="color: var(--theme--foreground-subdued);">
-            No conversations found
+            {{ conversationTypeFilter === 'all' ? 'No conversations' : `No ${conversationTypeFilter} chats` }}
           </p>
         </div>
 
@@ -3116,18 +3651,22 @@ watch(activeConversationId, () => {
             @mouseenter="$event.currentTarget.style.backgroundColor = conversation.id === activeConversationId ? 'var(--theme--primary-background)' : 'var(--theme--background-subdued)'"
             @mouseleave="$event.currentTarget.style.backgroundColor = conversation.id === activeConversationId ? 'var(--theme--primary-background)' : 'transparent'"
           >
-            <!-- Avatar -->
-            <div class="relative flex-shrink-0">
-              <div class="w-10 h-10 rounded-full overflow-hidden" style="background-color: var(--theme--background-subdued);">
-                <img
-                  :src="conversation.avatar"
-                  :alt="conversation.name"
-                  class="w-full h-full object-cover"
-                  @error="handleImageError($event, conversation.name)"
-                >
+            <div class="w-11 h-11 rounded-full overflow-hidden border border-gray-200 bg-white flex items-center justify-center relative">
+              <img
+                :src="conversation.avatar || '/default-avatar.png'"
+                :alt="conversation.name"
+                class="avatar-img"
+                @error="(e) => handleImageError(e, conversation.name)"
+              >
+              <div
+                v-if="conversation.type === 'group'"
+                class="absolute bottom-0 right-0 w-4 h-4 rounded-full flex items-center justify-center"
+                style="background-color: var(--theme--success); border: 2px solid white;"
+              >
+                <v-icon name="group" x-small style="color: white;" />
               </div>
               <div
-                v-if="conversation.online"
+                v-else
                 class="absolute bottom-0 right-0 w-3 h-3 rounded-full border-2"
                 style="background-color: var(--theme--success); border-color: white;"
               />
@@ -3143,7 +3682,7 @@ watch(activeConversationId, () => {
                 </span>
               </div>
               <p class="text-xs truncate" style="color: var(--theme--foreground-subdued); margin: 0;">
-                {{ conversation.lastMessage }}
+                {{ conversation.lastMessage || 'No messages' }}
               </p>
             </div>
             <v-badge
@@ -3159,15 +3698,14 @@ watch(activeConversationId, () => {
       <div v-if="activeConversation" class="chat-header">
         <div class="flex items-center justify-between w-full">
           <div class="flex items-center gap-3">
-            <div class="w-10 h-10 rounded-full overflow-hidden" style="background-color: var(--theme--background-subdued);">
+            <div class="w-11 h-11 rounded-full overflow-hidden border-2 border-white shadow-sm relative" style="background-color: var(--theme--background-subdued);">
               <img
                 :src="activeConversation.avatar"
                 :alt="activeConversation.name"
-                class="w-full h-full object-cover"
-                @error="handleImageError($event, activeConversation.name)"
+                class="avatar-img"
               >
             </div>
-            <div>
+            <div class="flex flex-col">
               <h3 class="font-semibold text-base" style="color: var(--theme--foreground); margin: 0;">
                 {{ activeConversation.name }}
               </h3>
@@ -3177,9 +3715,19 @@ watch(activeConversationId, () => {
             </div>
           </div>
 
-          <v-button :loading="loading" small icon secondary @click="loadMessages(activeConversationId)">
-            <v-icon name="refresh" />
-          </v-button>
+          <div class="flex items-center gap-2">
+            <v-button small icon secondary @click="showFunctionA">
+              <v-icon name="search" />
+            </v-button>
+
+            <v-button :loading="loading" small icon secondary @click="loadMessages(activeConversationId)">
+              <v-icon name="refresh" />
+            </v-button>
+
+            <v-button small icon secondary @click="showFunctionB">
+              <v-icon name="more_vert" />
+            </v-button>
+          </div>
         </div>
       </div>
 
@@ -3205,44 +3753,53 @@ watch(activeConversationId, () => {
           <div
             v-for="message in messages"
             :key="message.id"
-            class="flex gap-3"
-            :class="{ 'justify-end': message.direction === 'out' }"
+            :data-message-id="message.id"
+            class="flex items-start mb-3"
+            :class="{ 'bg-yellow-50 transition-all': message.id === highlightedMessageId }"
           >
-            <div
-              v-if="message.direction === 'in'"
-              class="w-8 h-8 rounded-full overflow-hidden flex-shrink-0"
-              style="background-color: var(--theme--background-subdued);"
+            <img
+              :src="message.avatar"
+              :alt="message.senderName"
+              class="w-10 h-10 rounded-full mr-3 object-cover border flex-shrink-0"
+              @error="(e) => handleImageError(e, message.senderName)"
             >
-              <img
-                :src="message.avatar"
-                :alt="message.senderName"
-                class="w-full h-full object-cover"
-                @error="handleImageError($event, message.senderName)"
-              >
-            </div>
 
-            <div class="flex flex-col max-w-[70%]">
-              <div
-                class="rounded-2xl px-4 py-2 break-words"
-                :style="{
-                  backgroundColor: message.direction === 'in' ? 'var(--theme--background-subdued)' : 'var(--theme--primary)',
-                  color: message.direction === 'in' ? 'var(--theme--foreground)' : 'white',
-                }"
-              >
-                <p class="text-sm whitespace-pre-wrap" style="margin: 0;">
+            <div class="flex-1 max-w-[70%]">
+              <div class="flex items-center gap-2 mt-1">
+                <p class="text-xs m-0 font-medium">
+                  {{ message.senderName }} • {{ message.time }}
+                </p>
+                <v-icon
+                  v-if="message.status === 'sent'"
+                  name="check"
+                  x-small
+                  style="color: #9CA3AF;"
+                />
+                <v-icon
+                  v-if="message.status === 'delivered'"
+                  name="done_all"
+                  x-small
+                  style="color: #9CA3AF;"
+                />
+                <v-icon
+                  v-if="message.status === 'read'"
+                  name="done_all"
+                  x-small
+                  style="color: #3B82F6;"
+                />
+                <v-icon
+                  v-if="message.status === 'failed'"
+                  name="error_outline"
+                  x-small
+                  style="color: #EF4444;"
+                  title="Failed to send"
+                />
+              </div>
+              <div class="text-gray-900 py-2 break-words">
+                <p class="text-sm whitespace-pre-wrap m-0">
                   {{ message.text }}
                 </p>
               </div>
-              <span
-                class="text-xs mt-1"
-                :class="{ 'text-right': message.direction === 'out' }"
-                style="color: var(--theme--foreground-subdued);"
-              >
-                {{ message.time }}
-                <template v-if="message.status && message.direction === 'out'">
-                  • {{ message.status }}
-                </template>
-              </span>
             </div>
           </div>
         </div>
@@ -3259,6 +3816,7 @@ watch(activeConversationId, () => {
             placeholder="Type your message..."
             rows="1"
             class="flex-1 resize-none px-3 py-2 border rounded-lg"
+            :class="{ 'opacity-50 cursor-not-allowed': sendingMessage }"
             style="border-color: var(--theme--border-color-subdued); outline: none;"
             @keydown.enter.exact.prevent="sendMessage"
             @input="autoResize"
@@ -3286,10 +3844,101 @@ watch(activeConversationId, () => {
         </div>
       </div>
     </div>
+
+    <div
+      v-if="showMembersDialog"
+      class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-[10000]"
+      @click.self="closeMembersDialog"
+    >
+      <div class="bg-white rounded-lg shadow-xl w-[500px] max-h-[70vh] flex flex-col overflow-hidden">
+        <div class="flex items-center justify-between p-4 border-b">
+          <h2 class="text-xl font-medium">
+            Select members
+          </h2>
+          <button
+            class="w-8 h-8 flex items-center justify-center rounded-md hover:bg-gray-100"
+            @click="closeMembersDialog"
+          >
+            <v-icon name="close" />
+          </button>
+        </div>
+
+        <div class="flex-1 flex flex-col p-4 space-y-3 overflow-hidden">
+          <div class="relative border rounded-lg bg-white">
+            <div class="flex flex-wrap gap-2 p-2">
+              <div
+                v-for="member in selectedMemberObjects"
+                :key="`selected-${member.id}`"
+                class="inline-flex items-center gap-2 bg-gray-100 rounded-md px-2 py-1"
+              >
+                <div class="w-6 h-6 rounded-full overflow-hidden">
+                  <img
+                    :src="member.avatar"
+                    :alt="member.name"
+                    class="w-full h-full object-cover"
+                  >
+                </div>
+                <span class="text-sm">{{ member.name }}</span>
+                <button
+                  class="w-4 h-4 flex items-center justify-center"
+                  @click="removeMember(member.id)"
+                >
+                  <v-icon name="close" x-small />
+                </button>
+              </div>
+
+              <input
+                v-model="memberSearchQuery"
+                type="text"
+                placeholder="Search a member"
+                class="flex-1 min-w-[120px] px-2 py-1 text-sm outline-none"
+              >
+            </div>
+          </div>
+
+          <div class="flex-1 space-y-2 overflow-y-auto">
+            <div
+              v-for="member in filteredMembers"
+              :key="member.id"
+              class="flex items-center gap-3 p-2 hover:bg-gray-50 rounded-md cursor-pointer"
+              @click="toggleMemberSelection(member.id)"
+            >
+              <input
+                type="checkbox"
+                :checked="selectedMembers.includes(member.id)"
+                class="w-4 h-4"
+                @click.stop
+                @change="toggleMemberSelection(member.id)"
+              >
+
+              <div class="w-10 h-10 rounded-full overflow-hidden">
+                <img
+                  :src="member.avatar"
+                  :alt="member.name"
+                  class="w-full h-full object-cover"
+                >
+              </div>
+              <p class="text-sm font-medium">
+                {{ member.name }}
+              </p>
+            </div>
+          </div>
+
+          <v-button
+            :disabled="selectedMembers.length === 0"
+            full-width
+            @click="createGroup"
+          >
+            Create a group
+          </v-button>
+        </div>
+      </div>
+    </div>
   </private-view>
 </template>
 
 <style scoped>
+@import "../styles/tailwind.css";
 .chat-container {
   display: flex;
   flex-direction: column;
@@ -3313,6 +3962,17 @@ watch(activeConversationId, () => {
   flex-shrink: 0;
   padding: 1rem;
   border-top: var(--theme--border-width) solid var(--theme--border-color-subdued);
+}
+
+.avatar-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 50%;
+}
+
+.search-container {
+  padding: 1rem;
 }
 </style>
 <<<<<<< HEAD

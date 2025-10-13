@@ -498,46 +498,244 @@ export default defineEndpoint(async (router, { database, getSchema, services }) 
       res.status(500).json({ error: error.message })
     }
   })
-
-  // ✅ Send message
-  router.post('/send-message', async (req, res) => {
+  router.get('/me', (req, res) => {
     try {
-      const { conversationId, content } = req.body
-
-      if (!conversationId || !content) {
-        return res.status(400).json({
-          error: 'conversationId and content are required',
-        })
-      }
-
-      console.log('[Endpoint] Sending message:', { conversationId, content })
-
-      const userId = (req as any).accountability?.user || 'system'
-
-      const [newMessage] = await database('zalo_messages')
-        .insert({
-          conversation_id: conversationId,
-          content,
-          sender_id: userId,
-          sent_at: new Date(),
-          created_at: new Date(),
-          updated_at: new Date(),
-        })
-        .returning('*')
-
-      console.log('[Endpoint] Message sent:', newMessage?.id)
-
+      const status = zaloService.getStatus()
       res.json({
-        success: true,
-        data: {
-          ...newMessage,
-          timestamp: newMessage.sent_at,
-        },
+        userId: status.userId,
+        status: status.status,
+        isListening: status.isListening,
       })
     }
     catch (error: any) {
-      console.error('[Endpoint] Error:', error)
       res.status(500).json({ error: error.message })
+    }
+  })
+  router.post('/send', async (req, res) => {
+    try {
+      const { conversationId, message, content, clientId } = req.body
+      const messageContent = message || content
+
+      console.log('🔵 [Endpoint /send] Request received:', {
+        conversationId,
+        messageLength: messageContent?.length,
+        hasAuth: !!(req as any).accountability,
+        userId: (req as any).accountability?.user,
+        clientId, // ✅ Log clientId
+      })
+
+      // 1. Validation
+      if (!conversationId || !messageContent) {
+        console.error('❌ [Endpoint /send] Missing required fields')
+        return res.status(400).json({
+          error: 'conversationId and message are required',
+        })
+      }
+
+      // 2. Check Zalo status
+      const status = zaloService.getStatus()
+      console.log('🔵 [Endpoint /send] Zalo status:', status)
+
+      if (status.status !== 'logged_in') {
+        console.error('❌ [Endpoint /send] Zalo not logged in')
+        return res.status(503).json({
+          error: 'Zalo is not connected',
+          status: status.status,
+        })
+      }
+
+      // 3. Get current user
+      const accountability = (req as any).accountability
+      const currentUserId = accountability?.user || status.userId || 'system'
+      const zaloUserId = status.userId // ✅ Lấy Zalo user ID
+
+      console.log('🔵 [Endpoint /send] User IDs:', {
+        directusUserId: currentUserId,
+        zaloUserId,
+      })
+
+      // 4. Query DB để lấy Zalo thread ID
+      let zaloThreadId: string | null = null
+
+      try {
+        const [conversation] = await database('zalo_conversations')
+          .where('id', conversationId)
+          .select(['participant_id', 'group_id'])
+          .limit(1)
+
+        console.log('🔵 [Endpoint /send] Found conversation:', conversation)
+
+        if (!conversation) {
+          console.error('❌ [Endpoint /send] Conversation not found')
+          return res.status(404).json({
+            error: 'Conversation not found in database',
+            conversationId,
+          })
+        }
+
+        if (conversationId.startsWith('direct_')) {
+          zaloThreadId = conversation.participant_id
+          console.log('🔵 [Endpoint /send] Direct chat - participant_id:', zaloThreadId)
+        }
+        else {
+          zaloThreadId = conversation.group_id
+          console.log('🔵 [Endpoint /send] Group chat - group_id:', zaloThreadId)
+        }
+
+        if (!zaloThreadId) {
+          console.error('❌ [Endpoint /send] No Zalo thread ID in conversation')
+          return res.status(400).json({
+            error: 'Cannot determine Zalo thread ID',
+            conversationId,
+            conversation,
+          })
+        }
+      }
+      catch (dbError: any) {
+        console.error('❌ [Endpoint /send] Database error:', dbError)
+        return res.status(500).json({
+          error: 'Failed to query conversation',
+          details: dbError.message,
+        })
+      }
+
+      console.log('✅ [Endpoint /send] Zalo thread ID:', zaloThreadId)
+
+      // 5. Send via Zalo API
+      console.log('🔵 [Endpoint /send] Calling zaloService.sendMessage...')
+
+      let zaloResult: any
+      try {
+        zaloResult = await zaloService.sendMessage(
+          { msg: messageContent },
+          zaloThreadId,
+        )
+
+        console.log('✅ [Endpoint /send] Zalo API success:', zaloResult)
+      }
+      catch (zaloError: any) {
+        console.error('❌ [Endpoint /send] Zalo API error:', zaloError)
+
+        if (zaloError.code === 114) {
+          return res.status(400).json({
+            error: 'Invalid Zalo thread ID',
+            details: 'The recipient does not exist or has blocked you',
+            zaloThreadId,
+            code: 114,
+          })
+        }
+
+        return res.status(500).json({
+          error: 'Failed to send message via Zalo',
+          details: zaloError.message,
+          code: zaloError.code,
+        })
+      }
+
+      // ✅ 6. Extract message IDs (SAU try-catch)
+      const messageId = zaloResult?.message?.msgId // ✅ Đúng path
+        || zaloResult?.data?.msgId
+        || `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
+
+      const clientMsgId = clientId || messageId // ✅ Từ request body
+
+      console.log('🔵 [Endpoint /send] Message IDs:', {
+        messageId,
+        clientMsgId,
+        fromZalo: zaloResult?.message?.msgId,
+        fromBody: clientId,
+      })
+
+      // 7. Save to database
+      const timestamp = new Date()
+
+      try {
+      // Check duplicate
+        const existingMessage = await database('zalo_messages')
+          .where(function () {
+            this.where('id', messageId)
+              .orWhere('client_id', clientMsgId)
+          })
+          .first()
+
+        if (existingMessage) {
+          console.log('⏭️ [Endpoint /send] Message already exists:', messageId)
+          return res.json({
+            success: true,
+            message: 'Message already processed',
+            data: {
+              id: existingMessage.id,
+              conversationId: existingMessage.conversation_id,
+              content: existingMessage.content,
+              sent_at: existingMessage.sent_at,
+            },
+          })
+        }
+
+        console.log('🔵 [Endpoint /send] Inserting new message...')
+
+        // ✅ Insert với Zalo IDs
+        const [newMessage] = await database('zalo_messages')
+          .insert({
+            id: messageId, // ✅ Zalo msgId
+            client_id: clientMsgId, // ✅ Client ID
+            conversation_id: conversationId,
+            content: messageContent,
+            sender_id: zaloUserId, // ✅ Zalo user ID (không phải Directus UUID)
+            sent_at: timestamp,
+            received_at: timestamp,
+            is_edited: false,
+            is_undone: false,
+            raw_data: zaloResult,
+            created_at: timestamp,
+            updated_at: timestamp,
+          })
+          .returning('*')
+
+        console.log('✅ [Endpoint /send] Message saved - WebSocket broadcasting...')
+
+        // Update conversation
+        await database('zalo_conversations')
+          .where('id', conversationId)
+          .update({
+            last_message_id: messageId,
+            last_message_time: timestamp,
+            updated_at: timestamp,
+          })
+
+        // ✅ Return success
+        return res.json({
+          success: true,
+          message: 'Message sent successfully',
+          data: {
+            id: messageId, // ✅ Zalo msgId
+            conversationId,
+            content: messageContent,
+            sent_at: timestamp.toISOString(),
+            sender_id: zaloUserId, // ✅ Zalo user ID
+            client_id: clientMsgId, // ✅ Client ID
+          },
+        })
+      }
+      catch (dbError: any) {
+        console.error('❌ [Endpoint /send] DB save error:', dbError)
+
+        return res.status(207).json({
+          success: true,
+          warning: 'Message sent to Zalo but failed to save to database',
+          data: {
+            messageId,
+            error: dbError.message,
+          },
+        })
+      }
+    }
+    catch (error: any) {
+      console.error('❌ [Endpoint /send] Unexpected error:', error)
+      return res.status(500).json({
+        error: 'Internal server error',
+        details: error.message,
+      })
     }
   })
 })

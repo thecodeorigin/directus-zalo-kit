@@ -6,57 +6,31 @@ export default defineHook(({ action, init, schedule }, { services, getSchema, lo
   const { ItemsService, FlowsService } = services
   let zaloService: ZaloService | null = null
 
-  // Khởi tạo ZaloService khi server start
+  // 1. Initialize ZaloService after server starts
   init('app.after', async () => {
     try {
-      logger.info('='.repeat(60))
-      logger.info('Initializing Zalo Service...')
-      logger.info('='.repeat(60))
+      const schema = await getSchema()
 
-      // Tạo instance ZaloService
-      zaloService = ZaloService.getInstance()
-
-      // Kiểm tra session cũ
-      const session = await zaloService.getSessionInfo()
-      if (session) {
-        logger.info(`Found existing session for user: ${session.userId}`)
-        logger.info(`Login time: ${session.loginTime}`)
-        logger.info(`Active: ${session.isActive}`)
-      }
-      else {
-        logger.info('No existing session found')
+      // Custom emitter that triggers Directus actions
+      const emitter = (event: string, payload: any) => {
+        logger.info(`Event triggered: ${event}`, payload)
       }
 
-      // Auto-login nếu được bật
+      zaloService = ZaloService.getInstance(emitter, schema)
+      logger.info('Zalo Hook initialized successfully')
+
+      // Auto-login if configured
       const autoLogin = process.env.ZALO_AUTO_LOGIN === 'true'
-      if (autoLogin && !session) {
-        logger.info('Auto-login enabled, starting login process...')
-
-        setTimeout(async () => {
-          try {
-            const result = await zaloService!.login()
-
-            if (result.qrCode) {
-              logger.info('QR Code generated! Please scan with Zalo app:')
-              logger.info(result.qrCode)
-              logger.info('Waiting for QR scan...')
-            }
-
-            if (result.success) {
-              logger.info(`Login successful! User ID: ${result.userId}`)
-            }
-          }
-          catch (err) {
+      if (autoLogin) {
+        setTimeout(() => {
+          zaloService?.initiateLogin().catch((err) => {
             logger.error('Auto-login failed:', err)
-          }
-        }, 3000) // Đợi 3s để Directus khởi động xong
+          })
+        }, 5000)
       }
-
-      logger.info('Zalo Service initialized successfully')
-      logger.info('='.repeat(60))
     }
     catch (error) {
-      logger.error('Failed to initialize Zalo Service:', error)
+      logger.error('Failed to initialize Zalo Hook:', error)
     }
   })
 
@@ -124,6 +98,8 @@ export default defineHook(({ action, init, schedule }, { services, getSchema, lo
 
   // 4. Handle QR code generation
   action('zalo.qr.generated', async ({ payload }) => {
+    logger.info('QR code generated for login')
+
     try {
       const settingsService = new ItemsService('zalo_settings', {
         schema: await getSchema(),
@@ -231,7 +207,7 @@ export default defineHook(({ action, init, schedule }, { services, getSchema, lo
       // Auto-reconnect if disconnected
       if (status.status === 'logged_out' && process.env.ZALO_AUTO_RECONNECT === 'true') {
         logger.info('Attempting auto-reconnect...')
-        await zaloService.login()
+        await zaloService.initiateLogin()
       }
     }
     catch (error) {
@@ -296,17 +272,4 @@ export default defineHook(({ action, init, schedule }, { services, getSchema, lo
       }
     }
   }
-  action('zalo.init', async () => {
-    if (!zaloService) {
-      throw new Error('ZaloService not initialized')
-    }
-
-    const result = await zaloService.login()
-
-    return {
-      success: result.success,
-      qrCode: result.qrCode || null,
-      userId: result.userId || null,
-    }
-  })
 })
