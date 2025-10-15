@@ -35,6 +35,8 @@ services:
   cache:
     image: redis:8.0
     restart: always
+    volumes:
+      - ./docker/redis_data:/data
     healthcheck:
       test: ["CMD-SHELL", "[ $$(redis-cli ping) = 'PONG' ]"]
       interval: 10s
@@ -72,7 +74,7 @@ services:
       - ./extensions:/directus/extensions
       - ./migrations:/directus/migrations
       - ./templates:/directus/templates
-      - ./docker:/directus/storage
+      - ./docker/storage:/directus/storage
     depends_on:
       cache:
         condition: service_healthy
@@ -93,9 +95,13 @@ services:
       DB_DATABASE: ${DB_DATABASE}
 
       SYNCHRONIZATION_STORE: "redis"
+      REDIS_HOST: cache
+      REDIS_PORT: 6379
+      REDIS_URL: "redis://cache:6379"
+
       CACHE_ENABLED: ${CACHE_ENABLED:-true}
       CACHE_STORE: "redis"
-      REDIS: "redis://cache:6379"
+      CACHE_REDIS: "redis://cache:6379"
 
       ADMIN_EMAIL: ${ADMIN_EMAIL}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD}
@@ -130,7 +136,9 @@ services:
       SESSION_COOKIE_SECURE: false
 
       # Zalo Extension Settings
-      ZALO_SESSION_PATH : /directus/storage
+      ZALO_SESSION_PATH: /directus/storage
+  
+
 
 
     command: >

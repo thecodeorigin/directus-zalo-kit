@@ -19,6 +19,9 @@
       }
     }
   },
+  "dependencies": {
+    "ioredis": "catalog:"
+  },
   "devDependencies": {
     "@antfu/eslint-config": "catalog:",
     "@directus/extensions-sdk": "catalog:",
@@ -29,12 +32,10 @@
     "@types/qrcode-terminal": "catalog:",
     "@vue/tsconfig": "catalog:",
     "eslint": "catalog:",
-    "knex": "^3.1.0",
     "open": "catalog:",
     "qrcode-terminal": "catalog:",
     "ts-pattern": "catalog:",
     "tsx": "catalog:",
-    "type-fest": "^5.0.1",
     "typescript": "catalog:",
     "vitest": "catalog:",
     "vue": "catalog:",
