@@ -2760,6 +2760,12 @@ const filterOptions = ref({
   },
 })
 
+// Mock groups data
+const groups = ref<Group[]>([])
+
+// Store messages for groups (in real app, this would be in a centralized store)
+const groupMessages = ref<Record<string, Message[]>>({})
+
 function showFunctionA() {
   currentFunction.value = 'A'
 }
@@ -2811,8 +2817,43 @@ const filteredConversations = computed(() => {
   return filtered
 })
 
+// Search filtered messages
+const searchFilteredMessages = computed(() => {
+  if (!messageSearchQuery.value.trim()) {
+    return []
+  }
+
+  const query = messageSearchQuery.value.toLowerCase().trim()
+
+  return messages.value.filter(message =>
+    message.text.toLowerCase().includes(query),
+  ).map(message => ({
+    ...message,
+    highlightedText: highlightSearchText(message.text, messageSearchQuery.value),
+  }))
+})
+
+// Helper function to highlight search text
+function highlightSearchText(text: string, searchTerm: string): string {
+  if (!searchTerm.trim())
+    return text
+
+  const regex = new RegExp(`(${searchTerm.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi')
+  return text.replace(regex, '<mark class="bg-yellow-200 px-1 rounded">$1</mark>')
+}
+
+// Get initials for avatar fallback
+function getInitials(name: string): string {
+  return name
+    .split(' ')
+    .map(word => word.charAt(0))
+    .join('')
+    .toUpperCase()
+    .slice(0, 2)
+}
+
 const activeConversation = computed(() => {
-  return conversations.value.find(
+  return allConversations.value.find(
     conv => conv.id === activeConversationId.value,
   )
 })
@@ -3387,6 +3428,31 @@ function scrollToBottom() {
 }
 
 function navigateToMessage(messageId: string) {
+  // Keep the search sidebar open - don't close it
+  // currentFunction.value = null (removed this line)
+
+  // Highlight the message
+  highlightedMessageId.value = messageId
+
+  // Wait for next tick to ensure DOM is updated
+  nextTick(() => {
+    const messageElement = document.querySelector(`[data-message-id="${messageId}"]`)
+    if (messageElement && messagesContainer.value) {
+      // Scroll to the message
+      messageElement.scrollIntoView({
+        behavior: 'smooth',
+        block: 'center',
+      })
+
+      // Remove highlight after 3 seconds
+      setTimeout(() => {
+        highlightedMessageId.value = null
+      }, 3000)
+    }
+  })
+}
+
+function navigateToMessage(messageId: string) {
   highlightedMessageId.value = messageId
 
   nextTick(() => {
@@ -3492,7 +3558,7 @@ watch(activeConversationId, (newId) => {
 </script>
 
 <template>
-  <private-view title="Messages aLO">
+  <private-view title="Messages">
     <template #title-outer:prepend>
       <v-button class="header-icon" rounded disabled icon secondary>
         <v-icon name="inbox" />
@@ -3753,7 +3819,7 @@ watch(activeConversationId, (newId) => {
 
         <div v-else class="p-4 space-y-4">
           <div
-            v-for="message in messages"
+            v-for="message in currentMessages"
             :key="message.id"
             :data-message-id="message.id"
             class="flex items-start mb-3"
