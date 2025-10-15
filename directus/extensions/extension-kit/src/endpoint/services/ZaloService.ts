@@ -2,6 +2,7 @@ import type { SchemaOverview } from '@directus/types'
 import type Redis from 'ioredis'
 import fs from 'node:fs'
 import path from 'node:path'
+import Redis from 'ioredis'
 import { match, P } from 'ts-pattern'
 import { LoginQRCallbackEventType, ThreadType, Zalo } from 'zca-js'
 
@@ -31,10 +32,7 @@ export class ZaloService {
   private readonly reconnectDelay = 5000
   private isRestoringSession = false
 
-  private sessionFile: string
-
-  // System accountability (use system admin by default)
-  private systemAccountability = {
+  private readonly systemAccountability = {
     admin: true,
     role: null,
     user: null,
@@ -118,7 +116,7 @@ export class ZaloService {
 
   public static getInstance(): ZaloService {
     if (!ZaloService.instance) {
-      throw new Error('ZaloService has not been initialized yet')
+      throw new Error('ZaloService has not been initialized')
     }
     return ZaloService.instance
   }
@@ -2585,27 +2583,244 @@ export class ZaloService {
     }
   }
 
-  public async getSessionInfo() {
+  public async redisStatus() {
+    if (!this.redis)
+      return { enabled: false }
     try {
-      if (!fs.existsSync(this.sessionFile)) {
-        return null
+      const ping = await this.redis.ping()
+      const dbsize = await this.redis.dbsize()
+      return { enabled: true, ping, dbsize }
+    }
+    catch (e: any) {
+      return { enabled: false, error: e.message }
+    }
+  }
+
+  public async redisGetSession(userId?: string) {
+    if (!this.redis)
+      return null
+    try {
+      if (!userId) {
+        const keys = await this.redis.keys('zalo:session:*')
+        const sessions: any = {}
+        for (const key of keys) {
+          const raw = await this.redis.get(key)
+          if (raw) {
+            try {
+              const id = key.replace('zalo:session:', '')
+              sessions[id] = JSON.parse(raw)
+            }
+            catch {
+              sessions[key] = raw
+            }
+          }
+        }
+        return sessions
       }
 
-      const raw = fs.readFileSync(this.sessionFile, 'utf-8')
+      const raw = await this.redis.get(this.getRedisKey(userId))
       if (!raw)
         return null
-
-      const session = JSON.parse(raw)
-
-      return {
-        userId: session.userId || null,
-        loginTime: session.loginTime || null,
-        isActive: session.isActive ?? false,
+      try {
+        return JSON.parse(raw)
+      }
+      catch {
+        return raw
       }
     }
-    catch (err) {
-      console.error('[ZaloService] getSessionInfo error:', err)
+    catch {
       return null
+    }
+  }
+
+  public async redisKeys(pattern = '*', limit = 1000) {
+    if (!this.redis)
+      return []
+    let cursor = '0'
+    const keys: string[] = []
+    do {
+      const [next, batch] = await this.redis.scan(
+        cursor,
+        'MATCH',
+        pattern,
+        'COUNT',
+        200,
+      )
+      for (const k of batch) {
+        keys.push(k)
+        if (keys.length >= limit)
+          return keys
+      }
+      cursor = next
+    } while (cursor !== '0')
+    return keys
+  }
+
+  public async redisGet(key: string) {
+    if (!this.redis || !key)
+      return null
+    const raw = await this.redis.get(key)
+    if (!raw)
+      return null
+    try {
+      return JSON.parse(raw)
+    }
+    catch {
+      return raw
+    }
+  }
+
+  private parseParams(params: any): any {
+    if (!params)
+      return {}
+    try {
+      return JSON.parse(params)
+    }
+    catch {
+      console.warn('[ZaloService] Failed to parse params')
+      return {}
+    }
+  }
+
+  private createAttachmentObject(rawData: any, parsedParams: any): any {
+    return {
+      title: rawData.content.title,
+      fileName: rawData.content.title,
+      name: rawData.content.title,
+      url: rawData.content.href,
+      href: rawData.content.href,
+      link: rawData.content.href,
+      thumb: rawData.content.thumb,
+      thumbnailUrl: rawData.content.thumb,
+      fileSize: parsedParams.fileSize
+        ? Number.parseInt(parsedParams.fileSize)
+        : null,
+      size: parsedParams.fileSize
+        ? Number.parseInt(parsedParams.fileSize)
+        : null,
+      fileExt: parsedParams.fileExt,
+      checksum: parsedParams.checksum,
+      type: rawData.msgType,
+      mimeType: this.getMimeTypeFromExtension(parsedParams.fileExt),
+      metadata: {
+        ...rawData.content,
+        parsedParams,
+      },
+    }
+  }
+
+  private getConversationId(senderId: string, recipientId: string): string {
+    const userIds = [senderId, recipientId].filter(Boolean).sort()
+    return userIds.length === 2
+      ? `direct_${userIds[0]}_${userIds[1]}`
+      : `thread_${recipientId || senderId}`
+  }
+
+  private async createMessage(
+    messageId: string,
+    clientMsgId: string,
+    conversationId: string,
+    senderId: string,
+    content: string,
+    rawData: any,
+    timestamp: number,
+    schema: SchemaOverview,
+  ) {
+    const messagesService = new this.ItemsService('zalo_messages', {
+      schema,
+      accountability: this.systemAccountability,
+    })
+
+    const existingMessages = await messagesService.readByQuery({
+      filter: { id: { _eq: messageId } },
+      limit: 1,
+    })
+
+    if (existingMessages.length === 0) {
+      await messagesService.createOne({
+        id: messageId,
+        client_id: clientMsgId || messageId,
+        conversation_id: conversationId,
+        sender_id: senderId,
+        content,
+        raw_data: rawData,
+        mentions: null,
+        forward_from_message_id: null,
+        reply_to_message_id: null,
+        is_edited: false,
+        is_undone: false,
+        sent_at: new Date(timestamp),
+        received_at: new Date(),
+        edited_at: null,
+      })
+    }
+  }
+
+  private async sendMessageSafe(
+    messageData: any,
+    threadId: string,
+    fallbackThreadId?: string,
+  ) {
+    try {
+      await this.sendMessage(messageData, threadId)
+    }
+    catch (error: any) {
+      if (
+        (error.code === 114 || error.message?.includes('không hợp lệ'))
+        && fallbackThreadId
+      ) {
+        await this.sendMessage(messageData, fallbackThreadId)
+      }
+      else {
+        throw error
+      }
+    }
+  }
+
+  private parseUserData(userInfo: any) {
+    const parseDateOfBirth = (dob: any): Date | null => {
+      if (!dob)
+        return null
+
+      try {
+        if (typeof dob === 'number' && dob > 0) {
+          return new Date(dob > 9999999999 ? dob : dob * 1000)
+        }
+
+        if (typeof dob === 'string' && /^\d{2}\/\d{2}\/\d{4}$/.test(dob)) {
+          const [day, month, year] = dob.split('/').map(Number)
+          const date = new Date(year ?? 0, (month ?? 1) - 1, day ?? 1)
+
+          if (
+            date.getFullYear() === (year ?? 0)
+            && date.getMonth() === (month ?? 1) - 1
+            && date.getDate() === (day ?? 1)
+          ) {
+            return date
+          }
+        }
+
+        const date = new Date(dob)
+        return Number.isNaN(date.getTime()) ? null : date
+      }
+      catch {
+        return null
+      }
+    }
+
+    return {
+      display_name: userInfo?.displayName || 'Unknown User',
+      avatar_url: userInfo?.avatar,
+      cover_url: userInfo?.cover,
+      alias: userInfo?.username,
+      date_of_birth: parseDateOfBirth(userInfo?.sdob || userInfo?.dob),
+      is_friend: userInfo?.isFr === 1 || false,
+      last_online: userInfo?.lastActionTime
+        ? new Date(Number(userInfo.lastActionTime))
+        : null,
+      status_message: userInfo?.status || null,
+      zalo_name: userInfo?.zaloName,
+      raw_data: userInfo,
     }
   }
 }

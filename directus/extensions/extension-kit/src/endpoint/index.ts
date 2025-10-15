@@ -51,7 +51,6 @@ export default defineEndpoint(async (router, { database, getSchema, services }) 
           message: 'Cookies must be a non-empty array',
         })
       }
-
       res.json({
         ok: true,
         message: 'Login session is being initialized...',

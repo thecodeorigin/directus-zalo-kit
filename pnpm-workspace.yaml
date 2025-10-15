@@ -15,8 +15,7 @@ catalog:
   '@vue/tsconfig': ^0.8.1
   autoprefixer: ^10.4.14
   eslint: ^9.36.0
-  ioredis: ^5.8.2
-  knex: ^3.1.0
+  ioredis: ^5.8.1
   open: ^10.2.0
   postcss: ^8.4.24
   qrcode-terminal: ^0.12.0
@@ -24,7 +23,6 @@ catalog:
   tailwindcss: ^3.3.0
   ts-pattern: ^5.8.0
   tsx: ^4.20.6
-  type-fest: ^5.0.1
   typescript: ^5.9.2
   vitest: ^3.2.4
   vue: ^3.5.22
