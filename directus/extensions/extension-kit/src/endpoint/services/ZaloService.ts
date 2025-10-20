@@ -1,6 +1,4 @@
 import type { SchemaOverview } from '@directus/types'
-import fs from 'node:fs'
-import path from 'node:path'
 import Redis from 'ioredis'
 import { match, P } from 'ts-pattern'
 import { LoginQRCallbackEventType, Zalo } from 'zca-js'
@@ -29,7 +27,6 @@ export class ZaloService {
   private reconnectAttempts = 0
   private readonly maxReconnectAttempts = 5
   private readonly reconnectDelay = 5000
-  private sessionsDir: string
   private isRestoringSession = false
 
   private readonly systemAccountability = {
@@ -44,6 +41,8 @@ export class ZaloService {
     cookies?: any[]
   } | null = null
 
+  private keepAliveInterval: NodeJS.Timeout | null = null
+
   private constructor(
     getSchemaFn: () => Promise<SchemaOverview>,
     ItemsService: any,
@@ -51,17 +50,10 @@ export class ZaloService {
     this.getSchemaFn = getSchemaFn
     this.ItemsService = ItemsService
 
-    const zaloDataPath = process.env.ZALO_SESSION_PATH || '/directus/storage'
-    this.sessionsDir = zaloDataPath
-    if (!fs.existsSync(this.sessionsDir)) {
-      fs.mkdirSync(this.sessionsDir, { recursive: true })
-    }
-
     this.zalo = new Zalo({ selfListen: true, checkUpdate: false })
 
     this.initializeRedis()
     console.log('[ZaloService] Initialized')
-    console.log(`[ZaloService] Session directory: ${this.sessionsDir}`)
 
     setTimeout(() => {
       void this.tryRestoreSession()
@@ -70,14 +62,6 @@ export class ZaloService {
 
   private getRedisKey(userId: string): string {
     return `zalo:session:${userId}`
-  }
-
-  private getSessionFile(userId: string): string {
-    return path.join(this.sessionsDir, `zalo-session-${userId}.json`)
-  }
-
-  private getBackupFile(userId: string): string {
-    return path.join(this.sessionsDir, `zalo-session-${userId}.backup.json`)
   }
 
   private async cleanup() {
@@ -141,7 +125,7 @@ export class ZaloService {
     try {
       this.redis = new Redis({
         host: process.env.REDIS_HOST,
-        port: Number.parseInt(process.env.REDIS_PORT || '6379'),
+        port: Number.parseInt(process.env.REDIS_PORT ?? '6379'),
       })
 
       this.redis.on('error', (err) => {
@@ -206,7 +190,6 @@ export class ZaloService {
     }
 
     const redisKey = this.getRedisKey(userId)
-    const filePath = this.getSessionFile(userId)
     if (this.redis) {
       try {
         console.log(`[ZaloService] Checking Redis for user ${userId}...`)
@@ -222,24 +205,6 @@ export class ZaloService {
           `[ZaloService] Error reading Redis for ${userId}:`,
           err.message,
         )
-      }
-    }
-    if (fs.existsSync(filePath)) {
-      try {
-        console.log(`[ZaloService] Checking file for user ${userId}...`)
-        const raw = fs.readFileSync(filePath, 'utf-8')
-        if (raw && raw.trim() !== '') {
-          const session = JSON.parse(raw)
-          console.log(`[ZaloService] File session loaded for ${userId}`)
-          return session
-        }
-      }
-      catch (err: any) {
-        console.error(
-          `[ZaloService] Error reading file for ${userId}:`,
-          err.message,
-        )
-        this.backupCorruptFile(userId)
       }
     }
 
@@ -275,50 +240,7 @@ export class ZaloService {
       }
     }
 
-    // Load from files
-    try {
-      if (fs.existsSync(this.sessionsDir)) {
-        const files = fs.readdirSync(this.sessionsDir)
-        const sessionFiles = files.filter(
-          f =>
-            f.startsWith('zalo-session-')
-            && f.endsWith('.json')
-            && !f.includes('backup'),
-        )
-
-        for (const file of sessionFiles) {
-          try {
-            const raw = fs.readFileSync(
-              path.join(this.sessionsDir, file),
-              'utf-8',
-            )
-            const session = JSON.parse(raw)
-            if (session.userId && !seenUserIds.has(session.userId)) {
-              sessions.push(session)
-              seenUserIds.add(session.userId)
-            }
-          }
-          catch {
-            console.error(`[ZaloService] Failed to parse file ${file}`)
-          }
-        }
-      }
-    }
-    catch (err) {
-      console.error('[ZaloService] Error listing file sessions:', err)
-    }
-
     return sessions
-  }
-
-  private backupCorruptFile(userId: string): void {
-    try {
-      const filePath = this.getSessionFile(userId)
-      const corruptBackup = `${filePath}.corrupt.${Date.now()}`
-      fs.copyFileSync(filePath, corruptBackup)
-      console.log(`[ZaloService] Corrupt file backed up to: ${corruptBackup}`)
-    }
-    catch {}
   }
 
   private isValidSession(session: ZaloSession): boolean {
@@ -411,6 +333,7 @@ export class ZaloService {
       this.status = 'logged_in'
       console.log(`[ZaloService] Restored session for user: ${id}`)
       this.startListener()
+      this.startKeepAlive()
 
       try {
         await this.fetchAndUpsertUser(id)
@@ -432,8 +355,6 @@ export class ZaloService {
       userId,
     )
     const redisKey = this.getRedisKey(userId)
-    const filePath = this.getSessionFile(userId)
-    const backupFile = this.getBackupFile(userId)
     if (this.redis) {
       try {
         this.redis.del(redisKey)
@@ -450,40 +371,12 @@ export class ZaloService {
         )
       }
     }
-
-    try {
-      if (fs.existsSync(filePath)) {
-        fs.copyFileSync(filePath, backupFile)
-        console.log(`[ZaloService] Session backed up to: ${backupFile}`)
-      }
-    }
-    catch (err: any) {
-      console.error(
-        `[ZaloService] Failed to backup session file for ${userId}:`,
-        err.message,
-      )
-    }
-
-    try {
-      if (fs.existsSync(filePath)) {
-        fs.unlinkSync(filePath)
-        console.log(`[ZaloService] Session file deleted for ${userId}`)
-      }
-    }
-    catch (err: any) {
-      console.error(
-        `[ZaloService] Failed to delete session file for ${userId}:`,
-        err.message,
-      )
-    }
   }
 
   private async saveSession(session: ZaloSession): Promise<void> {
     const sessionJson = JSON.stringify(session, null, 2)
     const userId = session.userId
     const redisKey = this.getRedisKey(session.userId)
-    const filePath = this.getSessionFile(session.userId)
-    const backupSessionFile = this.getBackupFile(session.userId)
 
     if (this.redis) {
       try {
@@ -502,27 +395,6 @@ export class ZaloService {
           err.message,
         )
       }
-    }
-
-    try {
-      const dir = path.dirname(filePath)
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true })
-      }
-
-      if (fs.existsSync(filePath)) {
-        fs.copyFileSync(filePath, backupSessionFile)
-      }
-
-      fs.writeFileSync(filePath, sessionJson, 'utf-8')
-      console.log(`[ZaloService] Session saved to file: ${userId}`)
-
-      const verifyRaw = fs.readFileSync(filePath, 'utf-8')
-      JSON.parse(verifyRaw)
-      console.log('[ZaloService] Session file verified')
-    }
-    catch (err: any) {
-      console.error('[ZaloService] Save session error:', err.message)
     }
   }
 
@@ -623,7 +495,6 @@ export class ZaloService {
         )
         return
       }
-
       this.pendingLoginData = {
         imei,
         userAgent,
@@ -656,14 +527,16 @@ export class ZaloService {
       console.error('[ZaloService]  Could not get userId from API')
       this.pendingLoginData = null
       this.startListener()
+      this.startKeepAlive()
       return
     }
 
     console.log(`[ZaloService] Using userId from API: ${userId}`)
     if (!userId || !/^\d+$/.test(userId)) {
-      console.error(`[ZaloService] ❌ Invalid userId format: ${userId}`)
+      console.error(`[ZaloService]  Invalid userId format: ${userId}`)
       this.pendingLoginData = null
       this.startListener()
+      this.startKeepAlive()
       return
     }
 
@@ -673,10 +546,13 @@ export class ZaloService {
       )
       this.pendingLoginData = null
       this.startListener()
+      this.startKeepAlive()
       return
     }
 
-    console.log(`[ZaloService]  userId validation passed: ${userId} (${userId.length} chars)`)
+    console.log(
+      `[ZaloService]  userId validation passed: ${userId} (${userId.length} chars)`,
+    )
     console.log(`[ZaloService] Login successful for user: ${userId}`)
 
     const session: ZaloSession = {
@@ -706,13 +582,12 @@ export class ZaloService {
       )
       this.pendingLoginData = null
       this.startListener()
+      this.startKeepAlive()
       return
     }
 
     await this.saveSession(session)
-    console.log(
-      `[ZaloService]  Session saved successfully for ${userId}`,
-    )
+    console.log(`[ZaloService]  Session saved successfully for ${userId}`)
 
     this.pendingLoginData = null
 
@@ -777,7 +652,7 @@ export class ZaloService {
 
       await this.saveSession(session)
       this.startListener()
-
+      this.startKeepAlive()
       try {
         await this.fetchAndUpsertUser(uid)
         await this.syncGroupAvatars()
@@ -800,7 +675,7 @@ export class ZaloService {
   }
 
   public async logout(userId?: string): Promise<void> {
-    const targetUserId = userId || this.api?.getOwnId?.()
+    const targetUserId = userId || this.api.getOwnId()
 
     let finalUserId = targetUserId
     if (!finalUserId) {
@@ -818,7 +693,7 @@ export class ZaloService {
       return
     }
 
-    const currentUserId = this.api?.getOwnId?.()
+    const currentUserId = this.api.getOwnId()
     const isCurrentSession = currentUserId === finalUserId
 
     if (this.api && isCurrentSession) {
@@ -844,8 +719,6 @@ export class ZaloService {
 
     try {
       const redisKey = this.getRedisKey(finalUserId)
-      const filePath = this.getSessionFile(finalUserId)
-      const backupFile = this.getBackupFile(finalUserId)
 
       if (this.redis) {
         try {
@@ -867,19 +740,6 @@ export class ZaloService {
             err.message,
           )
         }
-      }
-
-      if (fs.existsSync(filePath)) {
-        fs.unlinkSync(filePath)
-        console.log(`[ZaloService]  Session file deleted: ${finalUserId}`)
-      }
-      else {
-        console.log(`[ZaloService] No session file found for ${finalUserId}`)
-      }
-
-      if (fs.existsSync(backupFile)) {
-        fs.unlinkSync(backupFile)
-        console.log(`[ZaloService]  Backup file deleted: ${finalUserId}`)
       }
     }
     catch (err: any) {
@@ -920,93 +780,6 @@ export class ZaloService {
     catch (err: any) {
       console.error('[ZaloService] getSessionInfo error:', err.message)
       return null
-    }
-  }
-
-  public async redisStatus() {
-    if (!this.redis)
-      return { enabled: false }
-    try {
-      const ping = await this.redis.ping()
-      const dbsize = await this.redis.dbsize()
-      return { enabled: true, ping, dbsize }
-    }
-    catch (e: any) {
-      return { enabled: false, error: e.message }
-    }
-  }
-
-  public async redisGetSession(userId?: string) {
-    if (!this.redis)
-      return null
-    try {
-      if (!userId) {
-        const keys = await this.redis.keys('zalo:session:*')
-        const sessions: any = {}
-        for (const key of keys) {
-          const raw = await this.redis.get(key)
-          if (raw) {
-            try {
-              const id = key.replace('zalo:session:', '')
-              sessions[id] = JSON.parse(raw)
-            }
-            catch {
-              sessions[key] = raw
-            }
-          }
-        }
-        return sessions
-      }
-
-      const raw = await this.redis.get(this.getRedisKey(userId))
-      if (!raw)
-        return null
-      try {
-        return JSON.parse(raw)
-      }
-      catch {
-        return raw
-      }
-    }
-    catch {
-      return null
-    }
-  }
-
-  public async redisKeys(pattern = '*', limit = 1000) {
-    if (!this.redis)
-      return []
-    let cursor = '0'
-    const keys: string[] = []
-    do {
-      const [next, batch] = await this.redis.scan(
-        cursor,
-        'MATCH',
-        pattern,
-        'COUNT',
-        200,
-      )
-      for (const k of batch) {
-        keys.push(k)
-        if (keys.length >= limit)
-          return keys
-      }
-      cursor = next
-    } while (cursor !== '0')
-    return keys
-  }
-
-  public async redisGet(key: string) {
-    if (!this.redis || !key)
-      return null
-    const raw = await this.redis.get(key)
-    if (!raw)
-      return null
-    try {
-      return JSON.parse(raw)
-    }
-    catch {
-      return raw
     }
   }
 
@@ -1057,6 +830,29 @@ export class ZaloService {
       console.error('[ZaloService] startListener failed:', err)
       this.handleListenerError()
     }
+  }
+
+  private startKeepAlive() {
+    if (this.keepAliveInterval)
+      return
+    this.keepAliveInterval = setInterval(async () => {
+      if (this.status !== 'logged_in' || !this.api)
+        return
+      try {
+        const ownId = this.api.getOwnId()
+        if (ownId) {
+          await this.api.getUserInfo(ownId)
+        }
+        else {
+          console.warn('[ZaloService] Skip keep-alive: No ownId available')
+        }
+        console.log('[ZaloService] Internal keep-alive ping sent via getUserInfo')
+      }
+      catch (err) {
+        console.error('[ZaloService] Keep-alive error:', err)
+        this.handleListenerError()
+      }
+    }, 1800000) // 30 minutes
   }
 
   private async handleIncomingMessage(rawData: any) {
