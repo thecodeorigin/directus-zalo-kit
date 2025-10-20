@@ -30,11 +30,6 @@
         "source": "src/endpoint/index.ts"
       },
       {
-        "type": "hook",
-        "name": "zalo-hook",
-        "source": "src/hook/index.ts"
-      },
-      {
         "type": "interface",
         "name": "directus-interface-boilerplate",
         "source": "src/interface/index.ts"
