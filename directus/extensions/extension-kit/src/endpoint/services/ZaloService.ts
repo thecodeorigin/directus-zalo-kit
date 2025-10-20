@@ -1,5 +1,4 @@
 import type { SchemaOverview } from '@directus/types'
-import type Redis from 'ioredis'
 import fs from 'node:fs'
 import path from 'node:path'
 import Redis from 'ioredis'
@@ -244,6 +243,35 @@ export class ZaloService {
     }
 
     return sessions
+  }
+
+  private isValidSession(session: ZaloSession): boolean {
+    if (!session) {
+      console.warn('[ZaloService] Session object is null/undefined')
+      return false
+    }
+
+    if (
+      !session.cookies
+      || !Array.isArray(session.cookies)
+      || session.cookies.length === 0
+    ) {
+      console.warn('[ZaloService] Session missing or empty cookies array')
+      return false
+    }
+
+    if (!session.imei || typeof session.imei !== 'string') {
+      console.warn('[ZaloService] Session missing valid imei')
+      return false
+    }
+
+    if (!session.userAgent || typeof session.userAgent !== 'string') {
+      console.warn('[ZaloService] Session missing valid userAgent')
+      return false
+    }
+
+    console.log('[ZaloService] Session validation passed')
+    return true
   }
 
   private extractUserIdFromCookies(cookies: any[]): string | null {
@@ -933,95 +961,89 @@ export class ZaloService {
         }
       }
 
+  private startKeepAlive() {
+    if (this.keepAliveInterval)
+      return
+    this.keepAliveInterval = setInterval(async () => {
+      if (this.status !== 'logged_in' || !this.api)
+        return
+      try {
+        const ownId = this.api.getOwnId()
+        if (ownId) {
+          await this.api.getUserInfo(ownId)
+        }
+        else {
+          console.warn('[ZaloService] Skip keep-alive: No ownId available')
+        }
+        console.log('[ZaloService] Internal keep-alive ping sent via getUserInfo')
+      }
+      catch (err) {
+        console.error('[ZaloService] Keep-alive error:', err)
+        this.handleListenerError()
+      }
+    }, 1800000) // 30 minutes
+  }
+
+  private async handleIncomingMessage(rawData: any) {
+    try {
+      const schema = await this.getSchemaFn()
+      if (!schema || Object.keys(schema).length === 0) {
+        console.error('[ZaloService] Schema is empty or invalid')
+        return
+      }
+
+      const messageId = rawData.msgId
+      const senderId = rawData.uidFrom
+      const recipientId = rawData.idTo
+      const timestamp = Number.parseInt(
+        rawData.ts ?? rawData.t ?? `${Date.now()}`,
+      )
+      const clientMsgId = rawData.cliMsgId
+
       let content = ''
       let attachments: any[] = []
 
       if (typeof rawData.content === 'string') {
         content = rawData.content
-
         if (content.startsWith('/')) {
           await this.handleQuickMessage(content, recipientId, senderId)
         }
       }
-      else if (typeof rawData.content === 'object' && rawData.content !== null) {
-        let parsedParams: any = {}
-        if (rawData.content.params) {
-          try {
-            parsedParams = JSON.parse(rawData.content.params)
-          }
-          catch {
-            console.warn('[ZaloService] Failed to parse params')
-          }
-        }
-
-        const attachment = {
-          title: rawData.content.title,
-          fileName: rawData.content.title,
-          name: rawData.content.title,
-          url: rawData.content.href,
-          href: rawData.content.href,
-          link: rawData.content.href,
-          thumb: rawData.content.thumb,
-          thumbnailUrl: rawData.content.thumb,
-          fileSize: parsedParams.fileSize ? Number.parseInt(parsedParams.fileSize) : null,
-          size: parsedParams.fileSize ? Number.parseInt(parsedParams.fileSize) : null,
-          fileExt: parsedParams.fileExt,
-          checksum: parsedParams.checksum,
-          type: rawData.msgType,
-          mimeType: this.getMimeTypeFromExtension(parsedParams.fileExt),
-          metadata: {
-            ...rawData.content,
-            parsedParams,
-          },
-        }
-
-        attachments = [attachment]
+      else if (
+        typeof rawData.content === 'object'
+        && rawData.content !== null
+      ) {
+        const parsedParams = this.parseParams(rawData.content.params)
+        attachments = [this.createAttachmentObject(rawData, parsedParams)]
         content = rawData.content.description || rawData.content.title || ''
       }
 
-      let conversationId: string
-      if (isGroupMessage && groupId) {
-        conversationId = groupId
-      }
-      else {
-        const userIds = [senderId, recipientId].sort()
-        conversationId = `direct_${userIds[0]}_${userIds[1]}`
-      }
-
+      const conversationId = this.getConversationId(senderId, recipientId)
       await this.startSync(conversationId)
 
-      await this.upsertConversation(conversationId, rawData, schema, senderId, recipientId)
-
+      await this.upsertConversation(
+        conversationId,
+        rawData,
+        schema,
+        senderId,
+        recipientId,
+      )
       await this.fetchAndUpsertUser(senderId, schema)
 
-      if (isGroupMessage && groupId) {
-        await this.ensureGroupMember(groupId, senderId, schema)
-      }
-
-      if (!isGroupMessage && recipientId && recipientId !== senderId) {
+      if (recipientId && recipientId !== senderId) {
         await this.fetchAndUpsertUser(recipientId, schema)
       }
 
-      const messageData = {
-        id: messageId,
-        client_id: clientMsgId || messageId,
-        conversation_id: conversationId,
-        sender_id: senderId,
+      await this.createMessage(
+        messageId,
+        clientMsgId,
+        conversationId,
+        senderId,
         content,
-        raw_data: rawData,
-        mentions: null,
-        forward_from_message_id: null,
-        reply_to_message_id: null,
-        is_edited: false,
-        is_undone: false,
-        sent_at: new Date(timestamp),
-        received_at: new Date(),
-        edited_at: null,
-        message_type: isGroupMessage ? 'group' : 'direct',
-        websocket_broadcast: true,
-      }
-
-      await messagesService.createOne(messageData)
+        rawData,
+        timestamp,
+        schema,
+      )
 
       if (attachments.length > 0) {
         await this.createAttachments(messageId, attachments, schema)

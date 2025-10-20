@@ -74,7 +74,6 @@ services:
       - ./extensions:/directus/extensions
       - ./migrations:/directus/migrations
       - ./templates:/directus/templates
-      - ./docker/storage:/directus/storage
     depends_on:
       cache:
         condition: service_healthy
@@ -136,11 +135,6 @@ services:
       SESSION_COOKIE_SECURE: false
       CONTENT_SECURITY_POLICY_DIRECTIVES__IMG_SRC: ${CONTENT_SECURITY_POLICY_DIRECTIVES__IMG_SRC}
       CONTENT_SECURITY_POLICY: ${CONTENT_SECURITY_POLICY:-true}
-
-      # Zalo Extension Settings
-      ZALO_SESSION_PATH: /directus/storage
-  
-
 
 
     command: >
