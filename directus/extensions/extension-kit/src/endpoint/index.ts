@@ -738,4 +738,77 @@ export default defineEndpoint(async (router, { database, getSchema, services }) 
       })
     }
   })
+
+  // Proxy avatar images to avoid CORS
+  router.get('/avatar-proxy', async (req, res) => {
+    try {
+      const { url } = req.query
+
+      if (!url || typeof url !== 'string') {
+        return res.status(400).json({ error: 'URL parameter is required' })
+      }
+
+      // Only allow Zalo CDN URLs
+      if (!url.startsWith('https://ava-grp-talk.zadn.vn/') && !url.startsWith('https://s120-ava-talk.zadn.vn/')) {
+        return res.status(403).json({ error: 'Only Zalo CDN URLs are allowed' })
+      }
+
+      // Fetch image from Zalo
+      const response = await fetch(url)
+
+      if (!response.ok) {
+        return res.status(response.status).json({ error: 'Failed to fetch image' })
+      }
+
+      // Get content type and buffer
+      const contentType = response.headers.get('content-type') || 'image/jpeg'
+      const buffer = await response.arrayBuffer()
+
+      // Set headers and send
+      res.setHeader('Content-Type', contentType)
+      res.setHeader('Cache-Control', 'public, max-age=86400') // Cache 24 hours
+      res.send(Buffer.from(buffer))
+    }
+    catch (error: any) {
+      console.error('❌ [Endpoint /avatar-proxy] Error:', error)
+      res.status(500).json({ error: 'Failed to proxy image', details: error.message })
+    }
+  })
+
+  // Manual sync group members (max 10 members to avoid rate limit)
+  router.post('/sync-group-members/:groupId', async (req, res) => {
+    try {
+      const { groupId } = req.params
+      const { maxMembers = 10 } = req.body
+
+      if (!groupId) {
+        return res.status(400).json({ error: 'Group ID is required' })
+      }
+
+      console.warn(`[Endpoint] Manual sync members for group: ${groupId}`)
+
+      // Fetch group info from Zalo API
+      const groupInfo = await zaloService.getGroupInfo(groupId)
+
+      if (!groupInfo) {
+        return res.status(404).json({ error: 'Group not found' })
+      }
+
+      // Sync members (only first N to avoid rate limit)
+      await zaloService.manualSyncGroupMembers(groupId, groupInfo, maxMembers)
+
+      res.json({
+        success: true,
+        message: `Synced up to ${maxMembers} members for group ${groupId}`,
+        totalMembers: groupInfo.memVerList?.length || 0,
+      })
+    }
+    catch (error: any) {
+      console.error('❌ [Endpoint /sync-group-members] Error:', error)
+      res.status(500).json({
+        error: 'Failed to sync group members',
+        details: error.message,
+      })
+    }
+  })
 })

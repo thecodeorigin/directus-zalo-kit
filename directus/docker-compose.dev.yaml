@@ -136,8 +136,6 @@ services:
       CONTENT_SECURITY_POLICY_DIRECTIVES__IMG_SRC: ${CONTENT_SECURITY_POLICY_DIRECTIVES__IMG_SRC}
       
       CONTENT_SECURITY_POLICY: ${CONTENT_SECURITY_POLICY:-true}
-
-
     command: >
       sh -c "
         npx directus bootstrap &&

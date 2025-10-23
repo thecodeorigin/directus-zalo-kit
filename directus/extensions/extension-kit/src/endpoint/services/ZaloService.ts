@@ -1794,6 +1794,10 @@ export class ZaloService {
               avatar: groupInfo.fullAvt || groupInfo.avt || null,
               type: 'group',
             }, schema)
+
+            // ⚠️ KHÔNG sync members ngay để tránh rate limit
+            // Members sẽ được sync dần dần khi có message mới từ group
+            // Hoặc có thể tạo endpoint riêng để manual sync từng group
           }
           catch (error: any) {
             console.error('[ZaloService] Error syncing group', groupId, ':', error.message)
@@ -1812,9 +1816,10 @@ export class ZaloService {
     }
   }
 
-  private async syncGroupMembers(groupId: string, groupInfo: any) {
+  private async syncGroupMembers(groupId: string, groupInfo: any, maxMembers: number = 10) {
     try {
       if (!groupInfo.memVerList || !Array.isArray(groupInfo.memVerList)) {
+        console.warn(`[ZaloService] ⚠️ No members list for group: ${groupId}`)
         return
       }
 
@@ -1824,6 +1829,7 @@ export class ZaloService {
         accountability: this.systemAccountability,
       })
 
+      // Check existing members
       const existingMembers = await membersService.readByQuery({
         filter: { group_id: { _eq: groupId } },
         fields: ['user_id'],
@@ -1831,60 +1837,65 @@ export class ZaloService {
 
       const existingUserIds = new Set(existingMembers.map((m: any) => m.user_id))
 
-      const userIdsToFetch = groupInfo.memVerList
+      // Only sync first N members to avoid rate limit
+      const membersList = groupInfo.memVerList.slice(0, maxMembers)
+      const userIdsToFetch = membersList
         .map((memVer: string) => memVer.split('|')[0])
         .filter((userId: string) => userId && !existingUserIds.has(userId))
 
-      const USER_BATCH_SIZE = 10
+      console.warn(`[ZaloService] 📊 Syncing ${membersList.length}/${groupInfo.memVerList.length} members for group: ${groupId}`)
+
+      if (userIdsToFetch.length === 0) {
+        console.warn(`[ZaloService] ⏭️ All members already synced for group: ${groupId}`)
+        return
+      }
+
+      // Fetch users WITHOUT calling API (only create basic placeholders)
+      // Actual user info will be fetched when they send messages
+      const USER_BATCH_SIZE = 5
       for (let i = 0; i < userIdsToFetch.length; i += USER_BATCH_SIZE) {
         const userBatch = userIdsToFetch.slice(i, i + USER_BATCH_SIZE)
 
-        await Promise.all(
-          userBatch.map(async (userId: string) => {
-            try {
-              await this.fetchAndUpsertUser(userId, schema)
-            }
-            catch (error: any) {
-              console.error('[ZaloService] Failed to fetch user:', userId, error.message)
-            }
-          }),
-        )
+        for (const userId of userBatch) {
+          try {
+            // Just create basic user placeholder, don't call API
+            await this.createBasicUser(userId)
+          }
+          catch (error: any) {
+            console.error('[ZaloService] Failed to create basic user:', userId, error.message)
+          }
+        }
 
         if (i + USER_BATCH_SIZE < userIdsToFetch.length) {
-          await new Promise(resolve => setTimeout(resolve, 2000))
+          await new Promise(resolve => setTimeout(resolve, 1000))
         }
       }
 
-      const MEMBER_BATCH_SIZE = 20
-      for (let i = 0; i < groupInfo.memVerList.length; i += MEMBER_BATCH_SIZE) {
-        const memberBatch = groupInfo.memVerList.slice(i, i + MEMBER_BATCH_SIZE)
+      // Create group member records
+      for (const memVer of membersList) {
+        try {
+          const userId = memVer.split('|')[0]
+          if (!userId || existingUserIds.has(userId)) {
+            continue
+          }
 
-        await Promise.all(
-          memberBatch.map(async (memVer: string) => {
-            try {
-              const userId = memVer.split('|')[0]
-              if (!userId || existingUserIds.has(userId)) {
-                return
-              }
+          await this.upsertGroupMember(groupId, userId, {
+            is_active: true,
+            joined_at: new Date(),
+            left_at: null,
+          })
 
-              await this.upsertGroupMember(groupId, userId, {
-                isactive: true,
-                joinedat: new Date(),
-                leftat: null,
-              })
-
-              existingUserIds.add(userId)
-            }
-            catch (error: any) {
-              console.error('[ZaloService] Error creating member:', memVer, error.message)
-            }
-          }),
-        )
-
-        if (i + MEMBER_BATCH_SIZE < groupInfo.memVerList.length) {
-          await new Promise(resolve => setTimeout(resolve, 500))
+          existingUserIds.add(userId)
         }
+        catch (error: any) {
+          console.error('[ZaloService] Error creating member:', memVer, error.message)
+        }
+
+        // Small delay between each member
+        await new Promise(resolve => setTimeout(resolve, 100))
       }
+
+      console.warn(`[ZaloService] ✅ Synced ${membersList.length} members for group: ${groupId}`)
     }
     catch (error: any) {
       console.error('[ZaloService] Error syncing group members:', error.message)
@@ -2455,9 +2466,9 @@ export class ZaloService {
     groupId: string,
     userId: string,
     data: {
-      isactive?: boolean
-      joinedat?: Date | null
-      leftat?: Date | null
+      is_active?: boolean
+      joined_at?: Date | null
+      left_at?: Date | null
     },
   ) {
     try {
@@ -2481,14 +2492,14 @@ export class ZaloService {
       if (existing.length > 0) {
         const current = existing[0]
         const needsUpdate
-          = (data.isactive !== undefined && current.isactive !== data.isactive)
-            || (data.leftat !== undefined && current.leftat !== data.leftat)
+          = (data.is_active !== undefined && current.is_active !== data.is_active)
+            || (data.left_at !== undefined && current.left_at !== data.left_at)
 
         if (needsUpdate) {
           await membersService.updateOne(existing[0].id, {
-            isactive: data.isactive,
-            leftat: data.leftat,
-            updatedat: new Date(),
+            is_active: data.is_active,
+            left_at: data.left_at,
+            updated_at: new Date(),
           })
         }
         return
@@ -2496,9 +2507,9 @@ export class ZaloService {
       await membersService.createOne({
         group_id: groupId,
         user_id: userId,
-        isactive: data.isactive ?? true,
-        joinedat: data.joinedat ?? new Date(),
-        leftat: data.leftat ?? null,
+        is_active: data.is_active ?? true,
+        joined_at: data.joined_at ?? new Date(),
+        left_at: data.left_at ?? null,
       })
 
       console.info('[ZaloService] ✓ Created member:', groupId, userId)
@@ -2537,16 +2548,16 @@ export class ZaloService {
 
   public async markMemberLeft(groupId: string, userId: string) {
     await this.upsertGroupMember(groupId, userId, {
-      isactive: false,
-      leftat: new Date(),
+      is_active: false,
+      left_at: new Date(),
     })
   }
 
   public async markMemberRejoined(groupId: string, userId: string) {
     await this.upsertGroupMember(groupId, userId, {
-      isactive: true,
-      joinedat: new Date(),
-      leftat: null,
+      is_active: true,
+      joined_at: new Date(),
+      left_at: null,
     })
   }
 
@@ -6185,6 +6196,31 @@ export class ZaloService {
       console.error('[ZaloService] Zalo API error:', error)
       throw new Error(`Failed to send via Zalo: ${error.message}`)
     }
+  }
+
+  /**
+   * Get group info from Zalo API
+   */
+  public async getGroupInfo(groupId: string): Promise<any> {
+    if (!this.api) {
+      throw new Error('Not logged in')
+    }
+
+    try {
+      const response = await this.api.getGroupInfo?.(groupId)
+      return response?.gridInfoMap?.[groupId] || null
+    }
+    catch (error: any) {
+      console.error(`[ZaloService] Failed to get group info for ${groupId}:`, error.message)
+      throw error
+    }
+  }
+
+  /**
+   * Manual sync group members (for endpoint use)
+   */
+  public async manualSyncGroupMembers(groupId: string, groupInfo: any, maxMembers: number = 10): Promise<void> {
+    await this.syncGroupMembers(groupId, groupInfo, maxMembers)
   }
 <<<<<<< HEAD
 =======
