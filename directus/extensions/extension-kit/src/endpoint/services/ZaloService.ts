@@ -413,8 +413,6 @@ export class ZaloService {
     }
 
     this.status = 'pending_qr'
-    console.log('[ZaloService] Starting QR login...')
-
     return new Promise<any>((resolve, reject) => {
       this.loginResolver = resolve
 
