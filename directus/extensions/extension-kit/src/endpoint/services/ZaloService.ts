@@ -584,7 +584,6 @@ export class ZaloService {
     }
 
     await this.saveSession(session)
-    console.log(`[ZaloService]  Session saved successfully for ${userId}`)
 
     this.pendingLoginData = null
 
