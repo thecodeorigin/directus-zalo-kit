@@ -58,12 +58,11 @@ export default defineEndpoint(async (router, { database, getSchema, services }) 
 
       (async () => {
         try {
-          const result = await zaloService.importSessionFromExtractor(
+          await zaloService.importSessionFromExtractor(
             imei,
             userAgent,
             cookies,
           )
-          console.log('[ZaloService] Background cookie login done:', result)
         }
         catch (err) {
           console.error('[ZaloService] Background cookie login failed:', err)

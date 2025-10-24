@@ -413,8 +413,6 @@ export class ZaloService {
     }
 
     this.status = 'pending_qr'
-    console.log('[ZaloService] Starting QR login...')
-
     return new Promise<any>((resolve, reject) => {
       this.loginResolver = resolve
 
@@ -453,7 +451,6 @@ export class ZaloService {
         },
         (qrImage) => {
           this.qrCode = qrImage
-          console.log('[ZaloService] QR code generated')
           if (this.loginResolver) {
             this.loginResolver(this.getStatus())
           }

@@ -33,7 +33,6 @@
     "@types/qrcode-terminal": "catalog:",
     "@vue/tsconfig": "catalog:",
     "eslint": "catalog:",
-    "ioredis": "catalog:",
     "open": "catalog:",
     "qrcode-terminal": "catalog:",
     "ts-pattern": "catalog:",

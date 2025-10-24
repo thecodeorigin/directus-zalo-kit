@@ -124,8 +124,6 @@ export default defineHook(({ action, init, schedule }, { services, getSchema, lo
 
   // 4. Handle QR code generation
   action('zalo.qr.generated', async ({ payload }) => {
-    logger.info('QR code generated for login')
-
     try {
       const settingsService = new ItemsService('zalo_settings', {
         schema: await getSchema(),
