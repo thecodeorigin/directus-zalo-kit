@@ -1,12 +1,11 @@
 packages:
-  - directus/**
-  - nuxt
+  - extensions/**
+  - packages/**
 
 catalog:
   '@antfu/eslint-config': ^5.4.1
   '@directus/extensions-sdk': ^16.0.2
   '@directus/sdk': ^20.1.0
-  '@directus/shared': ^9.24.0
   '@directus/types': ^13.2.3
   '@neondatabase/api-client': ^2.2.0
   '@rollup/plugin-image': ^3.0.3
@@ -24,7 +23,7 @@ catalog:
   tailwindcss: ^3.3.0
   ts-pattern: ^5.8.0
   tsx: ^4.20.6
-  type-fest: ^0.0.0
+  type-fest: ^5.1.0
   typescript: ^5.9.2
   vitest: ^3.2.4
   vue: ^3.5.22

@@ -1,28 +1,15 @@
 {
-  "name": "directus-extension-kit-development-sandbox",
+  "name": "directus-zalo-kit-development-sandbox",
   "version": "1.0.0",
   "description": "",
   "author": "",
   "keywords": [],
   "scripts": {
-    "database:create": "bun --env-file=.env run create.ts",
-    "dev": "docker compose -f ./directus/docker-compose.dev.yaml up -d && pnpm -F @thecodeorigin/directus-extension-kit dev"
-  },
-  "directus:template": {
-    "name": "CMS",
-    "description": "A ready-to-use CMS with block builder, visual editing, and integration with your favorite framework. ",
-    "template": "./directus/template",
-    "frontends": {
-      "nuxt": {
-        "name": "Nuxt",
-        "path": "./nuxt"
-      }
-    }
+    "dev": "docker compose -f ./directus/docker-compose.dev.yaml up -d && pnpm -F @thecodeorigin/directus-zalo-kit dev"
   },
   "devDependencies": {
     "@antfu/eslint-config": "catalog:",
     "@directus/extensions-sdk": "catalog:",
-    "@directus/shared": "catalog:",
     "@directus/types": "catalog:",
     "@neondatabase/api-client": "catalog:",
     "@rollup/plugin-image": "catalog:",

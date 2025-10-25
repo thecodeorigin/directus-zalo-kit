@@ -1,5 +1,5 @@
 {
-  "name": "@thecodeorigin/directus-extension-kit",
+  "name": "@thecodeorigin/directus-zalo-kit",
   "type": "module",
   "version": "1.0.0",
   "description": "Please enter a description for your extension",
@@ -84,6 +84,7 @@
   "devDependencies": {
     "@directus/sdk": "catalog:",
     "autoprefixer": "catalog:",
+    "knex": "catalog:",
     "postcss": "catalog:",
     "tailwindcss": "catalog:"
   }

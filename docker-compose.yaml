@@ -1,0 +1,48 @@
+volumes:
+  environments: {}
+
+services:
+  doppler:
+    image: dopplerhq/cli:latest
+    entrypoint: sh
+    environment:
+      - DOPPLER_TOKEN=${DOPPLER_TOKEN}
+      - DOPPLER_CONFIG=${DOPPLER_CONFIG}
+    command: > 
+      -c "
+      echo 'Fetching secrets from Doppler...' &&
+      doppler secrets download --no-file --format=env > /environments/directus.env && 
+      echo 'Secrets fetched successfully.' && 
+      touch /environments/fetch_done &&
+      echo 'Init complete. Keeping container alive for healthcheck...' &&
+      sleep infinity
+      "
+    volumes:
+      - environments:/environments
+    healthcheck:
+      test: ["CMD", "test", "-f", "/environments/fetch_done"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  directus:
+    image: directus/directus:11.12.0
+    depends_on:
+      doppler:
+        condition: service_healthy
+    entrypoint: sh
+    command: >
+      -c "
+      echo 'Sourcing environment variables from /environments/directus.env' &&
+      set -a && . /environments/directus.env && set +a &&
+      echo 'Running Directus bootstrap...' &&
+      npx directus bootstrap &&
+      echo 'Starting Directus...' &&
+      exec npx directus start
+      "
+
+    volumes:
+      - './uploads:/directus/uploads'
+      - './extensions:/directus/extensions'
+      - './template:/directus/template'
+      - environments:/environments
