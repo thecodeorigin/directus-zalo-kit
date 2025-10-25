@@ -1,10 +1,10 @@
 import { defineModule } from '@directus/extensions-sdk'
-import ModuleComponent from './module.vue'
+import ModuleComponent from './module.vue';
 
 export default defineModule({
-  id: 'zalo',
-  name: 'Zalo Module',
-  icon: 'box',
+  id: 'chat-ui-test',
+  name: 'Chat UI Test',
+  icon: 'chat',
   routes: [
     {
       path: '',
@@ -17,6 +17,7 @@ export default defineModule({
     {
       path: '/:page',
       component: ModuleComponent,
+      props: true,
     },
   ],
-})
+});

@@ -5,18 +5,25 @@ packages:
 catalog:
   '@antfu/eslint-config': ^5.4.1
   '@directus/extensions-sdk': ^16.0.2
+  '@directus/sdk': ^20.1.0
   '@directus/shared': ^9.24.0
   '@directus/types': ^13.2.3
   '@neondatabase/api-client': ^2.2.0
+  '@rollup/plugin-image': ^3.0.3
   '@types/node': ^24.5.2
   '@types/qrcode-terminal': ^0.12.2
   '@vue/tsconfig': ^0.8.1
+  autoprefixer: ^10.4.14
   eslint: ^9.36.0
   ioredis: ^5.8.1
   open: ^10.2.0
+  postcss: ^8.4.24
   qrcode-terminal: ^0.12.0
+  sass: ^1.93.2
+  tailwindcss: ^3.3.0
   ts-pattern: ^5.8.0
   tsx: ^4.20.6
+  type-fest: ^0.0.0
   typescript: ^5.9.2
   vitest: ^3.2.4
   vue: ^3.5.22

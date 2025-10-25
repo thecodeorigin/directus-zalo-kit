@@ -164,7 +164,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <private-view title="Zalo Sync">
+  <private-view title="Zalo Sync Thiện Hoàn">
     <div class="zalo-sync-container">
       <div v-if="isLoggedIn" class="status-card logged-in">
         <div class="success-animation">

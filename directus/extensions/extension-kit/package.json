@@ -53,6 +53,11 @@
         }
       },
       {
+        "type": "module",
+        "name": "my-module",
+        "source": "src/test-module/index.ts"
+      },
+      {
         "type": "panel",
         "name": "directus-panel-boilerplate",
         "source": "src/panel/index.ts"
@@ -71,5 +76,14 @@
     "link": "directus-extension link",
     "validate": "directus-extension validate",
     "lint": "eslint ."
+  },
+  "dependencies": {
+    "sass": "catalog:"
+  },
+  "devDependencies": {
+    "@directus/sdk": "catalog:",
+    "autoprefixer": "catalog:",
+    "postcss": "catalog:",
+    "tailwindcss": "catalog:"
   }
 }
