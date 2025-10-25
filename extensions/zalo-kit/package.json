@@ -40,22 +40,12 @@
         "source": "src/layout/index.ts"
       },
       {
-        "type": "module",
-        "name": "zalo-module",
-        "source": "src/module/index.ts"
-      },
-      {
         "type": "operation",
         "name": "directus-operation-boilerplate",
         "source": {
           "app": "src/operation/app.ts",
           "api": "src/operation/api.ts"
         }
-      },
-      {
-        "type": "module",
-        "name": "my-module",
-        "source": "src/test-module/index.ts"
       },
       {
         "type": "panel",
@@ -66,6 +56,16 @@
         "type": "theme",
         "name": "directus-theme-boilerplate",
         "source": "src/theme/index.ts"
+      },
+      {
+        "type": "module",
+        "name": "zalo-chat",
+        "source": "src/zalo-chat/index.ts"
+      },
+      {
+        "type": "module",
+        "name": "zalo-listener",
+        "source": "src/zalo-listener/index.ts"
       }
     ],
     "host": "^10.10.0"

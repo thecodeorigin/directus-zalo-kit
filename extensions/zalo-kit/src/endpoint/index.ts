@@ -1,16 +1,20 @@
+/* eslint-disable no-console */
 import { defineEndpoint } from '@directus/extensions-sdk'
 import { ThreadType } from 'zca-js'
-import ZaloService from './services/ZaloService'
+import ZaloService from './services/ZaloService' // Assuming ZaloService is correctly imported
 
 export default defineEndpoint(async (router, { database, getSchema, services }) => {
   const { ItemsService } = services
 
+  // Initialize or get the ZaloService instance
   let zaloService: ZaloService
   try {
+    // Use the static getInstance method as per the refactored service
     zaloService = ZaloService.getInstance()
     console.warn('[Zalo Endpoint] Using existing ZaloService instance')
   }
   catch {
+    // Use the static init method as per the refactored service
     zaloService = ZaloService.init(getSchema, ItemsService)
     console.warn('[Zalo Endpoint] Created new ZaloService instance')
   }
@@ -18,7 +22,8 @@ export default defineEndpoint(async (router, { database, getSchema, services }) 
   // POST /zalo/init - Initiate QR code login
   router.post('/init', async (req, res) => {
     try {
-      const result = await zaloService.initiateLogin()
+      // Use the refactored method name
+      const result = await zaloService.loginInitiate()
       res.json(result)
     }
     catch (error: any) {
@@ -56,9 +61,11 @@ export default defineEndpoint(async (router, { database, getSchema, services }) 
         message: 'Login session is being initialized...',
       });
 
+      // Run the import in the background
       (async () => {
         try {
-          await zaloService.importSessionFromExtractor(
+          // Use the refactored method name
+          await zaloService.loginImportSession(
             imei,
             userAgent,
             cookies,
@@ -81,7 +88,8 @@ export default defineEndpoint(async (router, { database, getSchema, services }) 
   // GET /zalo/status - Get current login status
   router.get('/status', async (req, res) => {
     try {
-      const status = zaloService.getStatus()
+      // Use the refactored method name
+      const status = zaloService.loginGetStatus()
       res.json(status)
     }
     catch (error: any) {
@@ -99,7 +107,8 @@ export default defineEndpoint(async (router, { database, getSchema, services }) 
   // POST /zalo/logout - Logout
   router.post('/logout', async (req, res) => {
     try {
-      await zaloService.logout()
+      // Use the refactored method name
+      await zaloService.loginLogout()
       res.json({
         success: true,
         message: 'Logged out successfully',
@@ -114,7 +123,8 @@ export default defineEndpoint(async (router, { database, getSchema, services }) 
   // GET /zalo/session - Get session info
   router.get('/session', async (req, res) => {
     try {
-      const session = await zaloService.getSessionInfo()
+      // Use the refactored method name
+      const session = await zaloService.sessionGetInfo()
 
       if (session) {
         res.json({
@@ -134,49 +144,11 @@ export default defineEndpoint(async (router, { database, getSchema, services }) 
     }
   })
 
-  // POST /zalo/send-message - Send a message
-  router.get('/messages/:conversationId', async (req, res) => {
-    try {
-      const { conversationId } = req.params
-      const messages = await database('zalo_messages')
-        .where('conversation_id', conversationId)
-        .select(['id', 'sender_id', 'content', 'sent_at', 'is_edited'])
-        .orderBy('sent_at', 'asc')
-
-      const senderIds = [...new Set(messages.map((m: any) => m.sender_id))]
-
-      const users = await database('zalo_users')
-        .whereIn('id', senderIds)
-        .select(['id', 'display_name', 'avatar_url', 'zalo_name'])
-
-      const userMap = new Map(users.map((u: any) => [u.id, u]))
-
-      const enrichedMessages = messages.map((msg: any) => {
-        const user = userMap.get(msg.sender_id)
-        return {
-          id: msg.id,
-          msgId: msg.id,
-          senderId: msg.sender_id,
-          senderName: user?.display_name || user?.zalo_name || msg.sender_id || 'Unknown',
-          senderAvatar: user?.avatar_url,
-          content: msg.content,
-          timestamp: msg.sent_at,
-          isEdited: msg.is_edited,
-        }
-      })
-
-      res.json({
-        data: enrichedMessages,
-      })
-    }
-    catch (error: any) {
-      console.error('[Endpoint] Error:', error)
-      res.status(500).json({ error: error.message })
-    }
-  })
+  // GET /zalo/me - Get basic status about the currently logged-in user
   router.get('/me', (req, res) => {
     try {
-      const status = zaloService.getStatus()
+      // Use the refactored method name
+      const status = zaloService.loginGetStatus()
       res.json({
         userId: status.userId,
         status: status.status,
@@ -187,330 +159,8 @@ export default defineEndpoint(async (router, { database, getSchema, services }) 
       res.status(500).json({ error: error.message })
     }
   })
-  router.post('/send', async (req, res) => {
-    try {
-      const { conversationId, message, content, clientId } = req.body
-      const messageContent = message || content
 
-      // 1. Validation
-      if (!conversationId || !messageContent) {
-        return res.status(400).json({
-          error: 'conversationId and message are required',
-        })
-      }
-
-      const status = zaloService.getStatus()
-      if (status.status !== 'logged_in') {
-        console.error('[Endpoint /send] Zalo not logged in')
-        return res.status(503).json({
-          error: 'Zalo is not connected',
-          status: status.status,
-        })
-      }
-
-      const zaloUserId = status.userId
-
-      let zaloThreadId: string | null = null
-      let threadType: typeof ThreadType.User | typeof ThreadType.Group
-
-      try {
-        const [conversation] = await database('zalo_conversations')
-          .where('id', conversationId)
-          .select(['participant_id', 'group_id'])
-          .limit(1)
-
-        if (!conversation) {
-          console.error('[Endpoint /send] Conversation not found')
-          return res.status(404).json({
-            error: 'Conversation not found in database',
-            conversationId,
-          })
-        }
-
-        if (conversation.group_id && conversation.group_id !== null) {
-          zaloThreadId = conversation.group_id
-          threadType = ThreadType.Group
-        }
-        else if (conversation.participant_id && conversation.participant_id !== null) {
-          zaloThreadId = conversation.participant_id
-          threadType = ThreadType.User
-        }
-        else {
-          return res.status(400).json({
-            error: 'Cannot determine Zalo thread ID',
-            conversationId,
-            conversation,
-          })
-        }
-
-        if (!zaloThreadId) {
-          return res.status(400).json({
-            error: 'Invalid thread ID',
-            conversationId,
-            conversation,
-          })
-        }
-      }
-      catch (dbError: any) {
-        return res.status(500).json({
-          error: 'Failed to query conversation',
-          details: dbError.message,
-        })
-      }
-
-      let zaloResult: any
-      try {
-        zaloResult = await zaloService.sendMessage(
-          { msg: messageContent },
-          zaloThreadId,
-          threadType,
-        )
-      }
-      catch (zaloError: any) {
-        console.error('Zalo API Error:', zaloError)
-
-        if (zaloError.code === 114) {
-          return res.status(400).json({
-            error: 'Invalid Zalo thread ID',
-            details: 'The recipient does not exist or has blocked you',
-            zaloThreadId,
-            code: 114,
-          })
-        }
-
-        return res.status(500).json({
-          error: 'Failed to send message via Zalo',
-          details: zaloError.message,
-          code: zaloError.code,
-          threadId: zaloThreadId,
-        })
-      }
-
-      const messageId = zaloResult?.message?.msgId
-        || zaloResult?.data?.msgId
-        || `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
-
-      const clientMsgId = clientId || messageId
-
-      const [sender] = await database('zalo_users')
-        .where('id', zaloUserId)
-        .select(['id', 'display_name', 'avatar_url', 'zalo_name'])
-        .limit(1)
-
-      const timestamp = new Date()
-
-      try {
-        const existingMessage = await database('zalo_messages')
-          .where(function () {
-            this.where('id', messageId)
-              .orWhere('client_id', clientMsgId)
-          })
-          .first()
-
-        if (existingMessage) {
-          return res.json({
-            success: true,
-            message: 'Message already processed',
-            data: {
-              id: existingMessage.id,
-              conversationId: existingMessage.conversation_id,
-              content: existingMessage.content,
-              sent_at: existingMessage.sent_at,
-            },
-          })
-        }
-
-        await database('zalo_messages')
-          .insert({
-            id: messageId,
-            client_id: clientMsgId,
-            conversation_id: conversationId,
-            content: messageContent,
-            sender_id: zaloUserId,
-            sent_at: timestamp,
-            received_at: timestamp,
-            is_edited: false,
-            is_undone: false,
-            raw_data: zaloResult,
-            created_at: timestamp,
-            updated_at: timestamp,
-          })
-          .onConflict('id')
-          .merge({
-            client_id: clientMsgId,
-            updated_at: timestamp,
-          })
-
-        await database('zalo_conversations')
-          .where('id', conversationId)
-          .update({
-            last_message_id: messageId,
-            last_message_time: timestamp,
-            updated_at: timestamp,
-          })
-
-        return res.json({
-          success: true,
-          message: 'Message sent successfully',
-          data: {
-            messageId,
-            id: messageId,
-            conversationId,
-            content: messageContent,
-            sent_at: timestamp.toISOString(),
-            sender_id: zaloUserId,
-            client_id: clientMsgId,
-            thread_id: zaloThreadId,
-            sender: {
-              id: sender?.id,
-              display_name: sender?.display_name,
-              avatar_url: sender?.avatar_url,
-              zalo_name: sender?.zalo_name,
-            },
-          },
-        })
-      }
-      catch (dbError: any) {
-        console.error('Database Error:', dbError)
-        return res.status(207).json({
-          success: true,
-          warning: 'Message sent to Zalo but failed to save to database',
-          data: {
-            messageId,
-            error: dbError.message,
-          },
-        })
-      }
-    }
-    catch (error: any) {
-      console.error('Internal Error:', error)
-      return res.status(500).json({
-        error: 'Internal server error',
-        details: error.message,
-      })
-    }
-  })
-
-  // ✅ Get conversations
-  router.get('/conversations', async (req, res) => {
-    try {
-      console.log('[Endpoint] Loading conversations...')
-
-      const messages = await database('zalo_messages')
-        .select(['conversation_id', 'sender_id', 'content', 'sent_at']) // ✅ Array
-        .orderBy('sent_at', 'desc')
-        .limit(1000)
-
-      console.log('[Endpoint] Messages:', messages.length)
-
-      const conversationsMap = new Map()
-      const senderIds = new Set()
-
-      messages.forEach((msg: any) => {
-        if (!conversationsMap.has(msg.conversation_id)) {
-          conversationsMap.set(msg.conversation_id, {
-            conversation_id: msg.conversation_id,
-            sender_id: msg.sender_id,
-            content: msg.content,
-            sent_at: msg.sent_at,
-          })
-          senderIds.add(msg.sender_id)
-        }
-      })
-
-      // ✅ Fetch users - Array in select
-      const users = await database('zalo_users')
-        .whereIn('id', Array.from(senderIds) as string[])
-        .select(['id', 'display_name', 'avatar_url', 'zalo_name']) // ✅ Array
-
-      console.log('[Endpoint] Users:', users.length)
-
-      const userMap = new Map(users.map((u: any) => [u.id, u]))
-
-      const conversations = Array.from(conversationsMap.values()).map((conv: any) => {
-        const user = userMap.get(conv.sender_id)
-        return {
-          id: conv.conversation_id,
-          name: user?.display_name || user?.zalo_name || conv.sender_id || 'Unknown',
-          avatar: user?.avatar_url || `https://ui-avatars.com/api/?name=${encodeURIComponent(user?.display_name || 'U')}&background=random`,
-          lastMessage: conv.content || '',
-          timestamp: conv.sent_at,
-          unreadCount: 0,
-          online: true,
-        }
-      })
-
-      console.log('[Endpoint] Conversations:', conversations.length)
-
-      res.json({
-        data: conversations,
-      })
-    }
-    catch (error: any) {
-      console.error('[Endpoint] Error:', error)
-      res.status(500).json({ error: error.message })
-    }
-  })
-
-  // ✅ Get messages
-  router.get('/messages/:conversationId', async (req, res) => {
-    try {
-      const { conversationId } = req.params
-      console.log('[Endpoint] Loading messages for:', conversationId)
-
-      const messages = await database('zalo_messages')
-        .where('conversation_id', conversationId)
-        .select(['id', 'sender_id', 'content', 'sent_at', 'is_edited']) // ✅ Array
-        .orderBy('sent_at', 'asc')
-
-      console.log('[Endpoint] Messages:', messages.length)
-
-      const senderIds = [...new Set(messages.map((m: any) => m.sender_id))]
-
-      const users = await database('zalo_users')
-        .whereIn('id', senderIds)
-        .select(['id', 'display_name', 'avatar_url', 'zalo_name']) // ✅ Array
-
-      console.log('[Endpoint] Users:', users.length)
-
-      const userMap = new Map(users.map((u: any) => [u.id, u]))
-
-      const enrichedMessages = messages.map((msg: any) => {
-        const user = userMap.get(msg.sender_id)
-        return {
-          id: msg.id,
-          msgId: msg.id,
-          senderId: msg.sender_id,
-          senderName: user?.display_name || user?.zalo_name || msg.sender_id || 'Unknown',
-          senderAvatar: user?.avatar_url,
-          content: msg.content,
-          timestamp: msg.sent_at,
-          isEdited: msg.is_edited,
-        }
-      })
-
-      res.json({
-        data: enrichedMessages,
-      })
-    }
-    catch (error: any) {
-      console.error('[Endpoint] Error:', error)
-      res.status(500).json({ error: error.message })
-    }
-  })
-  router.get('/me', (req, res) => {
-    try {
-      const status = zaloService.getStatus()
-      res.json({
-        userId: status.userId,
-        status: status.status,
-        isListening: status.isListening,
-      })
-    }
-    catch (error: any) {
-      res.status(500).json({ error: error.message })
-    }
-  })
+  // POST /zalo/send - Send a message
   router.post('/send', async (req, res) => {
     try {
       const { conversationId, message, content, clientId } = req.body
@@ -521,7 +171,7 @@ export default defineEndpoint(async (router, { database, getSchema, services }) 
         messageLength: messageContent?.length,
         hasAuth: !!(req as any).accountability,
         userId: (req as any).accountability?.user,
-        clientId, // ✅ Log clientId
+        clientId,
       })
 
       // 1. Validation
@@ -533,7 +183,8 @@ export default defineEndpoint(async (router, { database, getSchema, services }) 
       }
 
       // 2. Check Zalo status
-      const status = zaloService.getStatus()
+      // Use the refactored method name
+      const status = zaloService.loginGetStatus()
       console.log('🔵 [Endpoint /send] Zalo status:', status)
 
       if (status.status !== 'logged_in') {
@@ -547,20 +198,21 @@ export default defineEndpoint(async (router, { database, getSchema, services }) 
       // 3. Get current user
       const accountability = (req as any).accountability
       const currentUserId = accountability?.user || status.userId || 'system'
-      const zaloUserId = status.userId // ✅ Lấy Zalo user ID
+      const zaloUserId = status.userId // Get Zalo user ID
 
       console.log('🔵 [Endpoint /send] User IDs:', {
         directusUserId: currentUserId,
         zaloUserId,
       })
 
-      // 4. Query DB để lấy Zalo thread ID
+      // 4. Query DB to get Zalo thread ID
       let zaloThreadId: string | null = null
+      let threadType: typeof ThreadType.User | typeof ThreadType.Group
 
       try {
         const [conversation] = await database('zalo_conversations')
           .where('id', conversationId)
-          .select(['participant_id', 'group_id'])
+          .select(['participant_id', 'group_id', 'type']) // Added type for clarity
           .limit(1)
 
         console.log('🔵 [Endpoint /send] Found conversation:', conversation)
@@ -573,19 +225,30 @@ export default defineEndpoint(async (router, { database, getSchema, services }) 
           })
         }
 
-        if (conversationId.startsWith('direct_')) {
+        // Determine threadId and type based on conversation record
+        if (conversation.type === 'group' && conversation.group_id) {
+          zaloThreadId = conversation.group_id
+          threadType = ThreadType.Group
+          console.log('🔵 [Endpoint /send] Group chat - group_id:', zaloThreadId)
+        }
+        else if (conversation.type === 'direct' && conversation.participant_id) {
           zaloThreadId = conversation.participant_id
+          threadType = ThreadType.User
           console.log('🔵 [Endpoint /send] Direct chat - participant_id:', zaloThreadId)
         }
         else {
-          zaloThreadId = conversation.group_id
-          console.log('🔵 [Endpoint /send] Group chat - group_id:', zaloThreadId)
+          console.error('❌ [Endpoint /send] Cannot determine Zalo thread ID from conversation type/ids')
+          return res.status(400).json({
+            error: 'Cannot determine Zalo thread ID from conversation data',
+            conversationId,
+            conversation,
+          })
         }
 
-        if (!zaloThreadId) {
-          console.error('❌ [Endpoint /send] No Zalo thread ID in conversation')
+        if (!zaloThreadId) { // Should be redundant due to checks above, but safe
+          console.error('❌ [Endpoint /send] No Zalo thread ID could be determined')
           return res.status(400).json({
-            error: 'Cannot determine Zalo thread ID',
+            error: 'Invalid thread ID derived from conversation',
             conversationId,
             conversation,
           })
@@ -599,16 +262,18 @@ export default defineEndpoint(async (router, { database, getSchema, services }) 
         })
       }
 
-      console.log('✅ [Endpoint /send] Zalo thread ID:', zaloThreadId)
+      console.log('✅ [Endpoint /send] Determined Zalo thread ID:', zaloThreadId, 'Type:', threadType!)
 
       // 5. Send via Zalo API
-      console.log('🔵 [Endpoint /send] Calling zaloService.sendMessage...')
+      console.log('🔵 [Endpoint /send] Calling zaloService.apiSendMessage...')
 
       let zaloResult: any
       try {
-        zaloResult = await zaloService.sendMessage(
+        // Use the refactored method name
+        zaloResult = await zaloService.apiSendMessage(
           { msg: messageContent },
           zaloThreadId,
+          threadType!, // Pass the determined thread type
         )
 
         console.log('✅ [Endpoint /send] Zalo API success:', zaloResult)
@@ -616,28 +281,29 @@ export default defineEndpoint(async (router, { database, getSchema, services }) 
       catch (zaloError: any) {
         console.error('❌ [Endpoint /send] Zalo API error:', zaloError)
 
-        if (zaloError.code === 114) {
+        // Handle specific Zalo error codes if needed
+        if (zaloError.code === 114 || zaloError.message?.includes('không hợp lệ')) { // Example code 114
           return res.status(400).json({
-            error: 'Invalid Zalo thread ID',
-            details: 'The recipient does not exist or has blocked you',
+            error: 'Invalid Zalo recipient or permissions',
+            details: zaloError.message || 'The recipient might not exist or has blocked you.',
             zaloThreadId,
-            code: 114,
+            code: zaloError.code || 114, // Include code if available
           })
         }
 
         return res.status(500).json({
           error: 'Failed to send message via Zalo',
           details: zaloError.message,
-          code: zaloError.code,
+          code: zaloError.code, // Include Zalo error code if available
         })
       }
 
-      // ✅ 6. Extract message IDs (SAU try-catch)
-      const messageId = zaloResult?.message?.msgId // ✅ Đúng path
-        || zaloResult?.data?.msgId
-        || `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
+      // 6. Extract message IDs
+      const messageId = zaloResult?.message?.msgId // Correct path based on example
+        || zaloResult?.data?.msgId // Fallback path
+        || `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}` // Generate fallback ID
 
-      const clientMsgId = clientId || messageId // ✅ Từ request body
+      const clientMsgId = clientId || messageId // Use provided clientId or fallback to messageId
 
       console.log('🔵 [Endpoint /send] Message IDs:', {
         messageId,
@@ -650,11 +316,13 @@ export default defineEndpoint(async (router, { database, getSchema, services }) 
       const timestamp = new Date()
 
       try {
-      // Check duplicate
+        // Check duplicate using messageId OR clientMsgId
         const existingMessage = await database('zalo_messages')
           .where(function () {
             this.where('id', messageId)
-              .orWhere('client_id', clientMsgId)
+            if (clientId) { // Only add client_id check if it was provided
+              this.orWhere('client_id', clientMsgId)
+            }
           })
           .first()
 
@@ -674,27 +342,28 @@ export default defineEndpoint(async (router, { database, getSchema, services }) 
 
         console.log('🔵 [Endpoint /send] Inserting new message...')
 
-        // ✅ Insert với Zalo IDs
-        const [newMessage] = await database('zalo_messages')
+        // Insert using Zalo IDs
+        await database('zalo_messages')
           .insert({
-            id: messageId, // ✅ Zalo msgId
-            client_id: clientMsgId, // ✅ Client ID
+            id: messageId, // Zalo msgId
+            client_id: clientMsgId, // Client ID
             conversation_id: conversationId,
             content: messageContent,
-            sender_id: zaloUserId, // ✅ Zalo user ID (không phải Directus UUID)
+            sender_id: zaloUserId, // Zalo user ID (not Directus UUID)
             sent_at: timestamp,
-            received_at: timestamp,
+            received_at: timestamp, // Assume received immediately for sent messages
             is_edited: false,
             is_undone: false,
-            raw_data: zaloResult,
+            raw_data: zaloResult, // Store the raw Zalo response
             created_at: timestamp,
             updated_at: timestamp,
           })
-          .returning('*')
+          .returning('*') // Return the inserted row if needed
 
         console.log('✅ [Endpoint /send] Message saved - WebSocket broadcasting...')
+        // NOTE: WebSocket broadcast logic is assumed to be handled by Directus hooks/flows
 
-        // Update conversation
+        // Update conversation's last message
         await database('zalo_conversations')
           .where('id', conversationId)
           .update({
@@ -703,28 +372,28 @@ export default defineEndpoint(async (router, { database, getSchema, services }) 
             updated_at: timestamp,
           })
 
-        // ✅ Return success
+        // Return success
         return res.json({
           success: true,
           message: 'Message sent successfully',
           data: {
-            id: messageId, // ✅ Zalo msgId
+            id: messageId, // Zalo msgId
             conversationId,
             content: messageContent,
             sent_at: timestamp.toISOString(),
-            sender_id: zaloUserId, // ✅ Zalo user ID
-            client_id: clientMsgId, // ✅ Client ID
+            sender_id: zaloUserId, // Zalo user ID
+            client_id: clientMsgId, // Client ID
           },
         })
       }
       catch (dbError: any) {
         console.error('❌ [Endpoint /send] DB save error:', dbError)
-
+        // Return 207 Multi-Status: Zalo send succeeded, DB save failed
         return res.status(207).json({
-          success: true,
+          success: true, // Zalo part succeeded
           warning: 'Message sent to Zalo but failed to save to database',
           data: {
-            messageId,
+            messageId, // Include Zalo message ID for reference
             error: dbError.message,
           },
         })
@@ -739,6 +408,168 @@ export default defineEndpoint(async (router, { database, getSchema, services }) 
     }
   })
 
+  // GET /zalo/conversations - Get recent conversations
+  router.get('/conversations', async (req, res) => {
+    try {
+      console.log('[Endpoint] Loading conversations...')
+
+      // Optimized Query: Fetch conversations directly, ordering by last_message_time
+      const conversationsData = await database('zalo_conversations')
+        .select([
+          'zalo_conversations.id',
+          'zalo_conversations.type',
+          'zalo_conversations.last_message_time as timestamp',
+          'zalo_conversations.last_message_id',
+          'zalo_conversations.participant_id', // For direct chats
+          'zalo_groups.name as group_name', // Join for group name
+          'zalo_groups.avatar_url as group_avatar',
+          'zalo_users.display_name as user_display_name', // Join for user name
+          'zalo_users.avatar_url as user_avatar',
+          'zalo_users.zalo_name as user_zalo_name',
+          'last_msg.content as lastMessage', // Join for last message content
+          'last_msg.sender_id as last_sender_id', // Needed to determine sender if needed later
+        ])
+        .leftJoin('zalo_groups', 'zalo_conversations.group_id', 'zalo_groups.id')
+        .leftJoin('zalo_users', 'zalo_conversations.participant_id', 'zalo_users.id')
+        .leftJoin('zalo_messages as last_msg', 'zalo_conversations.last_message_id', 'last_msg.id')
+        .orderBy('zalo_conversations.last_message_time', 'desc')
+        .limit(100) // Limit results for performance
+
+      console.log('[Endpoint] Conversations data fetched:', conversationsData.length)
+
+      const conversations = conversationsData.map((conv: any) => {
+        let name: string
+        let avatar: string | null
+
+        if (conv.type === 'group') {
+          name = conv.group_name || `Group ${conv.id}`
+          avatar = conv.group_avatar
+        }
+        else {
+          // For direct chats, use participant info
+          name = conv.user_display_name || conv.user_zalo_name || conv.participant_id || 'Unknown User'
+          avatar = conv.user_avatar
+        }
+
+        // Fallback avatar using ui-avatars
+        if (!avatar) {
+          const avatarName = name === 'Unknown User' ? '?' : name.charAt(0).toUpperCase()
+          avatar = `https://ui-avatars.com/api/?name=${encodeURIComponent(avatarName)}&background=random`
+        }
+
+        return {
+          id: conv.id,
+          name,
+          avatar,
+          lastMessage: conv.lastMessage || '',
+          timestamp: conv.timestamp,
+          // Placeholder values - implement logic if needed
+          unreadCount: 0,
+          online: true, // Placeholder
+        }
+      })
+
+      console.log('[Endpoint] Processed Conversations:', conversations.length)
+
+      res.json({
+        data: conversations,
+      })
+    }
+    catch (error: any) {
+      console.error('❌ [Endpoint /conversations] Error:', error)
+      res.status(500).json({ error: 'Failed to fetch conversations', details: error.message })
+    }
+  })
+
+  // GET /zalo/messages/:conversationId - Get messages for a conversation
+  router.get('/messages/:conversationId', async (req, res) => {
+    try {
+      const { conversationId } = req.params
+      console.log('[Endpoint] Loading messages for:', conversationId)
+
+      // Get messages
+      const messages = await database('zalo_messages')
+        .where('conversation_id', conversationId)
+        .select(['id', 'sender_id', 'content', 'sent_at', 'is_edited', 'raw_data']) // Select needed fields
+        .orderBy('sent_at', 'asc') // Order chronologically
+        .limit(200) // Add a limit for performance
+
+      console.log('[Endpoint] Messages fetched:', messages.length)
+
+      // Get unique sender IDs
+      const senderIds = [...new Set(messages.map((m: any) => m.sender_id).filter(id => id))] // Filter null/undefined
+
+      let userMap = new Map()
+
+      if (senderIds.length > 0) {
+        // Fetch user info for senders
+        const users = await database('zalo_users')
+          .whereIn('id', senderIds)
+          .select(['id', 'display_name', 'avatar_url', 'zalo_name'])
+
+        console.log('[Endpoint] Users fetched:', users.length)
+        userMap = new Map(users.map((u: any) => [u.id, u]))
+      }
+      else {
+        console.log('[Endpoint] No sender IDs found in messages.')
+      }
+
+      // Enrich messages with sender info
+      const enrichedMessages = messages.map((msg: any) => {
+        const user = userMap.get(msg.sender_id)
+        const senderName = user?.display_name || user?.zalo_name || msg.sender_id || 'Unknown Sender'
+        let senderAvatar = user?.avatar_url
+
+        if (!senderAvatar) {
+          const avatarName = senderName === 'Unknown Sender' ? '?' : senderName.charAt(0).toUpperCase()
+          senderAvatar = `https://ui-avatars.com/api/?name=${encodeURIComponent(avatarName)}&background=random`
+        }
+
+        // Basic attempt to parse attachments from raw_data if content is empty/generic
+        let parsedContent = msg.content
+        let attachments = []
+        if (!parsedContent || parsedContent === '[Hình ảnh]' || parsedContent === '[File]') { // Check for common placeholders
+          try {
+            const raw = msg.raw_data
+            if (raw && raw.message && raw.message.attachments && Array.isArray(raw.message.attachments)) {
+              attachments = raw.message.attachments.map((att: any) => ({
+                type: att.type, // e.g., 'photo', 'file'
+                payload: att.payload, // Contains URLs etc.
+              }))
+              if (attachments.length > 0 && !parsedContent) {
+                parsedContent = attachments[0].type === 'photo' ? '[Hình ảnh]' : '[File]' // Set placeholder if content was truly empty
+              }
+            }
+          }
+          catch (parseError) {
+            console.warn(`[Endpoint] Failed to parse attachments for msg ${msg.id}:`, parseError)
+          }
+        }
+
+        return {
+          id: msg.id,
+          // msgId: msg.id, // Redundant if id is the same
+          senderId: msg.sender_id,
+          senderName,
+          senderAvatar,
+          content: parsedContent,
+          timestamp: msg.sent_at,
+          isEdited: msg.is_edited,
+          attachments, // Include parsed attachments
+          // raw_data: msg.raw_data, // Optionally include for debugging
+        }
+      })
+
+      res.json({
+        data: enrichedMessages,
+      })
+    }
+    catch (error: any) {
+      console.error('❌ [Endpoint /messages] Error:', error)
+      res.status(500).json({ error: 'Failed to fetch messages', details: error.message })
+    }
+  })
+
   // Proxy avatar images to avoid CORS
   router.get('/avatar-proxy', async (req, res) => {
     try {
@@ -748,25 +579,40 @@ export default defineEndpoint(async (router, { database, getSchema, services }) 
         return res.status(400).json({ error: 'URL parameter is required' })
       }
 
-      // Only allow Zalo CDN URLs
-      if (!url.startsWith('https://ava-grp-talk.zadn.vn/') && !url.startsWith('https://s120-ava-talk.zadn.vn/')) {
-        return res.status(403).json({ error: 'Only Zalo CDN URLs are allowed' })
+      // Slightly more permissive check for Zalo domains
+      const allowedDomains = [
+        'https://ava-grp-talk.zadn.vn/',
+        'https://s120-ava-talk.zadn.vn/',
+        'https://avatar-talk.zadn.vn/', // Add other known domains if necessary
+        // Add other potential Zalo CDN domains here
+      ]
+
+      if (!allowedDomains.some(domain => url.startsWith(domain))) {
+        console.warn(`[Avatar Proxy] Blocked URL: ${url}`)
+        return res.status(403).json({ error: 'Only allowed Zalo CDN URLs are permitted' })
       }
 
       // Fetch image from Zalo
-      const response = await fetch(url)
+      const response = await fetch(url, {
+        headers: {
+          // Add Referer or other headers if Zalo requires them
+          // 'Referer': 'https://chat.zalo.me/' // Example - might not be needed
+        },
+      })
 
       if (!response.ok) {
-        return res.status(response.status).json({ error: 'Failed to fetch image' })
+        console.error(`[Avatar Proxy] Failed to fetch ${url} - Status: ${response.status}`)
+        return res.status(response.status).send(`Failed to fetch image from Zalo. Status: ${response.status}`)
       }
 
       // Get content type and buffer
-      const contentType = response.headers.get('content-type') || 'image/jpeg'
+      const contentType = response.headers.get('content-type') || 'application/octet-stream' // Default if missing
       const buffer = await response.arrayBuffer()
 
       // Set headers and send
       res.setHeader('Content-Type', contentType)
-      res.setHeader('Cache-Control', 'public, max-age=86400') // Cache 24 hours
+      res.setHeader('Cache-Control', 'public, max-age=86400') // Cache for 1 day
+      // eslint-disable-next-line node/prefer-global/buffer
       res.send(Buffer.from(buffer))
     }
     catch (error: any) {
@@ -775,11 +621,13 @@ export default defineEndpoint(async (router, { database, getSchema, services }) 
     }
   })
 
-  // Manual sync group members (max 10 members to avoid rate limit)
+  // --- Commented out: Manual sync route ---
+  /*
+  // POST /zalo/sync-group-members/:groupId - Manual sync group members
   router.post('/sync-group-members/:groupId', async (req, res) => {
     try {
       const { groupId } = req.params
-      const { maxMembers = 10 } = req.body
+      const { maxMembers = 10 } = req.body // Default to syncing a small number
 
       if (!groupId) {
         return res.status(400).json({ error: 'Group ID is required' })
@@ -787,28 +635,45 @@ export default defineEndpoint(async (router, { database, getSchema, services }) 
 
       console.warn(`[Endpoint] Manual sync members for group: ${groupId}`)
 
-      // Fetch group info from Zalo API
-      const groupInfo = await zaloService.getGroupInfo(groupId)
+      // NOTE: Assumes getGroupInfo and manualSyncGroupMembers exist on zaloService
+      // You will need to implement these in ZaloService based on zca-js capabilities
+      // and update the method names here if they follow the new convention.
 
-      if (!groupInfo) {
-        return res.status(404).json({ error: 'Group not found' })
-      }
+      // Example placeholder names (replace with actual method names):
+      // const groupInfo = await zaloService.apiGetGroupInfo(groupId);
+      // await zaloService.syncManualGroupMembers(groupId, groupInfo, maxMembers);
 
-      // Sync members (only first N to avoid rate limit)
-      await zaloService.manualSyncGroupMembers(groupId, groupInfo, maxMembers)
+      // Placeholder response:
+       return res.status(501).json({
+           message: "Sync functionality not implemented in ZaloService yet.",
+           groupId: groupId,
+           maxMembers: maxMembers
+       });
 
-      res.json({
-        success: true,
-        message: `Synced up to ${maxMembers} members for group ${groupId}`,
-        totalMembers: groupInfo.memVerList?.length || 0,
-      })
+      // --- Original Logic (needs methods in ZaloService) ---
+      // const groupInfo = await zaloService.apiGetGroupInfo(groupId) // Needs implementation
+
+      // if (!groupInfo) {
+      //   return res.status(404).json({ error: 'Group not found via Zalo API' })
+      // }
+
+      // await zaloService.syncManualGroupMembers(groupId, groupInfo, maxMembers) // Needs implementation
+
+      // res.json({
+      //   success: true,
+      //   message: `Sync initiated for up to ${maxMembers} members for group ${groupId}`,
+      //   // totalMembers: groupInfo.memVerList?.length || 0, // Get total from actual groupInfo
+      // })
+      // --- End Original Logic ---
+
     }
     catch (error: any) {
       console.error('❌ [Endpoint /sync-group-members] Error:', error)
       res.status(500).json({
-        error: 'Failed to sync group members',
+        error: 'Failed to initiate sync for group members',
         details: error.message,
       })
     }
   })
+  */
 })
