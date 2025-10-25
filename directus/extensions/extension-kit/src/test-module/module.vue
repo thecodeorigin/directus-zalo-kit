@@ -3,22 +3,9 @@ import { useApi } from '@directus/extensions-sdk'
 import { authentication, createDirectus, readItems, readMe, realtime, rest } from '@directus/sdk'
 import { computed, nextTick, onBeforeUnmount, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useFileUpload } from './composables/useFileUpload'
-import { convertEmoticonToEmoji, handleEmojiInsert } from './utils/emoticonConverter'
 import { client } from './utils/sdk'
 
 const currentFunction = ref<string | null>(null)
-const messageInputRef = ref<HTMLTextAreaElement | null>(null)
-
-function insertEmoji(event: any) {
-  const emoji = event?.emoji || event?.data || event?.native || event
-
-  if (!emoji || typeof emoji !== 'string') {
-    console.warn('Invalid emoji:', emoji)
-    return
-  }
-
-  handleEmojiInsert(emoji, messageInputRef, messageText)
-}
 
 function showFunctionA() {
   currentFunction.value = 'A'
@@ -26,24 +13,6 @@ function showFunctionA() {
 
 function showFunctionB() {
   currentFunction.value = 'B'
-}
-function getAvatarUrl(avatarUrl: string | null | undefined, fallbackName: string = 'User'): string {
-  if (!avatarUrl) {
-    return `https://ui-avatars.com/api/?name=${encodeURIComponent(fallbackName)}&background=random`
-  }
-
-  if (avatarUrl.match(/^[a-f0-9-]{36}$/i)) {
-    return `http://localhost:8055/assets/${avatarUrl}`
-  }
-
-  if (avatarUrl.startsWith('/')) {
-    return `http://localhost:8055${avatarUrl}`
-  }
-
-  if (avatarUrl.startsWith('http')) {
-    return avatarUrl
-  }
-  return `https://ui-avatars.com/api/?name=${encodeURIComponent(fallbackName)}&background=random`
 }
 interface Conversation {
   id: string
@@ -100,10 +69,11 @@ interface Message {
   time: string
   avatar?: string
   status?: 'sent' | 'delivered' | 'read'
-  type?: 'system' | 'user' | 'file'
-  files?: FileAttachment[]
+  type?: 'system' | 'user' | 'file' // For system messages, user messages, and file messages
+  files?: FileAttachment[] // For file attachments
 }
 
+// Reactive data
 const api = useApi()
 const searchQuery = ref('')
 const navSearchQuery = ref('')
@@ -129,6 +99,7 @@ const selectedMembers = ref<string[]>([])
 
 const conversationTypeFilter = ref<'all' | 'group' | 'direct'>('all')
 
+// File upload composable
 const {
   uploadFiles,
   getFileUrl,
@@ -145,6 +116,7 @@ const selectedFiles = ref<File[]>([])
 const showFilePreviewDialog = ref(false)
 const pendingAttachments = ref<FileAttachment[]>([])
 
+// Filter states
 const filterOptions = ref({
   status: {
     online: false,
@@ -168,6 +140,7 @@ const directusClient = createDirectus('http://localhost:8055')
   .with(rest())
 
 let subscriptionCleanup: (() => void) | null = null
+let globalSubscriptionCleanup: (() => void) | null = null
 const processedMessageIds = new Set<string>()
 
 // Helper function to highlight search text
@@ -305,10 +278,12 @@ async function sendMessage() {
 
   sendingMessage.value = true
 
+  // ✅ Tạo client_id duy nhất
   const clientId = `client_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
   const tempId = `temp_${Date.now()}`
 
   try {
+    // 1. Create temp message with real user info
     const tempMessage: Message = {
       id: tempId,
       direction: 'out',
@@ -318,7 +293,7 @@ async function sendMessage() {
       time: formatTime(new Date().toISOString()),
       avatar: currentUserAvatar.value,
       status: 'sent',
-      clientId,
+      clientId, // ✅ Thêm clientId để track
     }
 
     messages.value.push(tempMessage)
@@ -326,6 +301,8 @@ async function sendMessage() {
     messageText.value = ''
 
     nextTick(scrollToBottom)
+
+    console.log('🔵 [SEND] Sending with clientId:', clientId)
 
     // 2. Send via API với clientId
     const token = await directusClient.getToken()
@@ -338,7 +315,7 @@ async function sendMessage() {
       body: JSON.stringify({
         conversationId: activeConversationId.value,
         message: messageContent,
-        clientId,
+        clientId, // ✅ Gửi clientId lên backend
       }),
     })
 
@@ -348,17 +325,35 @@ async function sendMessage() {
     }
 
     const result = await response.json()
+    console.log('✅ [SEND] Success:', result)
 
+    // 3. Update temp message with real data (keep it, don't remove)
     const tempIndex = messages.value.findIndex(m => m.id === tempId)
     if (tempIndex !== -1) {
+      // Mark as sent and add clientId for deduplication
       messages.value[tempIndex].status = 'delivered'
       messages.value[tempIndex].clientId = clientId
+
+      // Add to processed set to prevent duplicate from WebSocket
       processedMessageIds.add(result.messageId || tempId)
+
+      console.log('✅ [SEND] Message marked as delivered, clientId:', clientId)
     }
+
+    // Update conversation's last message preview
+    const conversation = conversations.value.find(c => c.id === activeConversationId.value)
+    if (conversation) {
+      conversation.lastMessage = messageContent.substring(0, 50)
+      conversation.timestamp = formatTime(new Date().toISOString())
+      console.log('✅ [SEND] Updated conversation preview:', conversation.name)
+    }
+
+    // WebSocket will update with real message ID when it arrives
   }
   catch (error: any) {
-    console.error(' [SEND] Error:', error)
+    console.error('❌ [SEND] Error:', error)
 
+    // Mark temp message as failed
     const messageIndex = messages.value.findIndex(m => m.id === tempId)
     if (messageIndex !== -1 && messages.value[messageIndex]) {
       messages.value[messageIndex].status = 'failed'
@@ -369,23 +364,36 @@ async function sendMessage() {
   }
 }
 
+// Backend integration functions
 async function autoLogin() {
   try {
+    // 1. Login REST client first to get token
     await client.login({
       email: 'admin@example.com',
       password: 'd1r3ctu5',
     })
+    console.log('✅ REST client authenticated')
 
+    // 2. Get the auth token from REST client
     const token = await client.getToken()
+    console.log('✅ Token obtained:', token ? 'Yes' : 'No')
 
+    // 3. Set token for WebSocket client BEFORE connecting
     if (token) {
       await directusClient.setToken(token)
+      console.log('✅ Token set for WebSocket')
     }
 
+    // 4. Now connect WebSocket (with token already set)
     await directusClient.connect()
+    console.log('✅ WebSocket connected and authenticated')
 
     isAuthenticated.value = true
 
+    // Start global subscription for ALL conversations
+    subscribeToAllConversations()
+
+    // 5. Get current Zalo user ID and user info
     try {
       const response = await fetch('http://localhost:8055/zalo/status', {
         headers: {
@@ -396,7 +404,9 @@ async function autoLogin() {
       const data = await response.json()
       if (data?.userId) {
         currentUserId.value = data.userId
+        console.log('✅ Current Zalo user ID:', currentUserId.value)
 
+        // 6. Fetch Zalo user info (name & avatar)
         try {
           const users = await client.request(
             readItems('zalo_users' as any, {
@@ -410,20 +420,34 @@ async function autoLogin() {
           if (currentUser) {
             currentUserName.value = currentUser.display_name || currentUser.zalo_name || 'You'
 
-            currentUserAvatar.value = getAvatarUrl(currentUser.avatar_url, currentUserName.value)
+            // Proxy Zalo avatar URLs to avoid CORS
+            if (currentUser.avatar_url) {
+              if (currentUser.avatar_url.startsWith('https://s120-ava-talk.zadn.vn/')
+                || currentUser.avatar_url.startsWith('https://ava-grp-talk.zadn.vn/')) {
+                currentUserAvatar.value = `http://localhost:8055/zalo/avatar-proxy?url=${encodeURIComponent(currentUser.avatar_url)}`
+              }
+              else {
+                currentUserAvatar.value = currentUser.avatar_url
+              }
+            }
+            else {
+              currentUserAvatar.value = `https://ui-avatars.com/api/?name=${encodeURIComponent(currentUserName.value)}`
+            }
+
+            console.log('✅ Current user info:', { name: currentUserName.value, hasAvatar: !!currentUser.avatar_url })
           }
         }
         catch (e) {
-          console.warn('Could not fetch user info:', e)
+          console.warn('⚠️ Could not fetch user info:', e)
         }
       }
     }
     catch (e) {
-      console.warn('Could not get Zalo User ID:', e)
+      console.warn('⚠️ Could not get Zalo User ID:', e)
     }
   }
   catch (error) {
-    console.error('Authentication failed:', error)
+    console.error('❌ Authentication failed:', error)
     isAuthenticated.value = false
   }
 }
@@ -432,17 +456,28 @@ let isSelectingConversation = false
 
 function selectConversation(id: string) {
   if (isSelectingConversation) {
+    console.log('⏭️ Already selecting conversation, skipping')
     return
   }
 
   if (activeConversationId.value === id) {
+    console.log('⏭️ Conversation already active:', id)
     return
   }
 
   isSelectingConversation = true
 
+  console.log('🔵 Selecting conversation:', id)
+
   activeConversationId.value = id
   messages.value = []
+
+  // Reset unread count when selecting conversation
+  const conversation = conversations.value.find(c => c.id === id)
+  if (conversation && conversation.unreadCount > 0) {
+    console.log('✅ Clearing', conversation.unreadCount, 'unread messages for', conversation.name)
+    conversation.unreadCount = 0
+  }
 
   loadMessages(id).finally(() => {
     if (isAuthenticated.value) {
@@ -454,11 +489,12 @@ function selectConversation(id: string) {
 
 async function loadConversations() {
   if (!isAuthenticated.value) {
-    console.warn('Not authenticated')
+    console.warn('⚠️ Not authenticated')
     return
   }
 
   if (isLoadingConversations.value) {
+    console.log('⏳ Already loading conversations, skipping...')
     return
   }
 
@@ -476,6 +512,9 @@ async function loadConversations() {
         limit: 100,
       }),
     )
+
+    console.log(`📥 Loaded ${data.length} conversations`)
+
     const groupIds = [...new Set(
       data
         .filter((conv: any) => conv.group_id && conv.group_id !== null)
@@ -489,7 +528,10 @@ async function loadConversations() {
     )]
 
     let groupsMap = new Map()
-    let groupMembersMap = new Map()
+    let groupMembersMap = new Map() // Map<groupId, userId[]>
+
+    console.log('🔍 Found', groupIds.length, 'groups to load:', groupIds)
+
     if (groupIds.length > 0) {
       const groups = await client.request(
         readItems('zalo_groups' as any, {
@@ -499,33 +541,68 @@ async function loadConversations() {
         }),
       )
       groupsMap = new Map(groups.map((g: any) => [g.id, g]))
+      console.log('📦 Loaded', groups.length, 'group info')
 
-      const groupMembers = await client.request(
+      // Load group members for multi-avatar display (chỉ lấy active members)
+      // ⚠️ Chỉ load members cho groups có ít members để tránh quá tải
+      console.log('🔍 Loading members for', groupIds.length, 'groups')
+
+      // Load tất cả members (không filter is_active để test)
+      const allActiveMembers = await client.request(
         readItems('zalo_group_members' as any, {
-          fields: ['group_id', 'user_id'],
-          filter: { group_id: { _in: groupIds } },
+          fields: ['group_id', 'user_id', 'is_active'],
+          filter: {},
           limit: -1,
         }),
       )
 
+      // Filter is_active ở client side
+      const activeMembers = allActiveMembers.filter((m: any) => m.is_active === true)
+
+      console.warn('📥 Raw members loaded:', allActiveMembers.length, '| Active:', activeMembers.length)
+
+      // Filter chỉ lấy members của groups trong conversations
+      const groupIdsSet = new Set(groupIds)
+      const groupMembers = activeMembers.filter((m: any) => groupIdsSet.has(m.group_id))
+
+      console.log('✅ Filtered to', groupMembers.length, 'members for conversations groups')
+
+      console.warn('📥 Raw members loaded:', groupMembers.length, groupMembers.slice(0, 5))
+
+      // Group members by group_id
       groupMembers.forEach((gm: any) => {
         if (!groupMembersMap.has(gm.group_id)) {
           groupMembersMap.set(gm.group_id, [])
         }
         groupMembersMap.get(gm.group_id).push(gm.user_id)
       })
+
+      console.warn('🔍 Group 4577988136770414902 has', groupMembersMap.get('4577988136770414902')?.length || 0, 'members')
+
+      console.log('📥 Loaded members for', groupMembersMap.size, 'groups, total active members:', groupMembers.length)
+      console.log('📊 Members map:', Object.fromEntries(groupMembersMap))
     }
 
+    // Collect all user IDs: participants + group members
+    const allUserIds = new Set([
+      ...participantIds,
+      ...Array.from(groupMembersMap.values()).flat(),
+    ])
+
+    console.log('👥 Loading', allUserIds.size, 'users (participants + members)')
+
     let usersMap = new Map()
-    if (participantIds.length > 0) {
+    if (allUserIds.size > 0) {
       const users = await client.request(
         readItems('zalo_users' as any, {
           fields: ['id', 'display_name', 'zalo_name', 'avatar_url'],
-          filter: { id: { _in: participantIds } },
+          filter: { id: { _in: Array.from(allUserIds) } },
           limit: -1,
         }),
       )
       usersMap = new Map(users.map((u: any) => [u.id, u]))
+      console.log('✅ Loaded', users.length, 'user records into usersMap')
+      console.log('👤 User IDs in map:', Array.from(usersMap.keys()).slice(0, 5))
     }
 
     conversations.value = data.map((conv: any) => {
@@ -533,6 +610,7 @@ async function loadConversations() {
       let avatar = ''
       let type: 'group' | 'direct' = 'group'
       let memberAvatars: any[] = []
+      let hasRealAvatar = false // Flag to track if group has real avatar (not fallback)
 
       if (conv.participant_id && conv.participant_id !== null) {
         type = 'direct'
@@ -540,7 +618,19 @@ async function loadConversations() {
         if (user) {
           name = user.display_name || user.zalo_name || 'Unknown User'
 
-          avatar = getAvatarUrl(user.avatar_url, name)
+          // Proxy Zalo avatar URLs to avoid CORS
+          if (user.avatar_url) {
+            if (user.avatar_url.startsWith('https://s120-ava-talk.zadn.vn/')
+              || user.avatar_url.startsWith('https://ava-grp-talk.zadn.vn/')) {
+              avatar = `http://localhost:8055/zalo/avatar-proxy?url=${encodeURIComponent(user.avatar_url)}`
+            }
+            else {
+              avatar = user.avatar_url
+            }
+          }
+          else {
+            avatar = `https://ui-avatars.com/api/?name=${encodeURIComponent(name)}&background=4F46E5`
+          }
         }
         else {
           name = `User ${conv.participant_id.substring(0, 8)}`
@@ -551,34 +641,94 @@ async function loadConversations() {
         type = 'group'
         const group = groupsMap.get(conv.group_id)
 
+        // Get members for this group (for multi-avatar display)
         const memberUserIds = groupMembersMap.get(conv.group_id) || []
 
+        console.log('🔍 Group members:', {
+          groupId: conv.group_id,
+          groupName: group?.name,
+          memberCount: memberUserIds.length,
+          memberIds: memberUserIds.slice(0, 3),
+        })
+
+        // Get avatar for first 3 members (để hiển thị avatar tam giác)
         for (const userId of memberUserIds.slice(0, 3)) {
           const user = usersMap.get(userId)
           if (user) {
-            const memberName = user.display_name || user.zalo_name || 'User'
-            const memberAvatar = getAvatarUrl(user.avatar_url, memberName)
+            let memberAvatar = `https://ui-avatars.com/api/?name=${encodeURIComponent(user.display_name || user.zalo_name || 'U')}&background=10B981&color=fff`
+
+            if (user.avatar_url) {
+              // Proxy Zalo avatar URLs to avoid CORS
+              if (user.avatar_url.startsWith('https://s120-ava-talk.zadn.vn/')
+                || user.avatar_url.startsWith('https://ava-grp-talk.zadn.vn/')) {
+                memberAvatar = `http://localhost:8055/zalo/avatar-proxy?url=${encodeURIComponent(user.avatar_url)}`
+              }
+              else {
+                memberAvatar = user.avatar_url
+              }
+            }
 
             memberAvatars.push({
               id: userId,
-              name: memberName,
+              name: user.display_name || user.zalo_name || 'User',
               avatar: memberAvatar,
             })
           }
+          else {
+            console.warn('⚠️ User not found in usersMap:', userId)
+          }
         }
+
+        console.log(`📥 Group ${conv.group_id} has ${memberAvatars.length} member avatars loaded`)
 
         if (group) {
           name = group.name || 'Unknown Group'
-          avatar = getAvatarUrl(group.avatar_url, name)
+
+          // Handle avatar URL
+          if (group.avatar_url) {
+            hasRealAvatar = true
+            // If it's a Zalo CDN URL, proxy it to avoid CORS
+            if (group.avatar_url.startsWith('https://ava-grp-talk.zadn.vn/')
+              || group.avatar_url.startsWith('https://s120-ava-talk.zadn.vn/')) {
+              avatar = `http://localhost:8055/zalo/avatar-proxy?url=${encodeURIComponent(group.avatar_url)}`
+            }
+            // If it's a Directus file ID (UUID format)
+            else if (group.avatar_url.match(/^[a-f0-9-]{36}$/i)) {
+              avatar = `http://localhost:8055/assets/${group.avatar_url}`
+            }
+            // If it's a path starting with /
+            else if (group.avatar_url.startsWith('/')) {
+              avatar = `http://localhost:8055${group.avatar_url}`
+            }
+            // If it's another HTTP URL, use as-is
+            else if (group.avatar_url.startsWith('http')) {
+              avatar = group.avatar_url
+            }
+            // Otherwise treat as relative path to assets
+            else {
+              avatar = `http://localhost:8055/assets/${group.avatar_url}`
+            }
+            console.log('🖼️ Group avatar loaded:', {
+              groupId: conv.group_id,
+              name,
+              originalUrl: group.avatar_url,
+              finalUrl: avatar,
+            })
+          }
+          else {
+            // Use data URI for group icon (similar to Zalo's default group icon)
+            avatar = 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iNDAiIGhlaWdodD0iNDAiIHZpZXdCb3g9IjAgMCA0MCA0MCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48cmVjdCB3aWR0aD0iNDAiIGhlaWdodD0iNDAiIHJ4PSI4IiBmaWxsPSIjMTBCOTgxIi8+PHBhdGggZD0iTTE1IDEzQzE1IDExLjM0MzEgMTYuMzQzMSAxMCAxOCAxMEMyMC4yMDkxIDEwIDIyIDExLjc5MDkgMjIgMTRDMjIgMTYuMjA5MSAyMC4yMDkxIDE4IDE4IDE4QzE2LjM0MzEgMTggMTUgMTYuNjU2OSAxNSAxNVYxM1oiIGZpbGw9IndoaXRlIi8+PHBhdGggZD0iTTI1IDEzQzI1IDExLjM0MzEgMjYuMzQzMSAxMCAyOCAxMEMyOS42NTY5IDEwIDMxIDExLjM0MzEgMzEgMTNDMzEgMTQuNjU2OSAyOS42NTY5IDE2IDI4IDE2QzI2LjM0MzEgMTYgMjUgMTQuNjU2OSAyNSAxM1oiIGZpbGw9IndoaXRlIi8+PHBhdGggZD0iTTEwIDI2QzEwIDIzLjIzODYgMTIuMjM4NiAyMSAxNSAyMUgyMUMyMy43NjE0IDIxIDI2IDIzLjIzODYgMjYgMjZWMjhDMjYgMjguNTUyMyAyNS41NTIzIDI5IDI1IDI5SDExQzEwLjQ0NzcgMjkgMTAgMjguNTUyMyAxMCAyOFYyNloiIGZpbGw9IndoaXRlIi8+PHBhdGggZD0iTTI0IDI2QzI0IDI0LjM0MzEgMjUuMzQzMSAyMyAyNyAyM0gzMEMzMS42NTY5IDIzIDMzIDI0LjM0MzEgMzMgMjZWMjhDMzMgMjguNTUyMyAzMi41NTIzIDI5IDMyIDI5SDI1QzI0LjQ0NzcgMjkgMjQgMjguNTUyMyAyNCAyOFYyNloiIGZpbGw9IndoaXRlIiBmaWxsLW9wYWNpdHk9IjAuNyIvPjwvc3ZnPg=='
+            console.log('🖼️ Group using fallback icon:', { groupId: conv.group_id, name })
+          }
         }
         else {
           name = `Group ${conv.group_id.substring(0, 8)}`
           avatar = 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iNDAiIGhlaWdodD0iNDAiIHZpZXdCb3g9IjAgMCA0MCA0MCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48cmVjdCB3aWR0aD0iNDAiIGhlaWdodD0iNDAiIHJ4PSI4IiBmaWxsPSIjMTBCOTgxIi8+PHBhdGggZD0iTTE1IDEzQzE1IDExLjM0MzEgMTYuMzQzMSAxMCAxOCAxMEMyMC4yMDkxIDEwIDIyIDExLjc5MDkgMjIgMTRDMjIgMTYuMjA5MSAyMC4yMDkxIDE4IDE4IDE4QzE2LjM0MzEgMTggMTUgMTYuNjU2OSAxNSAxNVYxM1oiIGZpbGw9IndoaXRlIi8+PHBhdGggZD0iTTI1IDEzQzI1IDExLjM0MzEgMjYuMzQzMSAxMCAyOCAxMEMyOS42NTY5IDEwIDMxIDExLjM0MzEgMzEgMTNDMzEgMTQuNjU2OSAyOS42NTY5IDE2IDI4IDE2QzI2LjM0MzEgMTYgMjUgMTQuNjU2OSAyNSAxM1oiIGZpbGw9IndoaXRlIi8+PHBhdGggZD0iTTEwIDI2QzEwIDIzLjIzODYgMTIuMjM4NiAyMSAxNSAyMUgyMUMyMy43NjE0IDIxIDI2IDIzLjIzODYgMjYgMjZWMjhDMjYgMjguNTUyMyAyNS41NTIzIDI5IDI1IDI5SDExQzEwLjQ0NzcgMjkgMTAgMjguNTUyMyAxMCAyOFYyNloiIGZpbGw9IndoaXRlIi8+PHBhdGggZD0iTTI0IDI2QzI0IDI0LjM0MzEgMjUuMzQzMSAyMyAyNyAyM0gzMEMzMS42NTY5IDIzIDMzIDI0LjM0MzEgMzMgMjZWMjhDMzMgMjguNTUyMyAzMi41NTIzIDI5IDMyIDI5SDI1QzI0LjQ0NzcgMjkgMjQgMjguNTUyMyAyNCAyOFYyNloiIGZpbGw9IndoaXRlIiBmaWxsLW9wYWNpdHk9IjAuNyIvPjwvc3ZnPg=='
-          console.log('Group not found in map:', conv.group_id)
+          console.log('⚠️ Group not found in map:', conv.group_id)
         }
       }
 
-      return {
+      const result = {
         id: conv.id,
         name,
         avatar,
@@ -587,16 +737,25 @@ async function loadConversations() {
         unreadCount: conv.unread_count || 0,
         online: true,
         type,
-        members: memberAvatars,
+        members: memberAvatars, // Array of member objects with avatar URLs
+        hasRealAvatar, // True only if group has real avatar_url (not fallback)
       }
+
+      if (memberAvatars.length > 0) {
+        console.warn(`✨ Conversation ${name} has ${memberAvatars.length} member avatars:`, memberAvatars.map(m => m.name))
+      }
+
+      return result
     })
+
+    console.log(`✅ Conversations loaded`)
 
     if (conversations.value.length > 0 && !activeConversationId.value) {
       conversations.value[0]?.id && selectConversation(conversations.value[0].id)
     }
   }
   catch (error: any) {
-    console.error('Error loading conversations:', error)
+    console.error('❌ Error loading conversations:', error)
   }
   finally {
     loading.value = false
@@ -609,12 +768,16 @@ async function loadMessages(conversationId: string) {
     return
 
   if (isLoadingMessages.value) {
+    console.log('⏭️ Already loading messages')
     return
   }
+
+  console.log('🔵 Loading initial messages for:', conversationId)
 
   try {
     isLoadingMessages.value = true
 
+    // Get current user ID if needed
     if (currentUserId.value === 'system') {
       try {
         const me = await client.request(readMe({ fields: ['id'] }))
@@ -622,10 +785,11 @@ async function loadMessages(conversationId: string) {
           currentUserId.value = me.id
       }
       catch (e) {
-        console.warn('Could not get current user ID:', e)
+        console.warn('⚠️ Could not get current user ID:', e)
       }
     }
 
+    // Fetch messages from DB
     const data = await client.request(
       readItems('zalo_messages' as any, {
         fields: ['*'],
@@ -637,8 +801,12 @@ async function loadMessages(conversationId: string) {
       }),
     )
 
+    console.log('📥 Loaded', data.length, 'messages from DB')
+
+    // Get unique sender IDs
     const senderIds = [...new Set(data.map((msg: any) => msg.sender_id).filter(Boolean))]
 
+    // Fetch users
     let usersMap = new Map()
     if (senderIds.length > 0) {
       const users = await client.request(
@@ -651,11 +819,22 @@ async function loadMessages(conversationId: string) {
       usersMap = new Map(users.map((u: any) => [u.id, u]))
     }
 
+    // Map messages
     messages.value = data.map((msg: any) => {
       const user = usersMap.get(msg.sender_id)
       const senderName = user?.display_name || user?.zalo_name || 'Unknown'
 
-      const senderAvatar = getAvatarUrl(user?.avatar_url, senderName)
+      // Proxy Zalo avatar URLs to avoid CORS
+      let senderAvatar = `https://ui-avatars.com/api/?name=${encodeURIComponent(senderName)}`
+      if (user?.avatar_url) {
+        if (user.avatar_url.startsWith('https://s120-ava-talk.zadn.vn/')
+          || user.avatar_url.startsWith('https://ava-grp-talk.zadn.vn/')) {
+          senderAvatar = `http://localhost:8055/zalo/avatar-proxy?url=${encodeURIComponent(user.avatar_url)}`
+        }
+        else {
+          senderAvatar = user.avatar_url
+        }
+      }
 
       const direction: 'in' | 'out' = msg.sender_id === currentUserId.value ? 'out' : 'in'
 
@@ -671,24 +850,142 @@ async function loadMessages(conversationId: string) {
       }
     })
 
+    console.log('✅ Loaded', messages.value.length, 'messages')
+
     nextTick(scrollToBottom)
   }
   catch (error: any) {
-    console.error('Error loading messages:', error)
+    console.error('❌ Error loading messages:', error)
   }
   finally {
     isLoadingMessages.value = false
   }
 }
 
+function updateConversationOnNewMessage(conversationId: string, message: any) {
+  const convIndex = conversations.value.findIndex(c => c.id === conversationId)
+
+  if (convIndex === -1) {
+    console.warn('⚠️ Conversation not found:', conversationId)
+    return
+  }
+
+  const conversation = conversations.value[convIndex]
+  if (!conversation)
+    return
+
+  // Update last message preview
+  conversation.lastMessage = message.text?.substring(0, 50) || ''
+  conversation.timestamp = message.time
+
+  // If not the active conversation, increment unread count
+  if (conversationId !== activeConversationId.value) {
+    conversation.unreadCount = (conversation.unreadCount || 0) + 1
+    console.log('📬 Updated unread count for', conversation.name, ':', conversation.unreadCount)
+  }
+
+  // Move conversation to top of list
+  if (convIndex > 0) {
+    conversations.value.splice(convIndex, 1)
+    conversations.value.unshift(conversation)
+    console.log('⬆️ Moved conversation to top:', conversation.name)
+  }
+}
+
+// Subscribe to ALL conversations messages (global subscription)
+async function subscribeToAllConversations() {
+  if (globalSubscriptionCleanup) {
+    console.log('🔴 Cleaning up previous global subscription')
+    globalSubscriptionCleanup()
+    globalSubscriptionCleanup = null
+  }
+
+  console.log('🌐 [GLOBAL] Starting global message subscription')
+
+  try {
+    const { subscription, unsubscribe } = await directusClient.subscribe('zalo_messages', {
+      event: 'create',
+      query: {
+        fields: ['*'],
+        // No filter - subscribe to ALL messages
+        sort: ['sent_at'],
+      },
+      uid: 'messages-global',
+    })
+
+    globalSubscriptionCleanup = unsubscribe
+    console.log('✅ [GLOBAL] Global subscription active')
+
+    // Handle messages
+    ;(async () => {
+      for await (const item of subscription) {
+        if (item.type === 'subscription' && item.event === 'init') {
+          console.log('✅ [GLOBAL] Global subscription initialized')
+        }
+        else if (item.type === 'subscription' && item.event === 'create') {
+          if (!item.data || item.data.length === 0)
+            continue
+
+          const newMsg = item.data[0]
+          if (!newMsg?.id || !newMsg?.conversation_id)
+            continue
+
+          console.log('📨 [GLOBAL] New message in conversation:', newMsg.conversation_id)
+
+          // If message is NOT for active conversation, update conversation list
+          if (newMsg.conversation_id !== activeConversationId.value) {
+            // Fetch sender info for preview
+            let senderName = 'Unknown'
+            if (newMsg.sender_id) {
+              try {
+                const users = await client.request(
+                  readItems('zalo_users' as any, {
+                    fields: ['display_name', 'zalo_name'],
+                    filter: { id: { _eq: newMsg.sender_id } },
+                    limit: 1,
+                  }),
+                )
+                const user = users[0]
+                if (user) {
+                  senderName = user.display_name || user.zalo_name || 'Unknown'
+                }
+              }
+              catch (e) {
+                console.warn('Could not fetch sender info:', e)
+              }
+            }
+
+            const messagePreview = {
+              text: newMsg.content || '',
+              time: formatTime(newMsg.sent_at),
+              senderName,
+            }
+
+            updateConversationOnNewMessage(newMsg.conversation_id, messagePreview)
+          }
+          // If message IS for active conversation, it's already handled by subscribeToMessages
+        }
+      }
+    })()
+  }
+  catch (error) {
+    console.error('❌ [GLOBAL] Failed to subscribe:', error)
+  }
+}
+
 async function subscribeToMessages(conversationId: string) {
   if (subscriptionCleanup) {
+    console.log('🔴 Unsubscribing from previous conversation')
     subscriptionCleanup()
     subscriptionCleanup = null
   }
 
   if (!conversationId)
     return
+
+  console.log('🔵 [SUBSCRIBE] Starting subscription for:', conversationId)
+  console.log('🔵 [SUBSCRIBE] Current messages count:', messages.value.length)
+  console.log('🔵 [SUBSCRIBE] Current user ID:', currentUserId.value)
   processedMessageIds.clear()
 
   try {
@@ -705,38 +1002,55 @@ async function subscribeToMessages(conversationId: string) {
     })
 
     subscriptionCleanup = unsubscribe
+    console.log('✅ [SUBSCRIBE] Subscribed with UID:', `messages-${conversationId}`)
+    console.log('✅ [SUBSCRIBE] Listening for new messages in conversation:', conversationId)
 
+    // Handle messages
     ;(async () => {
       for await (const item of subscription) {
+        console.log('📩 [WEBSOCKET] Event received:', { type: item.type, event: item.event, hasData: !!item.data })
+
         if (item.type === 'subscription' && item.event === 'init') {
-          console.log('[WEBSOCKET] Subscription initialized')
+          console.log('✅ [SUBSCRIBE] Subscription initialized for:', conversationId)
         }
         else if (item.type === 'subscription' && item.event === 'create') {
           if (!item.data || item.data.length === 0) {
-            console.warn('[WEBSOCKET] Empty data received')
+            console.warn('⚠️ [WEBSOCKET] Empty data received')
             continue
           }
 
           const newMsg = item.data[0]
 
           if (!newMsg?.id) {
-            console.warn('[WEBSOCKET] Invalid message structure:', newMsg)
-            continue
-          }
-          if (processedMessageIds.has(newMsg.id)) {
+            console.warn('⚠️ [WEBSOCKET] Invalid message structure:', newMsg)
             continue
           }
 
+          console.log('📥 [WEBSOCKET] New message received:', {
+            id: newMsg.id,
+            conversationId: newMsg.conversation_id,
+            senderId: newMsg.sender_id,
+            clientId: newMsg.client_id,
+            content: `${newMsg.content?.substring(0, 20)}...`,
+          })
+          if (processedMessageIds.has(newMsg.id)) {
+            console.log('⏭️ [DEDUPE] Already processed message:', newMsg.id)
+            continue
+          }
+
+          // Check duplicate by ID or client_id
           const exists = messages.value.some(m =>
             m.id === newMsg.id
             || (newMsg.client_id && m.clientId === newMsg.client_id),
           )
 
           if (exists) {
+            console.log('⏭️ Message already exists:', newMsg.id)
             continue
           }
           processedMessageIds.add(newMsg.id)
 
+          // Fetch sender info
           let senderName = 'Unknown'
           let senderAvatar = ''
 
@@ -755,7 +1069,19 @@ async function subscribeToMessages(conversationId: string) {
               if (user) {
                 senderName = user.display_name || user.zalo_name || 'Unknown'
 
-                senderAvatar = getAvatarUrl(user.avatar_url, senderName)
+                // Proxy Zalo avatar URLs to avoid CORS
+                if (user.avatar_url) {
+                  if (user.avatar_url.startsWith('https://s120-ava-talk.zadn.vn/')
+                    || user.avatar_url.startsWith('https://ava-grp-talk.zadn.vn/')) {
+                    senderAvatar = `http://localhost:8055/zalo/avatar-proxy?url=${encodeURIComponent(user.avatar_url)}`
+                  }
+                  else {
+                    senderAvatar = user.avatar_url
+                  }
+                }
+                else {
+                  senderAvatar = `https://ui-avatars.com/api/?name=${encodeURIComponent(senderName)}`
+                }
               }
             }
             catch (e) {
@@ -779,13 +1105,24 @@ async function subscribeToMessages(conversationId: string) {
 
           messages.value.push(messageToAdd)
 
+          console.log('✅ [WEBSOCKET] Message added to UI:', {
+            id: messageToAdd.id,
+            direction: messageToAdd.direction,
+            from: messageToAdd.senderName,
+            text: messageToAdd.text.substring(0, 30),
+            totalMessages: messages.value.length,
+          })
+
+          // Update conversation list: move to top and update unread count
+          updateConversationOnNewMessage(newMsg.conversation_id, messageToAdd)
+
           nextTick(scrollToBottom)
         }
       }
     })()
   }
   catch (error) {
-    console.error('[SUBSCRIBE] Failed to subscribe:', error)
+    console.error('❌ [SUBSCRIBE] Failed to subscribe:', error)
   }
 }
 
@@ -859,32 +1196,24 @@ function removeMember(memberId: string) {
   }
 }
 
+// Get active conversation object
 const activeConversation = computed(() => {
-  return conversations.value.find(
+  const conv = conversations.value.find(
     conv => conv.id === activeConversationId.value,
   )
-})
-// Thêm vào script
-const activeConversationMembers = computed(() => {
-  if (!activeConversationId.value) {
-    console.log('❌ No active conversation ID')
-    return []
+
+  if (conv) {
+    console.log('📋 Active Conversation:', {
+      id: conv.id,
+      name: conv.name,
+      type: conv.type,
+      hasAvatar: !!conv.avatar,
+      avatarPreview: conv.avatar?.substring(0, 50),
+      memberCount: conv.members?.length || 0,
+    })
   }
 
-  const conv = conversations.value.find(c => c.id === activeConversationId.value)
-
-  if (!conv) {
-    console.log('❌ Conversation not found in array')
-    return []
-  }
-
-  if (conv.type !== 'group') {
-    console.log('ℹ️ Not a group conversation')
-    return []
-  }
-
-  console.log('✅ Found members:', conv.members?.length || 0, conv.members)
-  return conv.members || []
+  return conv
 })
 
 // Conversation stats by type
@@ -896,10 +1225,12 @@ const conversationStats = computed(() => {
   return { all, group, direct }
 })
 
+// Get current messages (all messages are in messages.value now)
 const currentMessages = computed(() => {
   return messages.value
 })
 
+// Get selected member objects
 const selectedMemberObjects = computed(() => {
   return conversations.value.filter(member =>
     selectedMembers.value.includes(member.id),
@@ -921,16 +1252,20 @@ function scrollToBottom() {
 }
 
 function navigateToMessage(messageId: string) {
+  // Highlight the message
   highlightedMessageId.value = messageId
 
+  // Wait for next tick to ensure DOM is updated
   nextTick(() => {
     const messageElement = document.querySelector(`[data-message-id="${messageId}"]`)
     if (messageElement && messagesContainer.value) {
+      // Scroll to the message
       messageElement.scrollIntoView({
         behavior: 'smooth',
         block: 'center',
       })
 
+      // Remove highlight after 3 seconds
       setTimeout(() => {
         highlightedMessageId.value = null
       }, 3000)
@@ -964,7 +1299,10 @@ function handleClickOutside(event: Event) {
   }
 }
 
+// Lifecycle hooks
 onMounted(async () => {
+  console.log('🔵 Component mounted')
+
   await autoLogin()
   await loadConversations()
 
@@ -972,6 +1310,8 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  console.log('🧹 Cleaning up WebSocket')
+
   if (subscriptionCleanup) {
     subscriptionCleanup()
   }
@@ -989,6 +1329,19 @@ watch(activeConversationId, (newId) => {
     nextTick(scrollToBottom)
   }
 })
+
+// Filtered members for search
+const filteredMembers = computed(() => {
+  if (!memberSearchQuery.value.trim()) {
+    return conversations.value
+  }
+
+  return conversations.value.filter(member =>
+    member.name.toLowerCase().includes(memberSearchQuery.value.toLowerCase()),
+  )
+})
+
+// End of script
 </script>
 
 <template>
@@ -1356,36 +1709,77 @@ watch(activeConversationId, (newId) => {
             @click="selectConversation(conversation.id)"
           >
             <div class="flex items-center gap-2 flex-1 min-w-0">
-              <!-- Group Avatar with Members (3-avatar composite) -->
-              <div v-if="conversation.type === 'group' && conversation.members && conversation.members.length > 0" class="relative w-[40px] h-[40px] inline-block">
-                <div
-                  v-for="(member, index) in conversation.members.slice(0, 3)"
-                  :key="member.id"
-                  class="absolute w-[20px] h-[20px] rounded-full overflow-hidden bg-neutral-100 border-2 border-white"
-                  :class="{
-                    'top-0 left-0': index === 0, // Avatar 1: trên trái
-                    'top-0 right-0': index === 1, // Avatar 2: trên phải
-                    'bottom-0 left-1/2 -translate-x-1/2': index === 2, // Avatar 3: dưới giữa
-                  }"
-                >
-                  <img
-                    :src="member.avatar"
-                    :alt="member.name"
-                    class="w-full h-full object-cover"
-                  >
-                </div>
-              </div>
-
-              <!-- Group Avatar - single image (has group photo) -->
-              <div v-else-if="conversation.type === 'group'" class="relative inline-block">
-                <div
-                  class="w-13 h-13 relative rounded-full overflow-hidden bg-neutral-100 border border-black/8"
-                >
+              <!-- ✅ PRIORITY 1: Group Avatar - single image (has real group photo, not SVG fallback) -->
+              <div
+                v-if="conversation.hasRealAvatar && conversation.type === 'group'"
+                class="relative inline-block"
+              >
+                <div class="w-13 h-13 relative rounded-full overflow-hidden bg-neutral-100 border border-black/8">
                   <img
                     :src="conversation.avatar"
                     :alt="conversation.name"
                     class="w-10 h-10 object-cover"
                     @error="handleImageError($event, conversation.name)"
+                  >
+                </div>
+              </div>
+
+              <!-- ✅ PRIORITY 2: Group Avatar with Members (3-avatar composite in triangle layout) -->
+              <div
+                v-else-if="conversation.type === 'group' && conversation.members && conversation.members.length > 0"
+                class="relative inline-block"
+                style="width: 42px; height: 42px;"
+              >
+                <!-- Avatar 1: Top Left -->
+                <div
+                  v-if="conversation.members[0]"
+                  class="absolute rounded-full overflow-hidden bg-white border border-gray-300"
+                  style="width: 18px; height: 18px; top: 0; left: 0; z-index: 3;"
+                >
+                  <img
+                    :src="conversation.members[0].avatar"
+                    :alt="conversation.members[0].name"
+                    style="width: 100%; height: 100%; object-fit: cover;"
+                    @error="(e) => { if (e.target) e.target.src = `https://ui-avatars.com/api/?name=${encodeURIComponent(conversation.members[0].name || 'U')}&background=10B981&color=fff` }"
+                  >
+                </div>
+
+                <!-- Avatar 2: Top Right -->
+                <div
+                  v-if="conversation.members[1]"
+                  class="absolute rounded-full overflow-hidden bg-white border border-gray-300"
+                  style="width: 18px; height: 18px; top: 0; right: 0; z-index: 2;"
+                >
+                  <img
+                    :src="conversation.members[1].avatar"
+                    :alt="conversation.members[1].name"
+                    style="width: 100%; height: 100%; object-fit: cover;"
+                    @error="(e) => { if (e.target) e.target.src = `https://ui-avatars.com/api/?name=${encodeURIComponent(conversation.members[1].name || 'U')}&background=10B981&color=fff` }"
+                  >
+                </div>
+
+                <!-- Avatar 3: Bottom Center -->
+                <div
+                  v-if="conversation.members[2]"
+                  class="absolute rounded-full overflow-hidden bg-white border border-gray-300"
+                  style="width: 18px; height: 18px; bottom: 0; left: 50%; transform: translateX(-50%); z-index: 1;"
+                >
+                  <img
+                    :src="conversation.members[2].avatar"
+                    :alt="conversation.members[2].name"
+                    style="width: 100%; height: 100%; object-fit: cover;"
+                    @error="(e) => { if (e.target) e.target.src = `https://ui-avatars.com/api/?name=${encodeURIComponent(conversation.members[2].name || 'U')}&background=10B981&color=fff` }"
+                  >
+                </div>
+              </div>
+
+              <!-- ✅ PRIORITY 3: Group fallback icon (no photo, no members) -->
+              <div v-else-if="conversation.type === 'group'" class="relative inline-block">
+                <div class="w-13 h-13 relative rounded-full overflow-hidden bg-neutral-100 border border-black/8">
+                  <img
+                    :src="conversation.avatar"
+                    :alt="conversation.name"
+                    class="w-10 h-10 object-cover"
                   >
                 </div>
               </div>
@@ -1454,32 +1848,48 @@ watch(activeConversationId, (newId) => {
       <div v-if="activeConversation" class="chat-header">
         <div class="flex items-center justify-between w-full">
           <div class="flex items-center gap-4">
-            <!-- Group Header Avatar -->
-            <div
-              v-if="activeConversation?.type === 'group'"
-              class="relative inline-block w-[36px] h-[36px]"
-            >
-              <template v-if="activeConversationMembers.length > 0">
+            <!-- GROUP Chat Header Avatar -->
+            <div v-if="activeConversation.type === 'group'">
+              <!-- Priority 1: Group có ảnh đại diện thật -->
+              <div
+                v-if="activeConversation.avatar && !activeConversation.avatar.startsWith('data:')"
+                class="w-14 h-14 relative rounded-full overflow-hidden bg-neutral-100 border border-black/8"
+              >
+                <img
+                  :src="activeConversation.avatar"
+                  :alt="activeConversation.name"
+                  class="w-full h-full object-cover"
+                >
+              </div>
+
+              <!-- Priority 2: Group không có ảnh - hiển thị 3 member avatars theo tam giác -->
+              <div
+                v-else-if="activeConversation.members && activeConversation.members.length > 0"
+                class="relative w-10 h-10"
+              >
                 <div
-                  v-for="(member, index) in activeConversationMembers.slice(0, 3)"
-                  :key="member.id"
-                  class="absolute w-[18px] h-[18px] rounded-full overflow-hidden bg-neutral-100 border border-white"
+                  v-for="(member, index) in activeConversation.members.slice(0, 3)"
+                  :key="member.id || index"
+                  class="absolute w-5 h-5 rounded-full overflow-hidden bg-neutral-100 border-2 border-white"
                   :class="{
-                    'top-0 left-[-1px]': index === 0,
-                    'top-0 right-[-1px]': index === 1,
+                    'top-0 left-0': index === 0,
+                    'top-0 right-0': index === 1,
                     'bottom-0 left-1/2 -translate-x-1/2': index === 2,
                   }"
                 >
                   <img
-                    :src="member.avatar || `https://ui-avatars.com/api/?name=${encodeURIComponent(member.name || 'User')}&background=random&size=18`"
-                    :alt="member.name || 'User'"
+                    :src="member.avatar || 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iNDAiIGhlaWdodD0iNDAiIHZpZXdCb3g9IjAgMCA0MCA0MCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48cmVjdCB3aWR0aD0iNDAiIGhlaWdodD0iNDAiIHJ4PSI4IiBmaWxsPSIjMTBCOTgxIi8+PHBhdGggZD0iTTE1IDEzQzE1IDExLjM0MzEgMTYuMzQzMSAxMCAxOCAxMEMyMC4yMDkxIDEwIDIyIDExLjc5MDkgMjIgMTRDMjIgMTYuMjA5MSAyMC4yMDkxIDE4IDE4IDE4QzE2LjM0MzEgMTggMTUgMTYuNjU2OSAxNSAxNVYxM1oiIGZpbGw9IndoaXRlIi8+PHBhdGggZD0iTTI1IDEzQzI1IDExLjM0MzEgMjYuMzQzMSAxMCAyOCAxMEMyOS42NTY5IDEwIDMxIDExLjM0MzEgMzEgMTNDMzEgMTQuNjU2OSAyOS42NTY5IDE2IDI4IDE2QzI2LjM0MzEgMTYgMjUgMTQuNjU2OSAyNSAxM1oiIGZpbGw9IndoaXRlIi8+PHBhdGggZD0iTTEwIDI2QzEwIDIzLjIzODYgMTIuMjM4NiAyMSAxNSAyMUgyMUMyMy43NjE0IDIxIDI2IDIzLjIzODYgMjYgMjZWMjhDMjYgMjguNTUyMyAyNS41NTIzIDI5IDI1IDI5SDExQzEwLjQ0NzcgMjkgMTAgMjguNTUyMyAxMCAyOFYyNloiIGZpbGw9IndoaXRlIi8+PHBhdGggZD0iTTI0IDI2QzI0IDI0LjM0MzEgMjUuMzQzMSAyMyAyNyAyM0gzMEMzMS42NTY5IDIzIDMzIDI0LjM0MzEgMzMgMjZWMjhDMzMgMjguNTUyMyAzMi41NTIzIDI5IDMyIDI5SDI1QzI0LjQ0NzcgMjkgMjQgMjguNTUyMyAyNCAyOFYyNloiIGZpbGw9IndoaXRlIiBmaWxsLW9wYWNpdHk9IjAuNyIvPjwvc3ZnPg=='"
+                    :alt="member.name || 'Member'"
                     class="w-full h-full object-cover"
                   >
                 </div>
-              </template>
+              </div>
 
-              <!-- Fallback -->
-              <div v-else class="w-full h-full rounded-full overflow-hidden bg-neutral-100 border border-white">
+              <!-- Priority 3: Fallback icon cho group -->
+              <div
+                v-else
+                class="w-10 h-10 relative rounded-full overflow-hidden bg-neutral-100 border border-black/8"
+              >
                 <img
                   :src="activeConversation.avatar"
                   :alt="activeConversation.name"
@@ -1488,18 +1898,13 @@ watch(activeConversationId, (newId) => {
               </div>
             </div>
 
-            <!-- Individual Conversation Header Avatar -->
+            <!-- INDIVIDUAL Chat Header Avatar (1-1 conversation) -->
             <div v-else class="relative inline-block">
               <div
                 class="w-14 h-14 relative rounded-full overflow-hidden bg-neutral-100 border border-black/8"
               >
                 <img
-                  :src="
-                    activeConversation.avatar
-                      || `https://ui-avatars.com/api/?name=${encodeURIComponent(
-                        activeConversation.name,
-                      )}&background=random`
-                  "
+                  :src="activeConversation.avatar || `https://ui-avatars.com/api/?name=${encodeURIComponent(activeConversation.name)}&background=random`"
                   :alt="activeConversation.name"
                   class="w-full h-full object-cover"
                   @error="handleImageError($event, activeConversation.name)"
@@ -1598,9 +2003,39 @@ watch(activeConversationId, (newId) => {
                 <!-- Group Avatar and Names Section -->
                 <div class="flex flex-col items-center gap-1.5">
                   <!-- Large Group Avatar (64x64) -->
-                  <div class="w-16 h-16 relative rounded-full overflow-hidden bg-neutral-100 border border-black/8">
+                  <!-- Priority 1: Group has real avatar -->
+                  <div v-if="activeConversation?.avatar && !activeConversation?.avatar?.startsWith('data:')" class="w-16 h-16 relative rounded-full overflow-hidden bg-neutral-100 border border-black/8">
                     <img
-                      :src="activeConversation?.members?.[0] ? conversations.find(c => c.id === activeConversation.members[0])?.avatar || `https://ui-avatars.com/api/?name=${encodeURIComponent(conversations.find(c => c.id === activeConversation.members[0])?.name || 'Group')}&background=random&size=64` : `https://ui-avatars.com/api/?name=Group&background=random&size=64`"
+                      :src="activeConversation.avatar"
+                      :alt="activeConversation?.name || 'Group'"
+                      class="w-full h-full object-cover"
+                    >
+                  </div>
+
+                  <!-- Priority 2: Group has no avatar, show 3 member avatars composite -->
+                  <div v-else-if="activeConversation?.members && activeConversation.members.length > 0" class="relative w-16 h-16 inline-block">
+                    <div
+                      v-for="(member, index) in activeConversation.members.slice(0, 3)"
+                      :key="member.id"
+                      class="absolute w-8 h-8 rounded-full overflow-hidden bg-neutral-100 border-2 border-white"
+                      :class="{
+                        'top-0 left-0': index === 0,
+                        'top-0 right-0': index === 1,
+                        'bottom-0 left-1/2 -translate-x-1/2': index === 2,
+                      }"
+                    >
+                      <img
+                        :src="member.avatar"
+                        :alt="member.name"
+                        class="w-full h-full object-cover"
+                      >
+                    </div>
+                  </div>
+
+                  <!-- Priority 3: Fallback icon -->
+                  <div v-else class="w-16 h-16 relative rounded-full overflow-hidden bg-neutral-100 border border-black/8">
+                    <img
+                      :src="activeConversation?.avatar || 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iNDAiIGhlaWdodD0iNDAiIHZpZXdCb3g9IjAgMCA0MCA0MCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48cmVjdCB3aWR0aD0iNDAiIGhlaWdodD0iNDAiIHJ4PSI4IiBmaWxsPSIjMTBCOTgxIi8+PHBhdGggZD0iTTE1IDEzQzE1IDExLjM0MzEgMTYuMzQzMSAxMCAxOCAxMEMyMC4yMDkxIDEwIDIyIDExLjc5MDkgMjIgMTRDMjIgMTYuMjA5MSAyMC4yMDkxIDE4IDE4IDE4QzE2LjM0MzEgMTggMTUgMTYuNjU2OSAxNSAxNVYxM1oiIGZpbGw9IndoaXRlIi8+PHBhdGggZD0iTTI1IDEzQzI1IDExLjM0MzEgMjYuMzQzMSAxMCAyOCAxMEMyOS42NTY5IDEwIDMxIDExLjM0MzEgMzEgMTNDMzEgMTQuNjU2OSAyOS42NTY5IDE2IDI4IDE2QzI2LjM0MzEgMTYgMjUgMTQuNjU2OSAyNSAxM1oiIGZpbGw9IndoaXRlIi8+PHBhdGggZD0iTTEwIDI2QzEwIDIzLjIzODYgMTIuMjM4NiAyMSAxNSAyMUgyMUMyMy43NjE0IDIxIDI2IDIzLjIzODYgMjYgMjZWMjhDMjYgMjguNTUyMyAyNS41NTIzIDI5IDI1IDI5SDExQzEwLjQ0NzcgMjkgMTAgMjguNTUyMyAxMCAyOFYyNloiIGZpbGw9IndoaXRlIi8+PHBhdGggZD0iTTI0IDI2QzI0IDI0LjM0MzEgMjUuMzQzMSAyMyAyNyAyM0gzMEMzMS42NTY5IDIzIDMzIDI0LjM0MzEgMzMgMjZWMjhDMzMgMjguNTUyMyAzMi41NTIzIDI5IDMyIDI5SDI1QzI0LjQ0NzcgMjkgMjQgMjguNTUyMyAyNCAyOFYyNloiIGZpbGw9IndoaXRlIiBmaWxsLW9wYWNpdHk9IjAuNyIvPjwvc3ZnPg=='"
                       :alt="activeConversation?.name || 'Group'"
                       class="w-full h-full object-cover"
                     >
@@ -1711,7 +2146,9 @@ watch(activeConversationId, (newId) => {
                     v-if="message.text"
                     class="rounded-lg max-w-full break-words text-sm text-text-secondary leading-relaxed border-neutral-200"
                   >
-                    <p class="whitespace-pre-wrap" v-html="convertEmoticonToEmoji(message.text)" />
+                    <p class="whitespace-pre-wrap">
+                      {{ message.text }}
+                    </p>
                   </div>
                 </div>
               </template>
@@ -2010,26 +2447,9 @@ watch(activeConversationId, (newId) => {
                 @input="onSelectFromLibrary"
               />
             </Story>
-            <VEmojiPicker
-              @select="insertEmoji($event)"
-              @emoji-click="insertEmoji($event)"
-              @emoji-selected="insertEmoji($event)"
-              @input="insertEmoji($event)"
-              @change="insertEmoji($event)"
-            >
-              <template #button>
-                <button
-                  class="w-8 h-8 flex items-center justify-center rounded-md bg-transparent hover:bg-neutral-100 text-text-muted hover:text-text-secondary transition-colors"
-                  type="button"
-                >
-                  <svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
-                    <path d="M10 18.3333C14.6024 18.3333 18.3333 14.6024 18.3333 10C18.3333 5.39763 14.6024 1.66667 10 1.66667C5.39763 1.66667 1.66667 5.39763 1.66667 10C1.66667 14.6024 5.39763 18.3333 10 18.3333Z" stroke="currentColor" stroke-width="1.5" />
-                    <path d="M6.66667 11.6667C6.66667 11.6667 7.91667 13.3333 10 13.3333C12.0833 13.3333 13.3333 11.6667 13.3333 11.6667M7.5 7.5H7.50833M12.5 7.5H12.5083" stroke="currentColor" stroke-width="1.5" />
-                  </svg>
-                </button>
-              </template>
+            <VEmojiPicker @emoji-selected="logEvent('emoji-selected', $event)">
+              My Button
             </VEmojiPicker>
-
             <button
               class="w-8 h-8 flex items-center justify-center rounded-md bg-transparent hover:bg-neutral-100 text-text-muted hover:text-text-secondary transition-colors"
             >
@@ -2053,7 +2473,6 @@ watch(activeConversationId, (newId) => {
 
           <div class="flex-1 flex items-end gap-2">
             <textarea
-              ref="messageInputRef"
               v-model="messageText"
               placeholder="Type your message here..."
               rows="1"
@@ -2256,7 +2675,7 @@ watch(activeConversationId, (newId) => {
   min-height: 0;
   overflow-y: auto;
   overflow-x: hidden;
-  padding: 12px 0px;
+  padding: 12px 4px;
   background: var(--background-page, white);
   scroll-behavior: smooth;
 }

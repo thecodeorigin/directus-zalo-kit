@@ -19,9 +19,6 @@
       }
     }
   },
-  "dependencies": {
-    "ioredis": "catalog:"
-  },
   "devDependencies": {
     "@antfu/eslint-config": "catalog:",
     "@directus/extensions-sdk": "catalog:",
