@@ -3,7 +3,7 @@ import { useApi } from '@directus/extensions-sdk'
 import { authentication, createDirectus, readItems, readMe, realtime, rest } from '@directus/sdk'
 import { computed, nextTick, onBeforeUnmount, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useFileUpload } from './composables/useFileUpload'
-import client from './utils/sdk'
+import { client } from './utils/sdk'
 
 const currentFunction = ref<string | null>(null)
 

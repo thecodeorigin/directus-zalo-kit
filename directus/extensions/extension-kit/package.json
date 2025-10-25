@@ -78,6 +78,7 @@
     "lint": "eslint ."
   },
   "dependencies": {
+    "ioredis": "catalog:",
     "sass": "catalog:"
   },
   "devDependencies": {
