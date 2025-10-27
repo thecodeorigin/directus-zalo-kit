@@ -1,11 +1,8 @@
 /* eslint-disable no-console */
 import type { SchemaOverview } from '@directus/types'
-// import Redis from 'ioredis'
+import Redis from 'ioredis'
 import { match, P } from 'ts-pattern'
 import { LoginQRCallbackEventType, ThreadType, Zalo } from 'zca-js'
-
-// Temporary type for Redis to avoid import errors
-type Redis = any
 
 interface ZaloSession {
   userId: string
@@ -251,7 +248,6 @@ export class ZaloService {
       return
 
     try {
-      // @ts-expect-error - Redis is an 'any' type
       this.redis = new Redis({
         host: process.env.REDIS_HOST,
         port: Number.parseInt(process.env.REDIS_PORT ?? '6379'),
