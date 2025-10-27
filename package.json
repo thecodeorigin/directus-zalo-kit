@@ -5,7 +5,7 @@
   "author": "",
   "keywords": [],
   "scripts": {
-    "dev": "docker compose -f ./directus/docker-compose.dev.yaml up -d && pnpm -F @thecodeorigin/directus-zalo-kit dev"
+    "dev": "docker compose -f ./docker-compose.dev.yaml up -d && pnpm -F @thecodeorigin/directus-zalo-kit dev"
   },
   "devDependencies": {
     "@antfu/eslint-config": "catalog:",
