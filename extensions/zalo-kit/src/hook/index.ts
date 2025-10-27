@@ -1,6 +1,6 @@
 // index.ts (Hook file)
 import { defineHook } from '@directus/extensions-sdk'
-import { ZaloService } from '../endpoint/services/ZaloService'
+import { ZaloService } from '../endpoint/services/ZaloMessageService'
 
 export default defineHook(({ action, init, schedule }, { services, getSchema, logger }) => {
   const { ItemsService, FlowsService } = services
