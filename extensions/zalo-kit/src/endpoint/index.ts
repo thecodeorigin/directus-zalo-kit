@@ -1,7 +1,8 @@
 /* eslint-disable no-console */
 import { defineEndpoint } from '@directus/extensions-sdk'
 import { ThreadType } from 'zca-js'
-import ZaloService from './services/ZaloService' // Assuming ZaloService is correctly imported
+import ZaloLoginService from './services/ZaloLoginService'
+import ZaloService from './services/ZaloMessageService' // Assuming ZaloService is correctly imported
 
 export default defineEndpoint(async (router, { database, getSchema, services }) => {
   const { ItemsService } = services
@@ -19,11 +20,14 @@ export default defineEndpoint(async (router, { database, getSchema, services }) 
     console.warn('[Zalo Endpoint] Created new ZaloService instance')
   }
 
+  // Initialize ZaloLoginService via singleton
+  const loginService = ZaloLoginService.getInstance()
+
   // POST /zalo/init - Initiate QR code login
   router.post('/init', async (req, res) => {
     try {
-      // Use the refactored method name
-      const result = await zaloService.loginInitiate()
+      // Call loginService directly for login operations
+      const result = await loginService.loginInitiate()
       res.json(result)
     }
     catch (error: any) {
@@ -64,12 +68,16 @@ export default defineEndpoint(async (router, { database, getSchema, services }) 
       // Run the import in the background
       (async () => {
         try {
-          // Use the refactored method name
-          await zaloService.loginImportSession(
+          // Call loginService directly, then notify ZaloService callback
+          const result = await loginService.loginImportSession(
             imei,
             userAgent,
             cookies,
           )
+          // Notify ZaloService to set up API and listener
+          if (result.ok) {
+            await zaloService._onSessionImported(result)
+          }
         }
         catch (err) {
           console.error('[ZaloService] Background cookie login failed:', err)
@@ -107,8 +115,8 @@ export default defineEndpoint(async (router, { database, getSchema, services }) 
   // POST /zalo/logout - Logout
   router.post('/logout', async (req, res) => {
     try {
-      // Use the refactored method name
-      await zaloService.loginLogout()
+      // Call loginService directly for login operations
+      await loginService.loginLogout()
       res.json({
         success: true,
         message: 'Logged out successfully',
@@ -123,8 +131,8 @@ export default defineEndpoint(async (router, { database, getSchema, services }) 
   // GET /zalo/session - Get session info
   router.get('/session', async (req, res) => {
     try {
-      // Use the refactored method name
-      const session = await zaloService.sessionGetInfo()
+      // Call loginService directly for session operations
+      const session = await loginService.sessionGetInfo()
 
       if (session) {
         res.json({

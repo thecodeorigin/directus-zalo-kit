@@ -1,53 +1,31 @@
 /* eslint-disable no-console */
 import type { SchemaOverview } from '@directus/types'
-import Redis from 'ioredis'
-import { match, P } from 'ts-pattern'
-import { LoginQRCallbackEventType, ThreadType, Zalo } from 'zca-js'
-
-interface ZaloSession {
-  userId: string
-  loginTime: string
-  isActive: boolean
-  imei?: string
-  userAgent?: string
-  cookies?: any[]
-}
+import type { ZaloSession } from './ZaloLoginService'
+import { ThreadType } from 'zca-js'
+import ZaloLoginService from './ZaloLoginService'
 
 /**
  * ZaloService
  * Manages the connection, session, and data synchronization
  * for a Zalo account with Directus.
+ * Login and session management has been extracted to ZaloLoginService.
  */
 export class ZaloService {
   private static instance: ZaloService | null = null
-  private zalo = new Zalo({ selfListen: true, checkUpdate: false })
   private api: any = null
   private getSchemaFn: () => Promise<SchemaOverview>
   private ItemsService: any
-  private redis: Redis | null = null
 
   // Directus schema and service cache
   private schema: SchemaOverview | null = null
   private serviceCache: { [key: string]: any } = {}
   private isSchemaLoading = false
 
-  // Login and connection state
-  private loginStatus: 'logged_out' | 'pending_qr' | 'logged_in' = 'logged_out'
-  private loginQrCode: string | null = null
-  private loginResolver: ((value: any) => void) | null = null
-  private loginPendingData: {
-    imei?: string
-    userAgent?: string
-    cookies?: any[]
-  } | null = null
-
   // Listener and session state
   private listenerIsStarted = false
   private listenerReconnectAttempts = 0
   private readonly listenerMaxReconnectAttempts = 5
   private readonly listenerReconnectDelay = 5000
-  private sessionIsRestoring = false
-  private listenerKeepAliveInterval: NodeJS.Timeout | null = null
 
   private readonly systemAccountability = {
     admin: true,
@@ -62,15 +40,16 @@ export class ZaloService {
     this.getSchemaFn = getSchemaFn
     this.ItemsService = ItemsService
 
-    this.zalo = new Zalo({ selfListen: true, checkUpdate: false })
-
-    this.redisInitialize()
     console.log('[ZaloService] Initialized')
 
     // Per request, keeping the 10s magic number.
     // This delay likely waits for Directus hooks or Redis to be fully available.
     setTimeout(() => {
-      void this.sessionTryRestore()
+      void ZaloLoginService.getInstance().sessionTryRestore(
+        async (restoredSession: ZaloSession, api: any) => {
+          await this._onSessionRestored(restoredSession, api)
+        },
+      )
     }, 10000)
   }
 
@@ -183,30 +162,7 @@ export class ZaloService {
     }
     this.api = null
     this.listenerIsStarted = false
-    this.loginStatus = 'logged_out'
-    this.loginQrCode = null
-    this.loginResolver = null
     this.listenerReconnectAttempts = 0
-  }
-
-  /**
-   * Extracts a user ID from the Zalo cookie array.
-   */
-  private utilExtractUserIdFromCookies(cookies: any[]): string | null {
-    if (!Array.isArray(cookies))
-      return null
-
-    const targetCookie = cookies.find(
-      c => c.key === 'zpw_sek' || c.key === 'zpsid',
-    )
-    if (!targetCookie)
-      return null
-
-    const parts = targetCookie.value.split('.')
-    if (parts.length >= 2 && /^\d+$/.test(parts[1])) {
-      return parts[1]
-    }
-    return null
   }
 
   /**
@@ -238,232 +194,32 @@ export class ZaloService {
     return mimeTypes[ext.toLowerCase()] || 'application/octet-stream'
   }
 
-  // --- Redis & Session ---
+  // --- Public method to get connection status with listener context ---
 
   /**
-   * Initializes the Redis client from environment variables.
+   * Gets the current connection status including listener state.
    */
-  private redisInitialize(): void {
-    if (!process.env.REDIS_HOST)
-      return
+  public loginGetStatus() {
+    const status = ZaloLoginService.getInstance().loginGetStatus()
+    return {
+      ...status,
+      isListening: this.listenerIsStarted,
+    }
+  }
 
+  /**
+   * Restores a session and starts the listener.
+   * Called from ZaloLoginService callback during sessionTryRestore.
+   */
+  public async _onSessionRestored(restoredSession: ZaloSession, api: any) {
     try {
-      this.redis = new Redis({
-        host: process.env.REDIS_HOST,
-        port: Number.parseInt(process.env.REDIS_PORT ?? '6379'),
-      })
-
-      this.redis.on('error', (err: any) => {
-        console.error('[ZaloService] Redis connection error:', err.message)
-        this.redis = null
-      })
-
-      console.log('[ZaloService] Redis client initialized')
-    }
-    catch (err: any) {
-      console.error('[ZaloService] Failed to initialize Redis:', err.message)
-      this.redis = null
-    }
-  }
-
-  private redisGetRedisKey(userId: string): string {
-    return `zalo:session:${userId}`
-  }
-
-  /**
-   * Attempts to restore one or all active sessions from storage.
-   */
-  public async sessionTryRestore(userId?: string): Promise<void> {
-    if (this.sessionIsRestoring) {
-      console.log(
-        '[ZaloService] Session restore already in progress, skipping',
-      )
-      return
-    }
-    this.sessionIsRestoring = true
-
-    try {
-      console.log('[ZaloService] Checking for existing sessions...')
-
-      if (userId) {
-        const session = await this.sessionLoad(userId)
-        if (session && this.sessionIsValid(session)) {
-          await this.sessionRestoreLogin(session)
-        }
-        return
-      }
-
-      // Restore all sessions
-      const sessions = await this.sessionListAll()
-      console.log(
-        `[ZaloService] Found ${sessions.length} session(s) to restore`,
-      )
-
-      for (const session of sessions) {
-        if (this.sessionIsValid(session)) {
-          console.log(
-            `[ZaloService] Restoring session for user: ${session.userId}`,
-          )
-          await this.sessionRestoreLogin(session)
-        }
-      }
-    }
-    finally {
-      this.sessionIsRestoring = false
-    }
-  }
-
-  /**
-   * Loads a session for a specific user, or the first one found.
-   */
-  public async sessionLoad(userId?: string): Promise<ZaloSession | null> {
-    if (!userId) {
-      const sessions = await this.sessionListAll()
-      return sessions.length > 0 && sessions[0] !== undefined
-        ? sessions[0]
-        : null
-    }
-
-    const redisKey = this.redisGetRedisKey(userId)
-    if (this.redis) {
-      try {
-        console.log(`[ZaloService] Checking Redis for user ${userId}...`)
-        const raw = await this.redis.get(redisKey)
-        if (raw && raw.trim() !== '') {
-          const session = JSON.parse(raw)
-          console.log(`[ZaloService] Redis session loaded for ${userId}`)
-          return session
-        }
-      }
-      catch (err: any) {
-        console.error(
-          `[ZaloService] Error reading Redis for ${userId}:`,
-          err.message,
-        )
-      }
-    }
-
-    return null
-  }
-
-  /**
-   * Lists all Zalo sessions found in Redis.
-   */
-  public async sessionListAll(): Promise<ZaloSession[]> {
-    const sessions: ZaloSession[] = []
-    const seenUserIds = new Set<string>()
-
-    // Load from Redis
-    if (this.redis) {
-      try {
-        const keys = await this.redis.keys('zalo:session:*')
-        for (const key of keys) {
-          const raw = await this.redis.get(key)
-          if (raw) {
-            try {
-              const session = JSON.parse(raw)
-              if (session.userId && !seenUserIds.has(session.userId)) {
-                sessions.push(session)
-                seenUserIds.add(session.userId)
-              }
-            }
-            catch {
-              console.error(`[ZaloService] Failed to parse Redis key ${key}`)
-            }
-          }
-        }
-      }
-      catch (err) {
-        console.error('[ZaloService] Error listing Redis sessions:', err)
-      }
-    }
-
-    return sessions
-  }
-
-  /**
-   * Validates the integrity of a session object.
-   */
-  private sessionIsValid(session: ZaloSession): boolean {
-    if (!session) {
-      console.warn('[ZaloService] Session object is null/undefined')
-      return false
-    }
-
-    if (
-      !session.cookies
-      || !Array.isArray(session.cookies)
-      || session.cookies.length === 0
-    ) {
-      console.warn('[ZaloService] Session missing or empty cookies array')
-      return false
-    }
-
-    if (!session.imei || typeof session.imei !== 'string') {
-      console.warn('[ZaloService] Session missing valid imei')
-      return false
-    }
-
-    if (!session.userAgent || typeof session.userAgent !== 'string') {
-      console.warn('[ZaloService] Session missing valid userAgent')
-      return false
-    }
-
-    console.log('[ZaloService] Session validation passed')
-    return true
-  }
-
-  /**
-   * Logs into Zalo using a saved session object.
-   */
-  private async sessionRestoreLogin(session: ZaloSession): Promise<void> {
-    try {
-      console.log('[ZaloService] Attempting login with saved session...')
-
-      if (!session.cookies || !Array.isArray(session.cookies)) {
-        throw new Error('Session cookies are missing or invalid')
-      }
-      if (this.api?.listener) {
-        try {
-          this.api.listener.stop()
-          console.log('[ZaloService] Stopped existing listener before restore')
-          await new Promise(resolve => setTimeout(resolve, 500))
-        }
-        catch (err) {
-          console.error('[ZaloService] Error stopping listener:', err)
-        }
-      }
-      this.api = await this.zalo.login({
-        cookie: session.cookies as any[],
-        imei: session.imei!,
-        userAgent: session.userAgent!,
-      })
-
-      let id = this.api?.getOwnId?.()
-      if (!id) {
-        id = this.utilExtractUserIdFromCookies(session.cookies || []) || null
-      }
-      if (!id) {
-        throw new Error('Restored api has no own id')
-      }
-
-      if (id !== session.userId) {
-        const oldId = session.userId
-        console.warn(
-          `[ZaloService] ID mismatch! Saved: ${session.userId}, API: ${id}. Updating to API value.`,
-        )
-        session.userId = id
-        await this.sessionSave(session)
-        this.sessionDelete(oldId)
-      }
-
-      this.loginStatus = 'logged_in'
-      console.log(`[ZaloService] Restored session for user: ${id}`)
+      this.api = api
+      console.log(`[ZaloService] Restored session for user: ${restoredSession.userId}`)
       this.listenerStart()
       this.listenerStartKeepAlive()
 
       try {
-        await this.dbFetchAndUpsertUser(id)
+        await this.dbFetchAndUpsertUser(restoredSession.userId)
         await this.syncGroups()
       }
       catch (err) {
@@ -472,501 +228,26 @@ export class ZaloService {
     }
     catch (err: any) {
       console.error('[ZaloService] Restore login failed:', err.message)
-      this.sessionDelete(session.userId)
     }
   }
 
   /**
-   * Deletes a session from storage.
+   * Restores a session from import and starts the listener.
+   * Called from ZaloLoginService after loginImportSession.
    */
-  private sessionDelete(userId: string): void {
-    console.log(
-      '[ZaloService] Backing up and deleting session for user:',
-      userId,
-    )
-    const redisKey = this.redisGetRedisKey(userId)
-    if (this.redis) {
+  public async _onSessionImported(result: { ok: boolean, userId: string, api: any }) {
+    if (result.ok) {
+      this.api = result.api
+      this.listenerStart()
+      this.listenerStartKeepAlive()
+
       try {
-        this.redis.del(redisKey)
-        console.log(
-          '[ZaloService] Session deleted from Redis for user:',
-          userId,
-        )
-      }
-      catch (err: any) {
-        console.error(
-          '[ZaloService] Failed to delete session from Redis for user:',
-          userId,
-          err.message,
-        )
-      }
-    }
-  }
-
-  /**
-   * Saves a session object to Redis.
-   */
-  private async sessionSave(session: ZaloSession): Promise<void> {
-    const sessionJson = JSON.stringify(session, null, 2)
-    const userId = session.userId
-    const redisKey = this.redisGetRedisKey(session.userId)
-
-    if (this.redis) {
-      try {
-        await this.redis.set(redisKey, sessionJson)
-        console.log(`[ZaloService] Session saved to Redis: ${userId}`)
-
-        const verifyRaw = await this.redis.get(redisKey)
-        if (verifyRaw) {
-          JSON.parse(verifyRaw)
-          console.log(`[ZaloService] Session verified in Redis for ${userId}`)
-        }
-      }
-      catch (err: any) {
-        console.error(
-          `[ZaloService] Error saving session to Redis for ${userId}:`,
-          err.message,
-        )
-      }
-    }
-  }
-
-  /**
-   * Gets the current session info, if any.
-   */
-  public async sessionGetInfo(): Promise<{
-    userId: string | null
-    loginTime: string | null
-    isActive: boolean
-  } | null> {
-    try {
-      const session = await this.sessionLoad()
-      if (!session)
-        return null
-
-      return {
-        userId: session.userId || null,
-        loginTime: session.loginTime || null,
-        isActive: session.isActive ?? false,
-      }
-    }
-    catch (err: any) {
-      console.error('[ZaloService] getSessionInfo error:', err.message)
-      return null
-    }
-  }
-
-  // --- Login / Logout ---
-
-  /**
-   * Gets the current connection status.
-   */
-  public loginGetStatus() {
-    return {
-      status: this.loginStatus,
-      qrCode: this.loginQrCode,
-      isListening: this.listenerIsStarted,
-      userId: this.api?.getOwnId?.() || null,
-    }
-  }
-
-  /**
-   * Resets the login state and cleans up resources.
-   */
-  private loginReset() {
-    this.utilCleanup() // Ensures listener is stopped
-    this.loginStatus = 'logged_out'
-    this.loginQrCode = null
-    this.loginResolver = null
-    this.listenerIsStarted = false
-    this.listenerReconnectAttempts = 0
-    this.loginPendingData = null
-  }
-
-  /**
-   * Initiates a new login attempt via QR code.
-   */
-  public async loginInitiate(): Promise<any> {
-    if (this.loginStatus !== 'logged_out') {
-      return this.loginGetStatus()
-    }
-
-    this.loginStatus = 'pending_qr'
-    return new Promise<any>((resolve, reject) => {
-      this.loginResolver = resolve
-
-      const timeout = setTimeout(() => {
-        reject(new Error('Login timeout'))
-        this.loginReset()
-      }, 120000)
-
-      this.zalo
-        .loginQR({}, async (response: any) => {
-          await this.loginHandleQRCallback(response)
-        })
-        .then(async (api: any) => {
-          clearTimeout(timeout)
-          await this.loginHandleSuccess(api)
-          // The resolver might be cleared by finalize,
-          // so we resolve the promise directly here too.
-          resolve(this.loginGetStatus())
-        })
-        .catch((err: any) => {
-          clearTimeout(timeout)
-          console.error('[ZaloService] Login failed:', err)
-          this.loginReset()
-          reject(err)
-        })
-    })
-  }
-
-  /**
-   * Handles QR code login events from `zca-js`.
-   */
-  private async loginHandleQRCallback(response: any): Promise<void> {
-    match(response)
-      .with(
-        {
-          type: LoginQRCallbackEventType.QRCodeGenerated,
-          data: { image: P.select(P.string) },
-        },
-        (qrImage) => {
-          this.loginQrCode = qrImage
-          if (this.loginResolver) {
-            this.loginResolver(this.loginGetStatus())
-          }
-        },
-      )
-      .with({ type: LoginQRCallbackEventType.QRCodeExpired }, () => {
-        console.log('[ZaloService] QR code expired')
-        this.loginReset()
-      })
-      .with({ type: LoginQRCallbackEventType.QRCodeDeclined }, () => {
-        console.log('[ZaloService] QR code declined')
-        this.loginReset()
-      })
-      .with(
-        { type: LoginQRCallbackEventType.GotLoginInfo, data: P.select() },
-        async (loginData) => {
-          await this.loginHandleGotLoginInfo(loginData)
-        },
-      )
-      .otherwise(() => {
-        console.log('[ZaloService] Login event:', response.type)
-      })
-  }
-
-  /**
-   * Handles the `GotLoginInfo` event, storing temporary session data.
-   */
-  private async loginHandleGotLoginInfo(loginData: any): Promise<void> {
-    try {
-      const cookies = loginData?.cookie ?? loginData?.cookies ?? null
-      const imei = loginData?.imei
-      const userAgent = loginData?.userAgent
-      if (
-        !cookies
-        || !Array.isArray(cookies)
-        || cookies.length === 0
-        || !imei
-        || !userAgent
-      ) {
-        console.warn(
-          '[ZaloService] Skipping GotLoginInfo: missing cookies/imei/userAgent',
-        )
-        return
-      }
-      this.loginPendingData = {
-        imei,
-        userAgent,
-        cookies,
-      }
-
-      console.log(
-        '[ZaloService] Login credentials stored temporarily, waiting for API initialization',
-      )
-      // Attempt to finalize login, in case the API resolved first.
-      await this.loginFinalize()
-    }
-    catch (e: any) {
-      console.warn('[ZaloService] GotLoginInfo handling failed:', e.message)
-    }
-  }
-
-  /**
-   * Handles the successful resolution of the `loginQR` promise.
-   */
-  private async loginHandleSuccess(api: any): Promise<void> {
-    this.api = api
-    // Attempt to finalize login, in case GotLoginInfo fired first.
-    await this.loginFinalize()
-  }
-
-  /**
-   * [FIX for Race Condition]
-   * This method is called by both `loginHandleSuccess` (when API is ready)
-   * and `loginHandleGotLoginInfo` (when session data is ready).
-   * It only proceeds when *both* are available.
-   */
-  private async loginFinalize(): Promise<void> {
-    // Check if both parts of the login are ready
-    if (!this.api || !this.loginPendingData) {
-      console.log(
-        '[ZaloService] Finalizing login... waiting for all components.',
-      )
-      return
-    }
-
-    console.log('[ZaloService] API and session data are ready. Finalizing login.')
-    this.loginStatus = 'logged_in'
-    this.loginQrCode = null
-
-    const userId = this.api?.getOwnId?.()
-
-    if (!userId) {
-      console.error('[ZaloService] Could not get userId from API')
-      this.loginPendingData = null
-      this.listenerStart()
-      this.listenerStartKeepAlive()
-      return
-    }
-
-    console.log(`[ZaloService] Using userId from API: ${userId}`)
-    if (!userId || !/^\d+$/.test(userId)) {
-      console.error(`[ZaloService] Invalid userId format: ${userId}`)
-      this.loginPendingData = null
-      this.listenerStart()
-      this.listenerStartKeepAlive()
-      return
-    }
-
-    if (userId.length < 8 || userId.length > 20) {
-      console.warn(
-        `[ZaloService] Skip saving - userId length unusual: ${userId} (${userId.length} chars)`,
-      )
-      this.loginPendingData = null
-      this.listenerStart()
-      this.listenerStartKeepAlive()
-      return
-    }
-
-    console.log(
-      `[ZaloService] userId validation passed: ${userId} (${userId.length} chars)`,
-    )
-    console.log(`[ZaloService] Login successful for user: ${userId}`)
-
-    const session: ZaloSession = {
-      userId,
-      loginTime: new Date().toISOString(),
-      isActive: true,
-      imei: this.loginPendingData.imei!,
-      userAgent: this.loginPendingData.userAgent!,
-      cookies: this.loginPendingData.cookies!,
-    }
-
-    console.log(`[ZaloService] Session info: userId=${userId}`)
-
-    if (
-      !session.imei
-      || !session.userAgent
-      || !session.cookies
-      || session.cookies.length === 0
-    ) {
-      console.error(
-        '[ZaloService] Session validation failed - pendingLoginData incomplete:',
-        {
-          hasImei: !!session.imei,
-          hasUserAgent: !!session.userAgent,
-          cookiesCount: session.cookies?.length || 0,
-        },
-      )
-      this.loginPendingData = null
-      this.listenerStart()
-      this.listenerStartKeepAlive()
-      return
-    }
-
-    await this.sessionSave(session)
-
-    // Clear pending data now that it's saved
-    this.loginPendingData = null
-
-    this.listenerStart()
-    this.listenerStartKeepAlive()
-
-    // Resolve the original promise from initiateLogin
-    if (this.loginResolver) {
-      this.loginResolver(this.loginGetStatus())
-      this.loginResolver = null
-    }
-
-    console.log('Waiting for API to stabilize ....')
-    await new Promise(resolve => setTimeout(resolve, 2000))
-
-    try {
-      if (!this.api) {
-        console.error('[ZaloService] API is not initialized after login success')
-        return
-      }
-
-      if (typeof this.api.getAllGroups !== 'function') {
-        console.error('[ZaloService] API does not have getAllGroups function')
-        console.error(
-          '[ZaloService] Available API methods:',
-          Object.keys(this.api || {}),
-        )
-        return
-      }
-
-      console.log('[ZaloService] API validation passed, starting sync...')
-
-      // Sync user info
-      await this.dbFetchAndUpsertUser(userId)
-      console.log('[ZaloService] User info synced')
-
-      // Sync groups
-      console.log('[ZaloService] Starting group sync...')
-      await this.syncGroups()
-      console.log('[ZaloService] Group sync completed successfully')
-    }
-    catch (err: any) {
-      console.error('[ZaloService] Sync after login failed:', err.message)
-      console.error('[ZaloService] Error stack:', err.stack)
-      console.error('[ZaloService] API state:', {
-        hasApi: !!this.api,
-        apiType: typeof this.api,
-        hasGetAllGroups: typeof this.api?.getAllGroups,
-        hasGetGroupInfo: typeof this.api?.getGroupInfo,
-      })
-    }
-  }
-
-  /**
-   * Logs in using session data from an external extractor tool.
-   */
-  public async loginImportSession(
-    imei: string,
-    userAgent: string,
-    cookies: any[],
-  ): Promise<{ ok: boolean, userId: string }> {
-    if (
-      !imei
-      || !userAgent
-      || !Array.isArray(cookies)
-      || cookies.length === 0
-    ) {
-      throw new Error('imei, userAgent, and cookies are required')
-    }
-
-    try {
-      console.log('[ZaloService] Logging in using imported extractor data...')
-      const api = await this.zalo.login({
-        cookie: cookies,
-        imei,
-        userAgent,
-      })
-
-      this.api = api
-      this.loginStatus = 'logged_in'
-      this.loginQrCode = null
-
-      let uid = this.api?.getOwnId?.()
-      if (!uid) {
-        uid = this.utilExtractUserIdFromCookies(cookies) || 'unknown'
-        console.warn(
-          `[ZaloService] getOwnId() failed, fell back to cookie: ${uid}`,
-        )
-      }
-      if (!uid || uid === 'unknown' || uid.length < 10) {
-        throw new Error('Invalid user ID after login; check credentials')
-      }
-
-      console.log(`[ZaloService] Login successful (import) for ${uid}`)
-
-      const session: ZaloSession = {
-        userId: uid,
-        loginTime: new Date().toISOString(),
-        isActive: true,
-        imei,
-        userAgent,
-        cookies,
-      }
-
-      await this.sessionSave(session)
-      this.listenerStart()
-      this.listenerStartKeepAlive()
-      try {
-        await this.dbFetchAndUpsertUser(uid)
+        await this.dbFetchAndUpsertUser(result.userId)
         await this.syncGroups()
       }
       catch (err) {
         console.warn('[ZaloService] Sync after import failed:', err)
       }
-
-      return { ok: true, userId: uid }
-    }
-    catch (err: any) {
-      console.error(
-        '[ZaloService] Import session from extractor failed:',
-        err.message,
-      )
-      this.api = null
-      this.loginStatus = 'logged_out'
-      throw err
-    }
-  }
-
-  /**
-   * Logs out a user and deletes their session.
-   */
-  public async loginLogout(userId?: string): Promise<void> {
-    const targetUserId = userId || this.api?.getOwnId?.()
-
-    let finalUserId = targetUserId
-    if (!finalUserId) {
-      const sessions = await this.sessionListAll()
-      if (sessions.length > 0 && sessions[0]) {
-        finalUserId = sessions[0].userId
-        console.log(
-          `[ZaloService] No userId provided, using first session: ${finalUserId}`,
-        )
-      }
-    }
-
-    if (!finalUserId) {
-      console.warn('[ZaloService] No userId found to logout')
-      return
-    }
-
-    const currentUserId = this.api?.getOwnId?.()
-    const isCurrentSession = currentUserId === finalUserId
-
-    if (this.api && isCurrentSession) {
-      try {
-        await this.api.logout?.()
-      }
-      catch (err: any) {
-        console.warn(
-          `[ZaloService] Error during API logout for ${finalUserId}:`,
-          err,
-        )
-      }
-      finally {
-        // Full cleanup of the active session
-        await this.utilCleanup()
-      }
-    }
-
-    // Always delete the session from storage
-    try {
-      this.sessionDelete(finalUserId)
-    }
-    catch (err: any) {
-      console.error(
-        `[ZaloService] Error cleaning up session for ${finalUserId}:`,
-        err.message,
-      )
-      throw err
     }
   }
 
@@ -982,10 +263,6 @@ export class ZaloService {
   ): Promise<any> {
     if (!this.api) {
       throw new Error('Zalo API not initialized. Please login first.')
-    }
-
-    if (this.loginStatus !== 'logged_in') {
-      throw new Error(`Zalo not logged in. Current status: ${this.loginStatus}`)
     }
 
     try {
@@ -1122,28 +399,10 @@ export class ZaloService {
 
   /**
    * Starts a keep-alive interval to maintain the connection.
+   * Delegated to ZaloLoginService.
    */
   private listenerStartKeepAlive() {
-    if (this.listenerKeepAliveInterval)
-      return
-    this.listenerKeepAliveInterval = setInterval(async () => {
-      if (this.loginStatus !== 'logged_in' || !this.api)
-        return
-      try {
-        const ownId = this.api.getOwnId()
-        if (ownId) {
-          await this.api.getUserInfo(ownId)
-        }
-        else {
-          console.warn('[ZaloService] Skip keep-alive: No ownId available')
-        }
-        console.log('[ZaloService] Internal keep-alive ping sent via getUserInfo')
-      }
-      catch (err) {
-        console.error('[ZaloService] Keep-alive error:', err)
-        this.listenerHandleError()
-      }
-    }, 1800000) // 30 minutes
+    ZaloLoginService.getInstance().startKeepAlive()
   }
 
   /**
@@ -1381,7 +640,7 @@ export class ZaloService {
       setTimeout(() => this.listenerRestart(), delay)
     }
     else {
-      this.loginReset()
+      this.utilCleanup()
     }
   }
 
@@ -2669,105 +1928,34 @@ export class ZaloService {
     }
   }
 
-  // --- Redis Admin ---
+  // --- Redis Admin (Delegated to ZaloLoginService) ---
 
   /**
-   * Gets the status of the Redis connection.
+   * Gets the status of the Redis connection from ZaloLoginService.
    */
   public async redisGetStatus() {
-    if (!this.redis)
-      return { enabled: false }
-    try {
-      const ping = await this.redis.ping()
-      const dbsize = await this.redis.dbsize()
-      return { enabled: true, ping, dbsize }
-    }
-    catch (e: any) {
-      return { enabled: false, error: e.message }
-    }
+    return await ZaloLoginService.getInstance().redisGetStatus()
   }
 
   /**
-   * Gets one or all sessions directly from Redis.
+   * Gets one or all sessions from Redis via ZaloLoginService.
    */
   public async redisGetSession(userId?: string) {
-    if (!this.redis)
-      return null
-    try {
-      if (!userId) {
-        const keys = await this.redis.keys('zalo:session:*')
-        const sessions: any = {}
-        for (const key of keys) {
-          const raw = await this.redis.get(key)
-          if (raw) {
-            try {
-              const id = key.replace('zalo:session:', '')
-              sessions[id] = JSON.parse(raw)
-            }
-            catch {
-              sessions[key] = raw
-            }
-          }
-        }
-        return sessions
-      }
-
-      const raw = await this.redis.get(this.redisGetRedisKey(userId))
-      if (!raw)
-        return null
-      try {
-        return JSON.parse(raw)
-      }
-      catch {
-        return raw
-      }
-    }
-    catch {
-      return null
-    }
+    return await ZaloLoginService.getInstance().redisGetSession(userId)
   }
 
   /**
-   * Scans for keys in Redis matching a pattern.
+   * Scans for keys in Redis matching a pattern via ZaloLoginService.
    */
   public async redisGetKeys(pattern = '*', limit = 1000) {
-    if (!this.redis)
-      return []
-    let cursor = '0'
-    const keys: string[] = []
-    do {
-      const [next, batch] = await this.redis.scan(
-        cursor,
-        'MATCH',
-        pattern,
-        'COUNT',
-        200,
-      )
-      for (const k of batch) {
-        keys.push(k)
-        if (keys.length >= limit)
-          return keys
-      }
-      cursor = next
-    } while (cursor !== '0')
-    return keys
+    return await ZaloLoginService.getInstance().redisGetKeys(pattern, limit)
   }
 
   /**
-   * Gets a raw value from Redis by key.
+   * Gets a raw value from Redis by key via ZaloLoginService.
    */
   public async redisGet(key: string) {
-    if (!this.redis || !key)
-      return null
-    const raw = await this.redis.get(key)
-    if (!raw)
-      return null
-    try {
-      return JSON.parse(raw)
-    }
-    catch {
-      return raw
-    }
+    return await ZaloLoginService.getInstance().redisGet(key)
   }
 }
 
