@@ -31,8 +31,19 @@ async function checkStatus() {
       userId.value = loggedInUserId
       isLoading.value = false
       qrCodeBase64.value = null
-      if (pollInterval)
+      loginMethod.value = null // Reset login method to show status
+
+      // Clear form inputs when successfully logged in
+      cookiesInput.value = ''
+      imeiInput.value = ''
+      userAgentInput.value = ''
+
+      if (pollInterval) {
         clearInterval(pollInterval)
+        pollInterval = null
+      }
+
+      console.warn('[Zalo] Login successful, redirecting to status card')
     }
     else if (status === 'pending_qr') {
       isLoading.value = true
@@ -45,8 +56,10 @@ async function checkStatus() {
   catch (error) {
     console.error('Failed to get Zalo status:', error)
     isLoading.value = false
-    if (pollInterval)
+    if (pollInterval) {
       clearInterval(pollInterval)
+      pollInterval = null
+    }
   }
 }
 
@@ -56,7 +69,11 @@ async function initiateQRLogin() {
   errorMessage.value = null
 
   try {
-    await api.post('/zalo/init')
+    await api.post('/zalo/login/qr')
+
+    // if (res.data.status === LoginQRCallbackEventType.QRCodeGenerated) {
+    //   qrCodeBase64.value = res.data.qrCode
+    // }
     if (pollInterval)
       clearInterval(pollInterval)
     pollInterval = window.setInterval(checkStatus, 2500)
@@ -92,14 +109,20 @@ async function initiateCookiesLogin() {
       userAgent: userAgentInput.value,
     })
 
-    if (response.data.ok) {
-      await new Promise(resolve => setTimeout(resolve, 2000))
-      await checkStatus()
+    console.warn('[Zalo] Login response:', response.data)
 
+    if (response.data.ok) {
+      console.warn('[Zalo] Login successful! Setting up session...')
+      isLoggedIn.value = true
+      userId.value = response.data.userId
+      loginMethod.value = null
+
+      // Clear form
       cookiesInput.value = ''
       imeiInput.value = ''
       userAgentInput.value = ''
-      loginMethod.value = null
+
+      setTimeout(checkStatus, 1000)
     }
     else {
       throw new Error(response.data.message || 'Login failed')
@@ -107,14 +130,11 @@ async function initiateCookiesLogin() {
   }
   catch (error: any) {
     console.error('Failed to login with cookies:', error)
-    errorMessage.value = error.message || 'Failed to login. Please check your data and try again.'
+    errorMessage.value
+      = error.message || 'Failed to login. Please check your data and try again.'
   }
   finally {
     isLoading.value = false
-    if (pollInterval) {
-      clearInterval(pollInterval)
-      pollInterval = null
-    }
   }
 }
 
@@ -147,8 +167,10 @@ function backToMethods() {
   errorMessage.value = null
   qrCodeBase64.value = null
   isLoading.value = false
-  if (pollInterval)
+  if (pollInterval) {
     clearInterval(pollInterval)
+    pollInterval = null
+  }
 }
 
 onMounted(() => {
@@ -156,8 +178,10 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
-  if (pollInterval)
+  if (pollInterval) {
     clearInterval(pollInterval)
+    pollInterval = null
+  }
 })
 </script>
 

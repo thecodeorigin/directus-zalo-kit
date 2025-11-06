@@ -18,7 +18,8 @@ defineEmits<{
     <h1>Successfully Connected</h1>
     <p class="user-info">
       <span class="label">User ID:</span>
-      <code class="user-id">{{ userId }}</code>
+      <code v-if="userId" class="user-id">{{ userId }}</code>
+      <code v-else class="user-id loading">Loading...</code>
     </p>
     <v-button large secondary class="logout-btn" @click="$emit('logout')">
       <v-icon name="logout" left />
@@ -95,6 +96,11 @@ defineEmits<{
   font-size: 14px;
   color: var(--primary);
   font-weight: 600;
+}
+
+.user-id.loading {
+  color: var(--foreground-subdued);
+  font-style: italic;
 }
 
 .logout-btn {
