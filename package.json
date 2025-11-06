@@ -13,6 +13,7 @@
     "@directus/types": "catalog:",
     "@neondatabase/api-client": "catalog:",
     "@rollup/plugin-image": "catalog:",
+    "@types/express-serve-static-core": "catalog:",
     "@types/node": "catalog:",
     "@types/qrcode-terminal": "catalog:",
     "@vue/tsconfig": "catalog:",
