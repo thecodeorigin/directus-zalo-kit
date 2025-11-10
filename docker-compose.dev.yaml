@@ -125,7 +125,6 @@ services:
       EMAIL_SMTP_SECURE: false
 
       # Other Settings
-      WEBSOCKETS_ENABLED: ${WEBSOCKETS_ENABLED:-true}
       CORS_ENABLED: ${CORS_ENABLED:-true}
       CORS_ORIGIN: ${CORS_ORIGIN:-true}
       EXTENSIONS_PATH: /directus/extensions
@@ -133,6 +132,7 @@ services:
       EXTENSIONS_AUTO_RELOAD: ${EXTENSIONS_AUTO_RELOAD:-true}
       REFRESH_TOKEN_COOKIE_SECURE: false
       SESSION_COOKIE_SECURE: false
+      WEBSOCKETS_ENABLED: ${WEBSOCKETS_ENABLED:-true}
 
       # Sepay Configuration
       SEPAY_BANK_ACC: ${SEPAY_BANK_ACC}

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { useApi } from '@directus/extensions-sdk'
-import { authentication, createDirectus, realtime } from '@directus/sdk'
+import { authentication, createDirectus, realtime, rest } from '@directus/sdk'
 import { computed, nextTick, onBeforeUnmount, onMounted, onUnmounted, ref } from 'vue'
 import { useFileUpload } from './composables/useFileUpload'
 import { convertEmoticonToEmoji, handleEmojiInsert } from './utils/emoticonConverter'
@@ -20,10 +20,13 @@ interface Conversation {
   avatar: string
   lastMessage: string
   timestamp: string
+  timestampRaw: string
+  lastMessageTimestamp: number // Unix timestamp in milliseconds for accurate sorting
   unreadCount: number
   online: boolean
   type: 'group' | 'direct'
-  members?: string[]
+  members?: Array<{ id: string, name: string, avatar: string }>
+  hasRealAvatar?: boolean // Flag to check if conversation has real avatar or fallback
 }
 
 interface Message {
@@ -38,6 +41,8 @@ interface Message {
   type?: 'system' | 'user' | 'file'
   clientId?: string
   files?: FileAttachment[]
+  isEdited?: boolean
+  isUndone?: boolean
 }
 
 interface Group {
@@ -61,26 +66,30 @@ interface FileAttachment {
   height?: number
 }
 
-// interface Message {
-//   id: string
-//   direction: 'in' | 'out'
-//   text: string
-//   senderName: string
-//   time: string
-//   avatar?: string
-//   status?: 'sent' | 'delivered' | 'read'
-//   type?: 'system' | 'user' | 'file' // For system messages, user messages, and file messages
-//   files?: FileAttachment[] // For file attachments
-// }
-
 // Reactive data
 const api = useApi()
+
+// Direct Directus client for WebSocket
+const directusClient = createDirectus('http://localhost:8055')
+  .with(authentication())
+  .with(realtime())
+  .with(rest())
+
+// WebSocket state
+const websocketConnected = ref(false)
+const websocketAuthenticated = ref(false)
+
+// Subscription references
+let messageUnsubscribe: (() => void) | null = null
+let conversationUnsubscribe: (() => void) | null = null
+
 const searchQuery = ref('')
 const navSearchQuery = ref('')
 const messageSearchQuery = ref('')
 const messageText = ref('')
 const activeConversationId = ref<string>('')
 const messagesContainer = ref<HTMLElement | null>(null)
+const messageInputRef = ref<HTMLTextAreaElement | null>(null)
 const conversations = ref<Conversation[]>([])
 const messages = ref<Message[]>([])
 const loading = ref(false)
@@ -96,8 +105,12 @@ const highlightedMessageId = ref<string | null>(null)
 const showMembersDialog = ref(false)
 const memberSearchQuery = ref('')
 const selectedMembers = ref<string[]>([])
+const conversationPage = ref(1)
+const conversationLimit = ref(50)
+const hasMoreConversations = ref(true)
+const isLoadingMore = ref(false)
 
-const conversationTypeFilter = ref<'all' | 'group' | 'direct'>('all')
+const conversationListRef = ref<HTMLElement | null>(null)
 
 // File upload composable
 const {
@@ -129,16 +142,6 @@ const filterOptions = ref({
   },
 })
 
-// Groups data (unused but kept for future implementation)
-const _groups = ref<Group[]>([])
-const _groupMessages = ref<Record<string, Message[]>>({})
-
-const directusClient = createDirectus('http://localhost:8055')
-  .with(authentication())
-  .with(realtime())
-
-let subscriptionCleanup: (() => void) | null = null
-let globalSubscriptionCleanup: (() => void) | null = null
 const processedMessageIds = new Set<string>()
 
 function highlightSearchText(text: string, searchTerm: string): string {
@@ -150,23 +153,42 @@ function highlightSearchText(text: string, searchTerm: string): string {
 }
 
 function formatTime(dateString: string): string {
-  const date = new Date(dateString)
-  const now = new Date()
-  const diffMs = now.getTime() - date.getTime()
-  const diffMins = Math.floor(diffMs / 60000)
-  const diffHours = Math.floor(diffMs / 3600000)
-  const diffDays = Math.floor(diffMs / 86400000)
+  if (!dateString)
+    return ''
 
-  if (diffMins < 1)
-    return 'Vừa xong'
-  if (diffMins < 60)
-    return `${diffMins} phút trước`
-  if (diffHours < 24)
-    return `${diffHours} giờ trước`
-  if (diffDays < 7)
-    return `${diffDays} ngày trước`
+  try {
+    const date = new Date(dateString)
 
-  return date.toLocaleDateString('vi-VN', { day: '2-digit', month: '2-digit', year: 'numeric' })
+    // Validate date
+    if (!date || date.toString() === 'Invalid Date')
+      return ''
+
+    const now = new Date()
+
+    // Đảm bảo tính toán đúng múi giờ
+    const diffMs = now.getTime() - date.getTime()
+    const diffMins = Math.floor(diffMs / 60000)
+    const diffHours = Math.floor(diffMs / 3600000)
+    const diffDays = Math.floor(diffMs / 86400000)
+
+    if (diffMins < 1)
+      return 'Vừa xong'
+    if (diffMins < 60)
+      return `${diffMins} phút trước`
+    if (diffHours < 24)
+      return `${diffHours} giờ trước`
+    if (diffDays < 7)
+      return `${diffDays} ngày trước`
+
+    return date.toLocaleDateString('vi-VN', {
+      day: '2-digit',
+      month: '2-digit',
+      year: 'numeric',
+    })
+  }
+  catch {
+    return ''
+  }
 }
 
 function handleImageError(event: Event, name: string) {
@@ -232,150 +254,47 @@ const searchFilteredMessages = computed(() => {
   }))
 })
 
-function getInitials(name: string): string {
-  return name
-    .split(' ')
-    .map(word => word.charAt(0))
-    .join('')
-    .toUpperCase()
-    .slice(0, 2)
-}
-
-function clearAllFilters() {
-  filterOptions.value = {
-    status: {
-      online: false,
-      offline: false,
-    },
-    messageType: {
-      unread: false,
-      important: false,
-      archived: false,
-    },
-  }
-  showFilterDropdown.value = false
-}
-
-function applyFilters() {
-  showFilterDropdown.value = false
-}
-
 async function sendMessage() {
-  if (!messageText.value.trim())
+  if (!messageText.value.trim() || !activeConversationId.value || sendingMessage.value) {
     return
+  }
 
+  const content = messageText.value.trim()
   sendingMessage.value = true
-
-  const clientId = `client_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
-  const tempId = `temp_${Date.now()}`
+  messageText.value = ''
 
   try {
-    const tempMessage: Message = {
-      id: tempId,
-      direction: 'out',
-      text: messageText.value,
-      senderName: currentUserName.value,
-      senderId: currentUserId.value,
-      time: formatTime(new Date().toISOString()),
-      avatar: currentUserAvatar.value,
-      status: 'sent',
-      clientId,
-    }
-
-    messages.value.push(tempMessage)
-    const messageContent = messageText.value
-    messageText.value = ''
-
-    nextTick(scrollToBottom)
-
-    console.log('🔵 [SEND] Sending with clientId:', clientId)
-
-    const response = await api.post('/zalo/send', {
+    // Always use HTTP API for sending messages
+    await api.post('/zalo/send', {
       conversationId: activeConversationId.value,
-      message: messageContent,
-      clientId,
-      senderId: currentUserId.value,
+      message: content,
     })
 
-    const resultData = response.data.data
+    // Auto scroll to bottom after sending
+    nextTick(() => {
+      if (messagesContainer.value) {
+        messagesContainer.value.scrollTop = messagesContainer.value.scrollHeight
+      }
+    })
 
-    if (!response.data.success) {
-      throw new Error(response.data.message || 'Failed to send message')
-    }
-
-    console.log('✅ [SEND] Success:', resultData)
-
-    // 3. Update temp message with real data (keep it, don't remove)
-    const tempIndex = messages.value.findIndex(m => m.id === tempId)
-    if (tempIndex !== -1) {
-      // Mark as sent and add clientId for deduplication
-      messages.value[tempIndex].status = 'delivered'
-      messages.value[tempIndex].clientId = clientId
-
-      // Add to processed set to prevent duplicate from WebSocket
-      // Dùng messageId thật từ server
-      processedMessageIds.add(resultData.messageId || tempId)
-
-      console.log('✅ [SEND] Message marked as delivered, clientId:', clientId)
-    }
-
-    // Update conversation's last message preview
-    const conversation = conversations.value.find(c => c.id === activeConversationId.value)
-    if (conversation) {
-      conversation.lastMessage = messageContent.substring(0, 50)
-      conversation.timestamp = formatTime(new Date().toISOString())
-      console.log('✅ [SEND] Updated conversation preview:', conversation.name)
-    }
-
-    // WebSocket will update with real message ID when it arrives
+    // WebSocket will receive the new message automatically via subscription
+    // No need to manually update UI
   }
   catch (error: any) {
-    console.error('❌ [SEND] Error:', error.response?.data?.error || error.message || error)
-
-    // Mark temp message as failed
-    const messageIndex = messages.value.findIndex(m => m.id === tempId)
-    if (messageIndex !== -1 && messages.value[messageIndex]) {
-      messages.value[messageIndex].status = 'failed'
-    }
+    messageText.value = content
   }
   finally {
     sendingMessage.value = false
   }
 }
-async function authenticateDirectusClient() {
-  try {
-    // Lấy token từ localStorage hoặc từ Directus session
-    const token = localStorage.getItem('directus_token')
-
-    if (token) {
-      // Set token cho directusClient
-      await directusClient.setToken(token)
-      console.log('✅ DirectusClient authenticated with token')
-      return true
-    }
-    else {
-      // Nếu không có token, login với credentials
-      // HOẶC sử dụng token từ api instance
-      console.warn('⚠️ No token found for directusClient')
-      return false
-    }
-  }
-  catch (error) {
-    console.error('❌ Failed to authenticate directusClient:', error)
-    return false
-  }
-}
 async function autoLogin() {
   try {
-    // 1. Check Zalo status
     const res = await api.get('/zalo/status')
     const zaloStatus = res.data
 
     if (zaloStatus?.userId) {
       currentUserId.value = zaloStatus.userId
-      console.log('✅ Zalo user ID:', currentUserId.value)
 
-      // 2. Fetch user info
       const userResponse = await api.get('/zalo/users', {
         params: {
           userId: zaloStatus.userId,
@@ -401,119 +320,450 @@ async function autoLogin() {
         else {
           currentUserAvatar.value = `https://ui-avatars.com/api/?name=${encodeURIComponent(currentUserName.value)}`
         }
-
-        console.log('✅ Current user info:', {
-          name: currentUserName.value,
-          avatar: currentUserAvatar.value,
-        })
       }
 
-      // ✅ 3. Authenticate directusClient for WebSocket
-      const authenticated = await authenticateDirectusClient()
-
-      if (authenticated) {
-        isAuthenticated.value = true
-        console.log('✅ Authentication successful')
-      }
-      else {
-        console.warn('⚠️ DirectusClient not authenticated - WebSocket may not work')
-        isAuthenticated.value = true // Still allow app to work without WebSocket
-      }
+      isAuthenticated.value = true
     }
     else {
-      console.warn('⚠️ Could not get Zalo User ID')
       isAuthenticated.value = false
     }
   }
   catch (error: any) {
-    console.error('❌ DirectusZalo auth failed:', error.message || error)
     isAuthenticated.value = false
+  }
+}
+
+// Initialize WebSocket connection using direct Directus SDK
+async function initializeWebSocket() {
+  try {
+    // Get session token from endpoint
+    const tokenResponse = await api.get('/zalo/get-session-token')
+    const sessionToken = tokenResponse.data?.sessionToken
+
+    if (!sessionToken) {
+      return
+    }
+
+    // Set token and connect
+    await directusClient.setToken(sessionToken)
+    await directusClient.connect()
+
+    websocketConnected.value = true
+    websocketAuthenticated.value = true
+
+    // Subscribe to global conversations for real-time updates
+    await subscribeToAllConversations()
+
+    // Subscribe to messages for active conversation if any
+    if (activeConversationId.value) {
+      await subscribeToConversationMessages(activeConversationId.value)
+    }
+  }
+  catch (error) {
+    // Silent fail
+  }
+}
+
+// Subscribe to all conversations for global updates
+async function subscribeToAllConversations() {
+  try {
+    // Subscribe to conversation creation
+    const createSub = await directusClient.subscribe('zalo_conversations', {
+      event: 'create',
+      query: {
+        fields: ['*'],
+      },
+      uid: 'conversations-create',
+    })
+
+    // Subscribe to conversation updates (when new messages arrive)
+    const updateSub = await directusClient.subscribe('zalo_conversations', {
+      event: 'update',
+      query: {
+        fields: ['*'],
+      },
+      uid: 'conversations-update',
+    })
+
+    // Store unsubscribe functions
+    const unsubscribeCreate = createSub.unsubscribe
+    const unsubscribeUpdate = updateSub.unsubscribe
+
+    conversationUnsubscribe = () => {
+      unsubscribeCreate()
+      unsubscribeUpdate()
+    }
+
+    // Process create events in background
+    ;(async () => {
+      for await (const item of createSub.subscription) {
+        if (item.type === 'subscription' && item.event === 'create') {
+          const conversationData = item.data[0]
+          handleNewConversationCreated({ data: conversationData })
+        }
+      }
+    })().catch(() => {})
+
+    // Process update events in background
+    ;(async () => {
+      for await (const item of updateSub.subscription) {
+        if (item.type === 'subscription' && item.event === 'update') {
+          const conversationData = item.data[0]
+          handleConversationUpdate({ data: conversationData })
+        }
+      }
+    })().catch(() => {})
+  }
+  catch (error) {
+    // Silent fail
+  }
+}
+
+// Subscribe to messages for a specific conversation
+async function subscribeToConversationMessages(conversationId: string) {
+  try {
+    // Unsubscribe from previous conversation if any
+    if (messageUnsubscribe) {
+      messageUnsubscribe()
+      messageUnsubscribe = null
+    }
+
+    const { subscription, unsubscribe } = await directusClient.subscribe('zalo_messages', {
+      event: 'create',
+      query: {
+        fields: ['*', 'sender_id.*'],
+        filter: {
+          conversation_id: {
+            _eq: conversationId,
+          },
+        },
+        sort: ['sent_at'],
+      },
+      uid: `messages-${conversationId}`,
+    })
+
+    messageUnsubscribe = unsubscribe
+
+    // Process events in background
+    ;(async () => {
+      for await (const item of subscription) {
+        if (item.type === 'subscription' && item.event === 'create') {
+          const messageData = item.data[0]
+
+          // Check for duplicates
+          if (processedMessageIds.has(messageData.id)) {
+            continue
+          }
+
+          processedMessageIds.add(messageData.id)
+
+          handleNewMessage({
+            conversationId,
+            message: messageData,
+          })
+        }
+      }
+    })().catch(() => {})
+  }
+  catch (error) {
+    // Silent fail
+  }
+}
+
+// Disconnect WebSocket
+async function disconnectWebSocket() {
+  try {
+    if (messageUnsubscribe) {
+      messageUnsubscribe()
+      messageUnsubscribe = null
+    }
+
+    if (conversationUnsubscribe) {
+      conversationUnsubscribe()
+      conversationUnsubscribe = null
+    }
+
+    await directusClient.disconnect()
+
+    websocketConnected.value = false
+    websocketAuthenticated.value = false
+  }
+  catch (error) {
+    // Silent fail
+  }
+}
+
+function handleNewMessage(data: any) {
+  // Extract message data (could be wrapped or direct)
+  const messageData = data.message || data.data || data
+  const conversationId = data.conversationId || messageData.conversation_id
+
+  if (conversationId !== activeConversationId.value) {
+    // Still update conversation preview even if not active
+    updateConversationOnNewMessage(conversationId, messageData)
+    return
+  }
+
+  const messageId = messageData.id
+  const exists = messages.value.some(m => m.id === messageId)
+
+  if (!exists) {
+    // Handle nested sender_id from ItemsService (could be {id, display_name, avatar_url} or just string)
+    const senderIdRaw = messageData.sender_id || messageData.senderId
+    const senderId = typeof senderIdRaw === 'object' ? senderIdRaw?.id : senderIdRaw
+    const senderName = typeof senderIdRaw === 'object' ? senderIdRaw?.display_name : (messageData.sender_name || messageData.senderName || 'Unknown')
+    const senderAvatar = typeof senderIdRaw === 'object' ? senderIdRaw?.avatar_url : messageData.avatar
+
+    const direction = senderId === currentUserId.value ? 'out' : 'in'
+
+    messages.value.push({
+      id: messageId,
+      direction,
+      text: messageData.content || messageData.text || '',
+      senderName,
+      senderId,
+      time: messageData.sent_at || messageData.time || new Date().toISOString(),
+      avatar: senderAvatar,
+      status: direction === 'out' ? 'sent' : undefined,
+      files: messageData.attachments,
+      isEdited: messageData.is_edited || messageData.isEdited || false,
+      isUndone: messageData.is_undone || messageData.isUndone || false,
+      clientId: messageData.client_id || messageData.clientId,
+    })
+
+    updateConversationOnNewMessage(conversationId, messageData)
+
+    // Auto scroll to bottom
+    nextTick(() => {
+      if (messagesContainer.value) {
+        messagesContainer.value.scrollTop = messagesContainer.value.scrollHeight
+      }
+    })
+  }
+}
+
+function handleConversationUpdate(data: any) {
+  const conversationData = data.data
+  const conversationId = conversationData.id
+
+  const index = conversations.value.findIndex(c => c.id === conversationId)
+
+  if (index !== -1 && conversations.value[index]) {
+    // Get timestamp from last_message_time or date_updated
+    const rawTimestamp = conversationData.last_message_time
+      || conversationData.date_updated
+      || conversationData.timestamp
+      || new Date().toISOString()
+    const newTimestamp = new Date(rawTimestamp).getTime()
+
+    // Create new object to trigger Vue reactivity
+    conversations.value[index] = {
+      ...conversations.value[index]!,
+      lastMessage: conversationData.last_message || conversations.value[index]!.lastMessage,
+      timestamp: formatTime(rawTimestamp),
+      timestampRaw: rawTimestamp,
+      lastMessageTimestamp: newTimestamp,
+      unreadCount: conversationData.unread_count ?? conversations.value[index]!.unreadCount,
+    }
+
+    sortConversations()
+  }
+}
+
+function handleNewConversationCreated(data: any) {
+  const conversationData = data.data
+  const exists = conversations.value.some(c => c.id === conversationData.id)
+
+  if (!exists) {
+    const rawTimestamp = conversationData.timestamp || new Date().toISOString()
+    const timestampMs = new Date(rawTimestamp).getTime()
+
+    conversations.value.unshift({
+      id: conversationData.id,
+      name: conversationData.name || 'Unknown',
+      avatar: conversationData.avatar || `https://ui-avatars.com/api?name=U&background=random`,
+      lastMessage: conversationData.lastMessage || '',
+      timestamp: formatTime(rawTimestamp),
+      timestampRaw: rawTimestamp,
+      lastMessageTimestamp: timestampMs,
+      unreadCount: conversationData.unreadCount || 0,
+      online: true,
+      type: conversationData.type || 'direct',
+      members: [],
+      hasRealAvatar: !!conversationData.avatar,
+    })
+
+    sortConversations()
+  }
+}
+
+function unsubscribeFromMessages() {
+  if (messageUnsubscribe) {
+    messageUnsubscribe()
+    messageUnsubscribe = null
+  }
+}
+
+function unsubscribeFromConversations() {
+  if (conversationUnsubscribe) {
+    conversationUnsubscribe()
+    conversationUnsubscribe = null
   }
 }
 
 let isSelectingConversation = false
 
 function selectConversation(id: string) {
-  if (isSelectingConversation) {
-    console.log('⏭️ Already selecting conversation, skipping')
+  if (isSelectingConversation)
     return
-  }
-
-  if (activeConversationId.value === id) {
-    console.log('⏭️ Conversation already active:', id)
+  if (activeConversationId.value === id)
     return
-  }
 
   isSelectingConversation = true
 
-  console.log('🔵 Selecting conversation:', id)
+  // Unsubscribe from old conversation messages
+  unsubscribeFromMessages()
 
   activeConversationId.value = id
   messages.value = []
 
-  // Reset unread count when selecting conversation
   const conversation = conversations.value.find(c => c.id === id)
   if (conversation && conversation.unreadCount > 0) {
-    console.log('✅ Clearing', conversation.unreadCount, 'unread messages for', conversation.name)
     conversation.unreadCount = 0
   }
 
   loadMessages(id).finally(() => {
-    if (isAuthenticated.value) {
-      subscribeToMessages(id)
+    // Subscribe to new conversation messages via WebSocket
+    if (websocketConnected.value && websocketAuthenticated.value) {
+      subscribeToConversationMessages(id)
     }
+
     isSelectingConversation = false
   })
 }
 
-async function loadConversations() {
+function sortConversations() {
+  conversations.value.sort((a, b) => {
+    if (b.lastMessageTimestamp !== a.lastMessageTimestamp) {
+      return b.lastMessageTimestamp - a.lastMessageTimestamp
+    }
+    if (b.unreadCount !== a.unreadCount) {
+      return b.unreadCount - a.unreadCount
+    }
+    return a.name.localeCompare(b.name)
+  })
+}
+
+async function loadConversations(append = false) {
   if (!isAuthenticated.value) {
-    console.warn('⚠️ Not authenticated')
-    conversations.value = [] // ✅ Set empty
+    conversations.value = []
     return
   }
 
   try {
-    loading.value = true
-    isLoadingConversations.value = true
+    if (!append) {
+      loading.value = true
+      isLoadingConversations.value = true
+      conversationPage.value = 1
+    }
+    else {
+      isLoadingMore.value = true
+    }
 
-    const convResponse = await api.get('zalo/conversations')
-    const data = convResponse.data.data || [] // ✅ Fallback to []
+    const convResponse = await api.get('/zalo/index', {
+      params: {
+        page: conversationPage.value,
+        limit: conversationLimit.value,
+      },
+    })
 
-    console.log(`📥 Loaded ${data.length} conversations`)
+    const data = convResponse.data.data
+    const meta = convResponse.data.meta
 
-    // ✅ Map với safe defaults
-    conversations.value = data.map((conv: any) => ({
-      id: conv.id,
-      name: conv.name || 'Unknown',
-      avatar: conv.avatar || 'https://ui-avatars.com/api/?name=U&background=random',
-      lastMessage: '',
-      timestamp: formatTime(conv.timestamp || new Date().toISOString()),
-      unreadCount: conv.unreadCount || 0,
-      online: true,
-      type: conv.type || 'direct',
-      members: Array.isArray(conv.members)
-        ? conv.members.map((m: any) => ({
-            id: m.id,
-            name: m.name || 'Unknown',
-            avatar: m.avatar || 'https://ui-avatars.com/api/?name=U&background=random',
-          }))
-        : [],
-      hasRealAvatar: !!conv.avatar && !conv.avatar.includes('ui-avatars.com'),
-    }))
+    if (!meta) {
+      return
+    }
 
-    // ✅ Only select if has data
-    if (conversations.value.length > 0 && !activeConversationId.value) {
-      selectConversation(conversations.value[0].id)
+    const newConversations = data.map((conv: any) => {
+      const rawTimestamp = conv.timestamp || conv.lastMessageTime || new Date().toISOString()
+      const timestampDate = new Date(rawTimestamp)
+      const timestampMs = timestampDate.getTime()
+
+      return {
+        id: conv.id,
+        name: conv.name || 'Unknown',
+        avatar: conv.avatar || `https://ui-avatars.com/api?name=U&background=random`,
+        lastMessage: conv.lastMessage || '',
+        timestamp: formatTime(rawTimestamp),
+        timestampRaw: rawTimestamp,
+        lastMessageTimestamp: timestampMs,
+        unreadCount: conv.unreadCount || 0,
+        online: true,
+        type: conv.type || 'direct',
+        members: Array.isArray(conv.members)
+          ? conv.members.map((m: any) => ({
+              id: m.id,
+              name: m.name || 'Unknown',
+              avatar: m.avatar || `https://ui-avatars.com/api?name=U&background=random`,
+            }))
+          : [],
+        hasRealAvatar: !!conv.avatar && !conv.avatar.includes('ui-avatars.com'),
+      }
+    })
+
+    if (append) {
+      const existingIds = new Set(conversations.value.map(c => c.id))
+      const uniqueNew = newConversations.filter((c: Conversation) => !existingIds.has(c.id))
+      conversations.value.push(...uniqueNew)
+    }
+    else {
+      conversations.value = newConversations
+    }
+
+    sortConversations()
+
+    hasMoreConversations.value = meta.hasMore
+
+    if (!append && conversations.value.length > 0 && !activeConversationId.value) {
+      const firstConversation = conversations.value[0]
+      if (firstConversation) {
+        selectConversation(firstConversation.id)
+      }
     }
   }
   catch (error: any) {
-    console.error('❌ Error loading conversations:', error)
-    conversations.value = [] // ✅ Set empty on error
+    if (!append) {
+      conversations.value = []
+    }
   }
   finally {
     loading.value = false
     isLoadingConversations.value = false
+    isLoadingMore.value = false
+  }
+}
+
+async function loadMoreConversations() {
+  if (isLoadingMore.value || !hasMoreConversations.value) {
+    return
+  }
+
+  conversationPage.value++
+
+  await loadConversations(true) // append = true
+}
+
+function handleConversationScroll(event: Event) {
+  const target = event.target as HTMLElement
+  const scrollTop = target.scrollTop
+  const scrollHeight = target.scrollHeight
+  const clientHeight = target.clientHeight
+  const distanceToBottom = scrollHeight - scrollTop - clientHeight
+
+  const threshold = 200
+
+  if (distanceToBottom < threshold && !isLoadingMore.value && hasMoreConversations.value) {
+    loadMoreConversations()
   }
 }
 
@@ -522,16 +772,12 @@ async function loadMessages(conversationId: string) {
     return
 
   if (isLoadingMessages.value) {
-    console.log('Already loading messages')
     return
   }
-
-  console.log('✅ Loading initial messages for:', conversationId)
 
   try {
     isLoadingMessages.value = true
 
-    // Get current user ID if needed
     if (currentUserId.value === 'system') {
       try {
         const meResponse = await api.get('/users/me', {
@@ -544,22 +790,14 @@ async function loadMessages(conversationId: string) {
           currentUserId.value = me.id
         }
       }
-      catch (e) {
-        console.warn('Could not get current user ID', e)
+      catch {
+        // Silently fail - will use default 'system'
       }
     }
 
-    // ✅ Fetch messages - backend returns enriched data
     const messagesResponse = await api.get(`/zalo/messages/${conversationId}`)
     const data = messagesResponse.data.data
 
-    console.log('✅ Raw messages from backend:', data)
-    console.log('✅ First message:', data[0])
-
-    // ✅ BACKEND ĐÃ ENRICH DATA - Không cần fetch users nữa!
-    // Backend đã trả về senderName, avatar, direction, etc.
-
-    // Map messages - chỉ cần map structure cho UI
     messages.value = data.map((msg: any) => ({
       id: msg.id,
       direction: msg.direction,
@@ -576,11 +814,15 @@ async function loadMessages(conversationId: string) {
       clientId: msg.clientId,
     }))
 
-    console.log('✅ Loaded', messages.value.length, 'messages')
-    nextTick(scrollToBottom)
+    // Auto scroll to bottom after loading
+    nextTick(() => {
+      if (messagesContainer.value) {
+        messagesContainer.value.scrollTop = messagesContainer.value.scrollHeight
+      }
+    })
   }
   catch (error: any) {
-    console.error('❌ Error loading messages:', error)
+    // Silent fail
   }
   finally {
     isLoadingMessages.value = false
@@ -589,262 +831,27 @@ async function loadMessages(conversationId: string) {
 
 function updateConversationOnNewMessage(conversationId: string, message: any) {
   const convIndex = conversations.value.findIndex(c => c.id === conversationId)
-
-  if (convIndex === -1) {
-    console.warn('⚠️ Conversation not found:', conversationId)
+  if (convIndex === -1)
     return
-  }
 
   const conversation = conversations.value[convIndex]
   if (!conversation)
     return
 
-  // ✅ SỬA: Sử dụng content thay vì text (hoặc fallback)
   const messagePreview = message.content || message.text || ''
-  conversation.lastMessage = messagePreview.substring(0, 50)
-  conversation.timestamp = message.time || message.sentat || formatTime(new Date().toISOString())
+  const messageTime = message.sent_at || message.time || message.sentAt || new Date().toISOString()
+  const messageTimestamp = new Date(messageTime).getTime()
 
-  // If not the active conversation, increment unread count
+  conversation.lastMessage = messagePreview.substring(0, 50)
+  conversation.timestamp = formatTime(messageTime)
+  conversation.timestampRaw = messageTime
+  conversation.lastMessageTimestamp = messageTimestamp
+
   if (conversationId !== activeConversationId.value) {
     conversation.unreadCount = (conversation.unreadCount || 0) + 1
-    console.log('📬 Updated unread count for', conversation.name, ':', conversation.unreadCount)
   }
 
-  // Move conversation to top of list
-  if (convIndex > 0) {
-    conversations.value.splice(convIndex, 1)
-    conversations.value.unshift(conversation)
-    console.log('⬆️ Moved conversation to top:', conversation.name)
-  }
-}
-
-// Subscribe to ALL conversations messages (global subscription)
-async function subscribeToAllConversations() {
-  if (globalSubscriptionCleanup) {
-    console.log('🔴 Cleaning up previous global subscription')
-    globalSubscriptionCleanup()
-    globalSubscriptionCleanup = null
-  }
-
-  console.log('🌐 [GLOBAL] Starting global message subscription')
-
-  try {
-    // ✅ directusClient VẪN DÙNG ĐỂ SUBSCRIBE
-    const { subscription, unsubscribe } = await directusClient.subscribe('/zalo_messages', {
-      event: 'create',
-      query: {
-        fields: ['*'],
-        // No filter - subscribe to ALL messages
-        sort: ['sent_at'],
-      },
-      uid: 'messages-global',
-    })
-
-    globalSubscriptionCleanup = unsubscribe
-    console.log('✅ [GLOBAL] Global subscription active')
-
-    // Handle messages
-    ;(async () => {
-      for await (const item of subscription) {
-        if (item.type === 'subscription' && item.event === 'init') {
-          console.log('✅ [GLOBAL] Global subscription initialized')
-        }
-        else if (item.type === 'subscription' && item.event === 'create') {
-          if (!item.data || item.data.length === 0)
-            continue
-
-          const newMsg = item.data[0]
-          if (!newMsg?.id || !newMsg?.conversation_id)
-            continue
-
-          console.log('📨 [GLOBAL] New message in conversation:', newMsg.conversation_id)
-
-          // If message is NOT for active conversation, update conversation list
-          if (newMsg.conversation_id !== activeConversationId.value) {
-            // Fetch sender info for preview
-            let senderName = 'Unknown'
-            if (newMsg.sender_id) {
-              try {
-                // ✅ DÙNG api.get() ĐỂ LẤY USER INFO
-                const userResponse = await api.get(`/zalo/users/${newMsg.sender_id}`)
-
-                const user = userResponse.data.data[0]
-                if (user) {
-                  senderName = user.display_name || user.zalo_name || 'Unknown'
-                }
-              }
-              catch (e) {
-                console.warn('Could not fetch sender info:', e)
-              }
-            }
-
-            const messagePreview = {
-              text: newMsg.content || '',
-              time: formatTime(newMsg.sent_at),
-              senderName,
-            }
-
-            updateConversationOnNewMessage(newMsg.conversation_id, messagePreview)
-          }
-          // If message IS for active conversation, it's already handled by subscribeToMessages
-        }
-      }
-    })()
-  }
-  catch (error) {
-    console.error('❌ [GLOBAL] Failed to subscribe:', error)
-  }
-}
-
-async function subscribeToMessages(conversationId: string) {
-  if (subscriptionCleanup) {
-    console.log('🔴 Unsubscribing from previous conversation')
-    subscriptionCleanup()
-    subscriptionCleanup = null
-  }
-
-  if (!conversationId)
-    return
-
-  console.log('🔵 [SUBSCRIBE] Starting subscription for:', conversationId)
-  console.log('🔵 [SUBSCRIBE] Current messages count:', messages.value.length)
-  console.log('🔵 [SUBSCRIBE] Current user ID:', currentUserId.value)
-  processedMessageIds.clear()
-
-  try {
-    // ✅ directusClient VẪN DÙNG ĐỂ SUBSCRIBE
-    const { subscription, unsubscribe } = await directusClient.subscribe('/zalo_messages', {
-      event: 'create',
-      query: {
-        fields: ['*'],
-        filter: {
-          conversation_id: { _eq: conversationId },
-        },
-        sort: ['sent_at'],
-      },
-      uid: `messages-${conversationId}`,
-    })
-
-    subscriptionCleanup = unsubscribe
-    console.log('✅ [SUBSCRIBE] Subscribed with UID:', `messages-${conversationId}`)
-    console.log('✅ [SUBSCRIBE] Listening for new messages in conversation:', conversationId)
-
-    // Handle messages
-    ;(async () => {
-      for await (const item of subscription) {
-        console.log('📩 [WEBSOCKET] Event received:', {
-          type: item.type,
-          event: item.event,
-          hasData: !!item.data,
-        })
-
-        if (item.type === 'subscription' && item.event === 'init') {
-          console.log('✅ [SUBSCRIBE] Subscription initialized for:', conversationId)
-        }
-        else if (item.type === 'subscription' && item.event === 'create') {
-          if (!item.data || item.data.length === 0) {
-            console.warn('⚠️ [WEBSOCKET] Empty data received')
-            continue
-          }
-
-          const newMsg = item.data[0]
-
-          if (!newMsg?.id) {
-            console.warn('⚠️ [WEBSOCKET] Invalid message structure:', newMsg)
-            continue
-          }
-
-          console.log('📨 [WEBSOCKET] New message received:', {
-            id: newMsg.id,
-            conversationId: newMsg.conversation_id,
-            senderId: newMsg.sender_id,
-            clientId: newMsg.client_id,
-            content: `${newMsg.content?.substring(0, 20)}...`,
-          })
-
-          if (processedMessageIds.has(newMsg.id)) {
-            console.log('⏭️ [DEDUPE] Already processed message:', newMsg.id)
-            continue
-          }
-
-          // Check duplicate by ID or client_id
-          const exists = messages.value.some(m =>
-            m.id === newMsg.id
-            || (newMsg.client_id && m.clientId === newMsg.client_id),
-          )
-
-          if (exists) {
-            console.log('⏭️ Message already exists:', newMsg.id)
-            continue
-          }
-
-          processedMessageIds.add(newMsg.id)
-
-          // Fetch sender info
-          let senderName = 'Unknown'
-          let senderAvatar = ''
-
-          if (newMsg.sender_id) {
-            try {
-              // ✅ DÙNG api.get() ĐỂ LẤY USER INFO
-              const userResponse = await api.get(`/zalo/users/${newMsg.sender_id}`)
-
-              const user = userResponse.data.data[0]
-
-              if (user) {
-                senderName = user.display_name || user.zalo_name || 'Unknown'
-
-                // Proxy Zalo avatar URLs to avoid CORS
-                if (user.avatar_url) {
-                  if (user.avatar_url.startsWith('https://s120-ava-talk.zadn.vn/')
-                    || user.avatar_url.startsWith('https://ava-grp-talk.zadn.vn/')) {
-                    senderAvatar = `http://localhost:8055/zalo/avatar-proxy?url=${encodeURIComponent(user.avatar_url)}`
-                  }
-                  else {
-                    senderAvatar = user.avatar_url
-                  }
-                }
-                else {
-                  senderAvatar = `https://ui-avatars.com/api/?name=${encodeURIComponent(senderName)}`
-                }
-              }
-            }
-            catch (e) {
-              console.warn('Could not fetch sender info:', e)
-            }
-          }
-
-          const direction: 'in' | 'out' = newMsg.sender_id === currentUserId.value ? 'out' : 'in'
-
-          const messageToAdd = {
-            id: newMsg.id,
-            direction,
-            text: newMsg.content || '',
-            content: newMsg.content || '', // ✅ SỬA: content thay vì contend
-            senderName,
-            senderId: newMsg.sender_id,
-            time: formatTime(newMsg.sent_at),
-            avatar: senderAvatar,
-            status: direction === 'out' ? 'delivered' : undefined,
-            clientId: newMsg.client_id,
-            files: newMsg.attachments || [],
-            reactions: newMsg.reactions || [],
-          }
-
-          messages.value.push(messageToAdd)
-
-          // ✅ SỬA: conversation_id thay vì conversationid
-          updateConversationOnNewMessage(newMsg.conversation_id, messageToAdd)
-
-          console.log('✅ [ADDED] New message to UI:', messageToAdd.id)
-          nextTick(scrollToBottom)
-        }
-      }
-    })()
-  }
-  catch (error) {
-    console.error('❌ [SUBSCRIBE] Failed to subscribe:', error)
-  }
+  sortConversations()
 }
 
 function autoResize(event: Event) {
@@ -853,10 +860,16 @@ function autoResize(event: Event) {
   textarea.style.height = `${Math.min(textarea.scrollHeight, 120)}px`
 }
 
-// File Upload Functions (commented out - not fully implemented in BE yet)
-// ... (Không thay đổi)
+function insertEmoji(event: any) {
+  const emoji = event?.emoji || event?.data || event?.native || event
 
-// Members dialog functions
+  if (!emoji || typeof emoji !== 'string') {
+    return
+  }
+
+  handleEmojiInsert(emoji, messageInputRef, messageText)
+}
+
 function toggleMemberSelection(memberId: string) {
   const index = selectedMembers.value.indexOf(memberId)
   if (index > -1) {
@@ -874,17 +887,14 @@ function removeMember(memberId: string) {
   }
 }
 
-// Get active conversation object
 const activeConversation = computed(() => {
-  // ✅ ADD: Null check
   if (!activeConversationId.value || !conversations.value) {
     return null
   }
   return conversations.value.find(c => c.id === activeConversationId.value) || null
 })
 
-// Conversation stats by type
-const conversationStats = computed(() => {
+computed(() => {
   const all = conversations.value.length
   const group = conversations.value.filter(c => c.type === 'group').length
   const direct = conversations.value.filter(c => c.type === 'direct').length
@@ -892,47 +902,27 @@ const conversationStats = computed(() => {
   return { all, group, direct }
 })
 
-// Get current messages (all messages are in messages.value now)
 const currentMessages = computed(() => {
   return messages.value
 })
 
-// Get selected member objects
 const selectedMemberObjects = computed(() => {
   return conversations.value.filter(member =>
     selectedMembers.value.includes(member.id),
   )
 })
 
-// Create group function (commented out - not implemented in BE yet)
-// function createGroup() {
-//   if (selectedMembers.value.length === 0) {
-//     return
-//   }
-//   // Group creation logic not implemented
-// }
-
-function scrollToBottom() {
-  if (messagesContainer.value) {
-    messagesContainer.value.scrollTop = messagesContainer.value.scrollHeight
-  }
-}
-
 function navigateToMessage(messageId: string) {
-  // Highlight the message
   highlightedMessageId.value = messageId
 
-  // Wait for next tick to ensure DOM is updated
   nextTick(() => {
     const messageElement = document.querySelector(`[data-message-id="${messageId}"]`)
     if (messageElement && messagesContainer.value) {
-      // Scroll to the message
       messageElement.scrollIntoView({
         behavior: 'smooth',
         block: 'center',
       })
 
-      // Remove highlight after 3 seconds
       setTimeout(() => {
         highlightedMessageId.value = null
       }, 3000)
@@ -966,47 +956,36 @@ function handleClickOutside(event: Event) {
   }
 }
 
-// Lifecycle hooks
 onMounted(async () => {
   try {
-    console.log('🚀 Chat module mounted')
-
     await autoLogin()
 
-    // ✅ ADD: Check authenticated before loading
     if (isAuthenticated.value) {
       await loadConversations()
-      subscribeToAllConversations()
+      await initializeWebSocket()
     }
     else {
-      console.log('⚠️ Not authenticated, showing empty state')
-      conversations.value = [] // ✅ Set empty array
+      conversations.value = []
     }
   }
   catch (error: any) {
-    console.error('❌ Error in onMounted:', error)
-    conversations.value = [] // ✅ Set empty on error
+    conversations.value = []
   }
 })
 
 onBeforeUnmount(() => {
-  console.log('🧹 Cleaning up WebSocket')
-
-  if (subscriptionCleanup) {
-    subscriptionCleanup()
-  }
-  if (globalSubscriptionCleanup) {
-    globalSubscriptionCleanup()
-  }
-
-  directusClient.disconnect()
+  unsubscribeFromMessages()
+  unsubscribeFromConversations()
+  disconnectWebSocket()
 })
 
 onUnmounted(() => {
+  unsubscribeFromMessages()
+  unsubscribeFromConversations()
+  disconnectWebSocket()
   document.removeEventListener('click', handleClickOutside)
 })
 
-// Filtered members for search
 const filteredMembers = computed(() => {
   if (!memberSearchQuery.value.trim()) {
     return conversations.value
@@ -1016,8 +995,6 @@ const filteredMembers = computed(() => {
     member.name.toLowerCase().includes(memberSearchQuery.value.toLowerCase()),
   )
 })
-
-// End of script
 </script>
 
 <template>
@@ -1160,7 +1137,7 @@ const filteredMembers = computed(() => {
                 <div class="flex-1 min-w-0">
                   <div class="flex items-center gap-2 mb-1 justify-between">
                     <span class="text-sm font-semibold text-gray-900">{{ message.senderName }}</span>
-                    <span class="text-xs text-gray-500">{{ message.time }}</span>
+                    <span class="text-xs text-gray-500">{{ formatTime(message.time) }}</span>
                   </div>
                   <p class="text-sm text-gray-600 leading-relaxed" v-html="message.highlightedText" />
                 </div>
@@ -1368,13 +1345,14 @@ const filteredMembers = computed(() => {
           </div>
         </div>
       </div>
-      <div v-if="conversations.length === 0 && !loading" class="p-4 text-center">
-        <p class="text-text-muted text-sm">
-          No conversations yet
-        </p>
-      </div>
+
       <!-- Conversation List -->
-      <div class="flex-1 overflow-y-auto">
+      <div
+        ref="conversationListRef"
+        class="flex-1 overflow-y-auto scroll-style"
+        style="max-height: calc(100vh - 200px);"
+        @scroll="handleConversationScroll"
+      >
         <div class="p-2 space-y-1">
           <div
             v-for="conversation in filteredConversations"
@@ -1498,7 +1476,7 @@ const filteredMembers = computed(() => {
                     {{ conversation.name }}
                   </h4>
                   <span class="text-xs ml-2 flex-shrink-0 text-text-muted">
-                    {{ conversation.timestamp }}
+                    {{ formatTime(conversation.timestampRaw) }}
                   </span>
                 </div>
 
@@ -1517,6 +1495,28 @@ const filteredMembers = computed(() => {
                 conversation.unreadCount > 99 ? "99+" : conversation.unreadCount
               }}
             </div>
+          </div>
+
+          <!-- Loading More Indicator -->
+          <div
+            v-if="isLoadingMore"
+            class="flex items-center justify-center py-4"
+          >
+            <div class="flex items-center gap-2 text-sm text-gray-500">
+              <svg class="animate-spin h-4 w-4" fill="none" viewBox="0 0 24 24">
+                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" />
+                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+              </svg>
+              <span>Loading more...</span>
+            </div>
+          </div>
+
+          <!-- End of List Indicator -->
+          <div
+            v-else-if="!hasMoreConversations && conversations.length > 0"
+            class="flex items-center justify-center py-4"
+          >
+            <span class="text-xs text-gray-400">No more conversations</span>
           </div>
         </div>
       </div>
@@ -1768,7 +1768,7 @@ const filteredMembers = computed(() => {
                       {{ message.senderName }}
                     </span>
                     <span class="text-xs text-text-muted">
-                      {{ message.time }}
+                      {{ formatTime(message.time) }}
                     </span>
                   </div>
 
@@ -2127,8 +2127,24 @@ const filteredMembers = computed(() => {
                 @input="onSelectFromLibrary"
               />
             </Story>
-            <VEmojiPicker @emoji-selected="logEvent('emoji-selected', $event)">
-              My Button
+            <VEmojiPicker
+              @select="insertEmoji($event)"
+              @emoji-click="insertEmoji($event)"
+              @emoji-selected="insertEmoji($event)"
+              @input="insertEmoji($event)"
+              @change="insertEmoji($event)"
+            >
+              <template #button>
+                <button
+                  class="w-8 h-8 flex items-center justify-center rounded-md bg-transparent hover:bg-neutral-100 text-text-muted hover:text-text-secondary transition-colors"
+                  type="button"
+                >
+                  <svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
+                    <path d="M10 18.3333C14.6024 18.3333 18.3333 14.6024 18.3333 10C18.3333 5.39763 14.6024 1.66667 10 1.66667C5.39763 1.66667 1.66667 5.39763 1.66667 10C1.66667 14.6024 5.39763 18.3333 10 18.3333Z" stroke="currentColor" stroke-width="1.5" />
+                    <path d="M6.66667 11.6667C6.66667 11.6667 7.91667 13.3333 10 13.3333C12.0833 13.3333 13.3333 11.6667 13.3333 11.6667M7.5 7.5H7.50833M12.5 7.5H12.5083" stroke="currentColor" stroke-width="1.5" />
+                  </svg>
+                </button>
+              </template>
             </VEmojiPicker>
             <button
               class="w-8 h-8 flex items-center justify-center rounded-md bg-transparent hover:bg-neutral-100 text-text-muted hover:text-text-secondary transition-colors"
@@ -2153,6 +2169,7 @@ const filteredMembers = computed(() => {
 
           <div class="flex-1 flex items-end gap-2">
             <textarea
+              ref="messageInputRef"
               v-model="messageText"
               placeholder="Type your message here..."
               rows="1"
