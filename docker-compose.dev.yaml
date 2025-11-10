@@ -125,7 +125,6 @@ services:
       EMAIL_SMTP_SECURE: false
 
       # Other Settings
-      WEBSOCKETS_ENABLED: ${WEBSOCKETS_ENABLED:-true}
       CORS_ENABLED: ${CORS_ENABLED:-true}
       CORS_ORIGIN: ${CORS_ORIGIN:-true}
       EXTENSIONS_PATH: /directus/extensions

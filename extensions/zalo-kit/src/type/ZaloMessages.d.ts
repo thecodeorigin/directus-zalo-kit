@@ -1,6 +1,6 @@
 import type { PrimaryKey } from '@directus/types'
 
-export interface ZaloMessage {
+export interface ZaloMessageType {
   id: PrimaryKey
   conversation_id: PrimaryKey
   sender_id?: PrimaryKey
