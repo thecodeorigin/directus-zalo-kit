@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { useApi } from '@directus/extensions-sdk'
-import { authentication, createDirectus, readItems, readMe, realtime, rest } from '@directus/sdk'
-import { computed, nextTick, onBeforeUnmount, onMounted, onUnmounted, ref, watch } from 'vue'
+import { authentication, createDirectus, realtime } from '@directus/sdk'
+import { computed, nextTick, onBeforeUnmount, onMounted, onUnmounted, ref } from 'vue'
 import { useFileUpload } from './composables/useFileUpload'
-import { client } from './utils/sdk'
+import { convertEmoticonToEmoji, handleEmojiInsert } from './utils/emoticonConverter'
 
 const currentFunction = ref<string | null>(null)
 
@@ -61,17 +61,17 @@ interface FileAttachment {
   height?: number
 }
 
-interface Message {
-  id: string
-  direction: 'in' | 'out'
-  text: string
-  senderName: string
-  time: string
-  avatar?: string
-  status?: 'sent' | 'delivered' | 'read'
-  type?: 'system' | 'user' | 'file' // For system messages, user messages, and file messages
-  files?: FileAttachment[] // For file attachments
-}
+// interface Message {
+//   id: string
+//   direction: 'in' | 'out'
+//   text: string
+//   senderName: string
+//   time: string
+//   avatar?: string
+//   status?: 'sent' | 'delivered' | 'read'
+//   type?: 'system' | 'user' | 'file' // For system messages, user messages, and file messages
+//   files?: FileAttachment[] // For file attachments
+// }
 
 // Reactive data
 const api = useApi()
@@ -133,17 +133,14 @@ const filterOptions = ref({
 const _groups = ref<Group[]>([])
 const _groupMessages = ref<Record<string, Message[]>>({})
 
-// Directus WebSocket client
 const directusClient = createDirectus('http://localhost:8055')
   .with(authentication())
   .with(realtime())
-  .with(rest())
 
 let subscriptionCleanup: (() => void) | null = null
 let globalSubscriptionCleanup: (() => void) | null = null
 const processedMessageIds = new Set<string>()
 
-// Helper function to highlight search text
 function highlightSearchText(text: string, searchTerm: string): string {
   if (!searchTerm.trim())
     return text
@@ -152,7 +149,6 @@ function highlightSearchText(text: string, searchTerm: string): string {
   return text.replace(regex, '<mark class="bg-yellow-200 px-1 rounded">$1</mark>')
 }
 
-// Format time helper
 function formatTime(dateString: string): string {
   const date = new Date(dateString)
   const now = new Date()
@@ -173,17 +169,14 @@ function formatTime(dateString: string): string {
   return date.toLocaleDateString('vi-VN', { day: '2-digit', month: '2-digit', year: 'numeric' })
 }
 
-// Handle image error fallback
 function handleImageError(event: Event, name: string) {
   const target = event.target as HTMLImageElement
   target.src = `https://ui-avatars.com/api/?name=${encodeURIComponent(name)}&background=random`
 }
 
-// Computed properties
 const filteredConversations = computed(() => {
   let filtered = conversations.value
 
-  // Apply conversation search filter
   const query = navSearchQuery.value || searchQuery.value
   if (query) {
     filtered = filtered.filter(
@@ -193,7 +186,6 @@ const filteredConversations = computed(() => {
     )
   }
 
-  // Apply status filters
   const { status, messageType } = filterOptions.value
 
   if (status.online || status.offline) {
@@ -208,15 +200,14 @@ const filteredConversations = computed(() => {
     })
   }
 
-  // Apply message type filters
   if (messageType.unread || messageType.important || messageType.archived) {
     filtered = filtered.filter((conv) => {
       if (messageType.unread && conv.unreadCount > 0)
         return true
       if (messageType.important)
-        return true // Can add important flag to conversations later
+        return true
       if (messageType.archived)
-        return false // Can add archived flag to conversations later
+        return false
       return (
         !messageType.unread && !messageType.important && !messageType.archived
       )
@@ -226,7 +217,6 @@ const filteredConversations = computed(() => {
   return filtered
 })
 
-// Search filtered messages
 const searchFilteredMessages = computed(() => {
   if (!messageSearchQuery.value.trim()) {
     return []
@@ -242,7 +232,6 @@ const searchFilteredMessages = computed(() => {
   }))
 })
 
-// Get initials for avatar fallback
 function getInitials(name: string): string {
   return name
     .split(' ')
@@ -252,7 +241,6 @@ function getInitials(name: string): string {
     .slice(0, 2)
 }
 
-// Methods
 function clearAllFilters() {
   filterOptions.value = {
     status: {
@@ -278,12 +266,10 @@ async function sendMessage() {
 
   sendingMessage.value = true
 
-  // ✅ Tạo client_id duy nhất
   const clientId = `client_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
   const tempId = `temp_${Date.now()}`
 
   try {
-    // 1. Create temp message with real user info
     const tempMessage: Message = {
       id: tempId,
       direction: 'out',
@@ -293,7 +279,7 @@ async function sendMessage() {
       time: formatTime(new Date().toISOString()),
       avatar: currentUserAvatar.value,
       status: 'sent',
-      clientId, // ✅ Thêm clientId để track
+      clientId,
     }
 
     messages.value.push(tempMessage)
@@ -304,28 +290,20 @@ async function sendMessage() {
 
     console.log('🔵 [SEND] Sending with clientId:', clientId)
 
-    // 2. Send via API với clientId
-    const token = await directusClient.getToken()
-    const response = await fetch('http://localhost:8055/zalo/send', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${token}`,
-      },
-      body: JSON.stringify({
-        conversationId: activeConversationId.value,
-        message: messageContent,
-        clientId, // ✅ Gửi clientId lên backend
-      }),
+    const response = await api.post('/zalo/send', {
+      conversationId: activeConversationId.value,
+      message: messageContent,
+      clientId,
+      senderId: currentUserId.value,
     })
 
-    if (!response.ok) {
-      const errorData = await response.json().catch(() => ({ error: 'Unknown error' }))
-      throw new Error(`HTTP ${response.status}: ${errorData.error || response.statusText}`)
+    const resultData = response.data.data
+
+    if (!response.data.success) {
+      throw new Error(response.data.message || 'Failed to send message')
     }
 
-    const result = await response.json()
-    console.log('✅ [SEND] Success:', result)
+    console.log('✅ [SEND] Success:', resultData)
 
     // 3. Update temp message with real data (keep it, don't remove)
     const tempIndex = messages.value.findIndex(m => m.id === tempId)
@@ -335,7 +313,8 @@ async function sendMessage() {
       messages.value[tempIndex].clientId = clientId
 
       // Add to processed set to prevent duplicate from WebSocket
-      processedMessageIds.add(result.messageId || tempId)
+      // Dùng messageId thật từ server
+      processedMessageIds.add(resultData.messageId || tempId)
 
       console.log('✅ [SEND] Message marked as delivered, clientId:', clientId)
     }
@@ -351,7 +330,7 @@ async function sendMessage() {
     // WebSocket will update with real message ID when it arrives
   }
   catch (error: any) {
-    console.error('❌ [SEND] Error:', error)
+    console.error('❌ [SEND] Error:', error.response?.data?.error || error.message || error)
 
     // Mark temp message as failed
     const messageIndex = messages.value.findIndex(m => m.id === tempId)
@@ -363,91 +342,91 @@ async function sendMessage() {
     sendingMessage.value = false
   }
 }
-
-// Backend integration functions
-async function autoLogin() {
+async function authenticateDirectusClient() {
   try {
-    // 1. Login REST client first to get token
-    await client.login({
-      email: 'admin@example.com',
-      password: 'd1r3ctu5',
-    })
-    console.log('✅ REST client authenticated')
+    // Lấy token từ localStorage hoặc từ Directus session
+    const token = localStorage.getItem('directus_token')
 
-    // 2. Get the auth token from REST client
-    const token = await client.getToken()
-    console.log('✅ Token obtained:', token ? 'Yes' : 'No')
-
-    // 3. Set token for WebSocket client BEFORE connecting
     if (token) {
+      // Set token cho directusClient
       await directusClient.setToken(token)
-      console.log('✅ Token set for WebSocket')
+      console.log('✅ DirectusClient authenticated with token')
+      return true
     }
-
-    // 4. Now connect WebSocket (with token already set)
-    await directusClient.connect()
-    console.log('✅ WebSocket connected and authenticated')
-
-    isAuthenticated.value = true
-
-    // Start global subscription for ALL conversations
-    subscribeToAllConversations()
-
-    // 5. Get current Zalo user ID and user info
-    try {
-      const response = await fetch('http://localhost:8055/zalo/status', {
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
-      })
-
-      const data = await response.json()
-      if (data?.userId) {
-        currentUserId.value = data.userId
-        console.log('✅ Current Zalo user ID:', currentUserId.value)
-
-        // 6. Fetch Zalo user info (name & avatar)
-        try {
-          const users = await client.request(
-            readItems('zalo_users' as any, {
-              fields: ['display_name', 'zalo_name', 'avatar_url'],
-              filter: { id: { _eq: data.userId } },
-              limit: 1,
-            }),
-          )
-
-          const currentUser = users[0]
-          if (currentUser) {
-            currentUserName.value = currentUser.display_name || currentUser.zalo_name || 'You'
-
-            // Proxy Zalo avatar URLs to avoid CORS
-            if (currentUser.avatar_url) {
-              if (currentUser.avatar_url.startsWith('https://s120-ava-talk.zadn.vn/')
-                || currentUser.avatar_url.startsWith('https://ava-grp-talk.zadn.vn/')) {
-                currentUserAvatar.value = `http://localhost:8055/zalo/avatar-proxy?url=${encodeURIComponent(currentUser.avatar_url)}`
-              }
-              else {
-                currentUserAvatar.value = currentUser.avatar_url
-              }
-            }
-            else {
-              currentUserAvatar.value = `https://ui-avatars.com/api/?name=${encodeURIComponent(currentUserName.value)}`
-            }
-
-            console.log('✅ Current user info:', { name: currentUserName.value, hasAvatar: !!currentUser.avatar_url })
-          }
-        }
-        catch (e) {
-          console.warn('⚠️ Could not fetch user info:', e)
-        }
-      }
-    }
-    catch (e) {
-      console.warn('⚠️ Could not get Zalo User ID:', e)
+    else {
+      // Nếu không có token, login với credentials
+      // HOẶC sử dụng token từ api instance
+      console.warn('⚠️ No token found for directusClient')
+      return false
     }
   }
   catch (error) {
-    console.error('❌ Authentication failed:', error)
+    console.error('❌ Failed to authenticate directusClient:', error)
+    return false
+  }
+}
+async function autoLogin() {
+  try {
+    // 1. Check Zalo status
+    const res = await api.get('/zalo/status')
+    const zaloStatus = res.data
+
+    if (zaloStatus?.userId) {
+      currentUserId.value = zaloStatus.userId
+      console.log('✅ Zalo user ID:', currentUserId.value)
+
+      // 2. Fetch user info
+      const userResponse = await api.get('/zalo/users', {
+        params: {
+          userId: zaloStatus.userId,
+          fields: 'displayname,zaloname,avatarurl',
+        },
+      })
+
+      const users = userResponse.data.data
+      const currentUser = users[0]
+
+      if (currentUser) {
+        currentUserName.value = currentUser.displayname || currentUser.zaloname || 'You'
+
+        if (currentUser.avatarurl) {
+          if (currentUser.avatarurl.startsWith('https://s120-ava-talk.zadn.vn')
+            || currentUser.avatarurl.startsWith('https://ava-grp-talk.zadn.vn')) {
+            currentUserAvatar.value = `http://localhost:8055/zalo/avatar-proxy?url=${encodeURIComponent(currentUser.avatarurl)}`
+          }
+          else {
+            currentUserAvatar.value = currentUser.avatarurl
+          }
+        }
+        else {
+          currentUserAvatar.value = `https://ui-avatars.com/api/?name=${encodeURIComponent(currentUserName.value)}`
+        }
+
+        console.log('✅ Current user info:', {
+          name: currentUserName.value,
+          avatar: currentUserAvatar.value,
+        })
+      }
+
+      // ✅ 3. Authenticate directusClient for WebSocket
+      const authenticated = await authenticateDirectusClient()
+
+      if (authenticated) {
+        isAuthenticated.value = true
+        console.log('✅ Authentication successful')
+      }
+      else {
+        console.warn('⚠️ DirectusClient not authenticated - WebSocket may not work')
+        isAuthenticated.value = true // Still allow app to work without WebSocket
+      }
+    }
+    else {
+      console.warn('⚠️ Could not get Zalo User ID')
+      isAuthenticated.value = false
+    }
+  }
+  catch (error: any) {
+    console.error('❌ DirectusZalo auth failed:', error.message || error)
     isAuthenticated.value = false
   }
 }
@@ -490,11 +469,7 @@ function selectConversation(id: string) {
 async function loadConversations() {
   if (!isAuthenticated.value) {
     console.warn('⚠️ Not authenticated')
-    return
-  }
-
-  if (isLoadingConversations.value) {
-    console.log('⏳ Already loading conversations, skipping...')
+    conversations.value = [] // ✅ Set empty
     return
   }
 
@@ -502,260 +477,39 @@ async function loadConversations() {
     loading.value = true
     isLoadingConversations.value = true
 
-    const data = await client.request(
-      readItems('zalo_conversations', {
-        fields: ['*'],
-        filter: {
-          is_hidden: { _eq: false },
-        } as any,
-        sort: ['-is_pinned', '-last_message_time'],
-        limit: 100,
-      }),
-    )
+    const convResponse = await api.get('zalo/conversations')
+    const data = convResponse.data.data || [] // ✅ Fallback to []
 
     console.log(`📥 Loaded ${data.length} conversations`)
 
-    const groupIds = [...new Set(
-      data
-        .filter((conv: any) => conv.group_id && conv.group_id !== null)
-        .map((conv: any) => conv.group_id),
-    )]
+    // ✅ Map với safe defaults
+    conversations.value = data.map((conv: any) => ({
+      id: conv.id,
+      name: conv.name || 'Unknown',
+      avatar: conv.avatar || 'https://ui-avatars.com/api/?name=U&background=random',
+      lastMessage: '',
+      timestamp: formatTime(conv.timestamp || new Date().toISOString()),
+      unreadCount: conv.unreadCount || 0,
+      online: true,
+      type: conv.type || 'direct',
+      members: Array.isArray(conv.members)
+        ? conv.members.map((m: any) => ({
+            id: m.id,
+            name: m.name || 'Unknown',
+            avatar: m.avatar || 'https://ui-avatars.com/api/?name=U&background=random',
+          }))
+        : [],
+      hasRealAvatar: !!conv.avatar && !conv.avatar.includes('ui-avatars.com'),
+    }))
 
-    const participantIds = [...new Set(
-      data
-        .filter((conv: any) => conv.participant_id && conv.participant_id !== null)
-        .map((conv: any) => String(conv.participant_id)),
-    )]
-
-    let groupsMap = new Map()
-    let groupMembersMap = new Map() // Map<groupId, userId[]>
-
-    console.log('🔍 Found', groupIds.length, 'groups to load:', groupIds)
-
-    if (groupIds.length > 0) {
-      const groups = await client.request(
-        readItems('zalo_groups' as any, {
-          fields: ['id', 'name', 'avatar_url'],
-          filter: { id: { _in: groupIds } },
-          limit: -1,
-        }),
-      )
-      groupsMap = new Map(groups.map((g: any) => [g.id, g]))
-      console.log('📦 Loaded', groups.length, 'group info')
-
-      // Load group members for multi-avatar display (chỉ lấy active members)
-      // ⚠️ Chỉ load members cho groups có ít members để tránh quá tải
-      console.log('🔍 Loading members for', groupIds.length, 'groups')
-
-      // Load tất cả members (không filter is_active để test)
-      const allActiveMembers = await client.request(
-        readItems('zalo_group_members' as any, {
-          fields: ['group_id', 'user_id', 'is_active'],
-          filter: {},
-          limit: -1,
-        }),
-      )
-
-      // Filter is_active ở client side
-      const activeMembers = allActiveMembers.filter((m: any) => m.is_active === true)
-
-      console.warn('📥 Raw members loaded:', allActiveMembers.length, '| Active:', activeMembers.length)
-
-      // Filter chỉ lấy members của groups trong conversations
-      const groupIdsSet = new Set(groupIds)
-      const groupMembers = activeMembers.filter((m: any) => groupIdsSet.has(m.group_id))
-
-      console.log('✅ Filtered to', groupMembers.length, 'members for conversations groups')
-
-      console.warn('📥 Raw members loaded:', groupMembers.length, groupMembers.slice(0, 5))
-
-      // Group members by group_id
-      groupMembers.forEach((gm: any) => {
-        if (!groupMembersMap.has(gm.group_id)) {
-          groupMembersMap.set(gm.group_id, [])
-        }
-        groupMembersMap.get(gm.group_id).push(gm.user_id)
-      })
-
-      console.warn('🔍 Group 4577988136770414902 has', groupMembersMap.get('4577988136770414902')?.length || 0, 'members')
-
-      console.log('📥 Loaded members for', groupMembersMap.size, 'groups, total active members:', groupMembers.length)
-      console.log('📊 Members map:', Object.fromEntries(groupMembersMap))
-    }
-
-    // Collect all user IDs: participants + group members
-    const allUserIds = new Set([
-      ...participantIds,
-      ...Array.from(groupMembersMap.values()).flat(),
-    ])
-
-    console.log('👥 Loading', allUserIds.size, 'users (participants + members)')
-
-    let usersMap = new Map()
-    if (allUserIds.size > 0) {
-      const users = await client.request(
-        readItems('zalo_users' as any, {
-          fields: ['id', 'display_name', 'zalo_name', 'avatar_url'],
-          filter: { id: { _in: Array.from(allUserIds) } },
-          limit: -1,
-        }),
-      )
-      usersMap = new Map(users.map((u: any) => [u.id, u]))
-      console.log('✅ Loaded', users.length, 'user records into usersMap')
-      console.log('👤 User IDs in map:', Array.from(usersMap.keys()).slice(0, 5))
-    }
-
-    conversations.value = data.map((conv: any) => {
-      let name = 'Unknown'
-      let avatar = ''
-      let type: 'group' | 'direct' = 'group'
-      let memberAvatars: any[] = []
-      let hasRealAvatar = false // Flag to track if group has real avatar (not fallback)
-
-      if (conv.participant_id && conv.participant_id !== null) {
-        type = 'direct'
-        const user = usersMap.get(conv.participant_id)
-        if (user) {
-          name = user.display_name || user.zalo_name || 'Unknown User'
-
-          // Proxy Zalo avatar URLs to avoid CORS
-          if (user.avatar_url) {
-            if (user.avatar_url.startsWith('https://s120-ava-talk.zadn.vn/')
-              || user.avatar_url.startsWith('https://ava-grp-talk.zadn.vn/')) {
-              avatar = `http://localhost:8055/zalo/avatar-proxy?url=${encodeURIComponent(user.avatar_url)}`
-            }
-            else {
-              avatar = user.avatar_url
-            }
-          }
-          else {
-            avatar = `https://ui-avatars.com/api/?name=${encodeURIComponent(name)}&background=4F46E5`
-          }
-        }
-        else {
-          name = `User ${conv.participant_id.substring(0, 8)}`
-          avatar = `https://ui-avatars.com/api/?name=U&background=4F46E5`
-        }
-      }
-      else if (conv.group_id && conv.group_id !== null) {
-        type = 'group'
-        const group = groupsMap.get(conv.group_id)
-
-        // Get members for this group (for multi-avatar display)
-        const memberUserIds = groupMembersMap.get(conv.group_id) || []
-
-        console.log('🔍 Group members:', {
-          groupId: conv.group_id,
-          groupName: group?.name,
-          memberCount: memberUserIds.length,
-          memberIds: memberUserIds.slice(0, 3),
-        })
-
-        // Get avatar for first 3 members (để hiển thị avatar tam giác)
-        for (const userId of memberUserIds.slice(0, 3)) {
-          const user = usersMap.get(userId)
-          if (user) {
-            let memberAvatar = `https://ui-avatars.com/api/?name=${encodeURIComponent(user.display_name || user.zalo_name || 'U')}&background=10B981&color=fff`
-
-            if (user.avatar_url) {
-              // Proxy Zalo avatar URLs to avoid CORS
-              if (user.avatar_url.startsWith('https://s120-ava-talk.zadn.vn/')
-                || user.avatar_url.startsWith('https://ava-grp-talk.zadn.vn/')) {
-                memberAvatar = `http://localhost:8055/zalo/avatar-proxy?url=${encodeURIComponent(user.avatar_url)}`
-              }
-              else {
-                memberAvatar = user.avatar_url
-              }
-            }
-
-            memberAvatars.push({
-              id: userId,
-              name: user.display_name || user.zalo_name || 'User',
-              avatar: memberAvatar,
-            })
-          }
-          else {
-            console.warn('⚠️ User not found in usersMap:', userId)
-          }
-        }
-
-        console.log(`📥 Group ${conv.group_id} has ${memberAvatars.length} member avatars loaded`)
-
-        if (group) {
-          name = group.name || 'Unknown Group'
-
-          // Handle avatar URL
-          if (group.avatar_url) {
-            hasRealAvatar = true
-            // If it's a Zalo CDN URL, proxy it to avoid CORS
-            if (group.avatar_url.startsWith('https://ava-grp-talk.zadn.vn/')
-              || group.avatar_url.startsWith('https://s120-ava-talk.zadn.vn/')) {
-              avatar = `http://localhost:8055/zalo/avatar-proxy?url=${encodeURIComponent(group.avatar_url)}`
-            }
-            // If it's a Directus file ID (UUID format)
-            else if (group.avatar_url.match(/^[a-f0-9-]{36}$/i)) {
-              avatar = `http://localhost:8055/assets/${group.avatar_url}`
-            }
-            // If it's a path starting with /
-            else if (group.avatar_url.startsWith('/')) {
-              avatar = `http://localhost:8055${group.avatar_url}`
-            }
-            // If it's another HTTP URL, use as-is
-            else if (group.avatar_url.startsWith('http')) {
-              avatar = group.avatar_url
-            }
-            // Otherwise treat as relative path to assets
-            else {
-              avatar = `http://localhost:8055/assets/${group.avatar_url}`
-            }
-            console.log('🖼️ Group avatar loaded:', {
-              groupId: conv.group_id,
-              name,
-              originalUrl: group.avatar_url,
-              finalUrl: avatar,
-            })
-          }
-          else {
-            // Use data URI for group icon (similar to Zalo's default group icon)
-            avatar = 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iNDAiIGhlaWdodD0iNDAiIHZpZXdCb3g9IjAgMCA0MCA0MCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48cmVjdCB3aWR0aD0iNDAiIGhlaWdodD0iNDAiIHJ4PSI4IiBmaWxsPSIjMTBCOTgxIi8+PHBhdGggZD0iTTE1IDEzQzE1IDExLjM0MzEgMTYuMzQzMSAxMCAxOCAxMEMyMC4yMDkxIDEwIDIyIDExLjc5MDkgMjIgMTRDMjIgMTYuMjA5MSAyMC4yMDkxIDE4IDE4IDE4QzE2LjM0MzEgMTggMTUgMTYuNjU2OSAxNSAxNVYxM1oiIGZpbGw9IndoaXRlIi8+PHBhdGggZD0iTTI1IDEzQzI1IDExLjM0MzEgMjYuMzQzMSAxMCAyOCAxMEMyOS42NTY5IDEwIDMxIDExLjM0MzEgMzEgMTNDMzEgMTQuNjU2OSAyOS42NTY5IDE2IDI4IDE2QzI2LjM0MzEgMTYgMjUgMTQuNjU2OSAyNSAxM1oiIGZpbGw9IndoaXRlIi8+PHBhdGggZD0iTTEwIDI2QzEwIDIzLjIzODYgMTIuMjM4NiAyMSAxNSAyMUgyMUMyMy43NjE0IDIxIDI2IDIzLjIzODYgMjYgMjZWMjhDMjYgMjguNTUyMyAyNS41NTIzIDI5IDI1IDI5SDExQzEwLjQ0NzcgMjkgMTAgMjguNTUyMyAxMCAyOFYyNloiIGZpbGw9IndoaXRlIi8+PHBhdGggZD0iTTI0IDI2QzI0IDI0LjM0MzEgMjUuMzQzMSAyMyAyNyAyM0gzMEMzMS42NTY5IDIzIDMzIDI0LjM0MzEgMzMgMjZWMjhDMzMgMjguNTUyMyAzMi41NTIzIDI5IDMyIDI5SDI1QzI0LjQ0NzcgMjkgMjQgMjguNTUyMyAyNCAyOFYyNloiIGZpbGw9IndoaXRlIiBmaWxsLW9wYWNpdHk9IjAuNyIvPjwvc3ZnPg=='
-            console.log('🖼️ Group using fallback icon:', { groupId: conv.group_id, name })
-          }
-        }
-        else {
-          name = `Group ${conv.group_id.substring(0, 8)}`
-          avatar = 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iNDAiIGhlaWdodD0iNDAiIHZpZXdCb3g9IjAgMCA0MCA0MCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48cmVjdCB3aWR0aD0iNDAiIGhlaWdodD0iNDAiIHJ4PSI4IiBmaWxsPSIjMTBCOTgxIi8+PHBhdGggZD0iTTE1IDEzQzE1IDExLjM0MzEgMTYuMzQzMSAxMCAxOCAxMEMyMC4yMDkxIDEwIDIyIDExLjc5MDkgMjIgMTRDMjIgMTYuMjA5MSAyMC4yMDkxIDE4IDE4IDE4QzE2LjM0MzEgMTggMTUgMTYuNjU2OSAxNSAxNVYxM1oiIGZpbGw9IndoaXRlIi8+PHBhdGggZD0iTTI1IDEzQzI1IDExLjM0MzEgMjYuMzQzMSAxMCAyOCAxMEMyOS42NTY5IDEwIDMxIDExLjM0MzEgMzEgMTNDMzEgMTQuNjU2OSAyOS42NTY5IDE2IDI4IDE2QzI2LjM0MzEgMTYgMjUgMTQuNjU2OSAyNSAxM1oiIGZpbGw9IndoaXRlIi8+PHBhdGggZD0iTTEwIDI2QzEwIDIzLjIzODYgMTIuMjM4NiAyMSAxNSAyMUgyMUMyMy43NjE0IDIxIDI2IDIzLjIzODYgMjYgMjZWMjhDMjYgMjguNTUyMyAyNS41NTIzIDI5IDI1IDI5SDExQzEwLjQ0NzcgMjkgMTAgMjguNTUyMyAxMCAyOFYyNloiIGZpbGw9IndoaXRlIi8+PHBhdGggZD0iTTI0IDI2QzI0IDI0LjM0MzEgMjUuMzQzMSAyMyAyNyAyM0gzMEMzMS42NTY5IDIzIDMzIDI0LjM0MzEgMzMgMjZWMjhDMzMgMjguNTUyMyAzMi41NTIzIDI5IDMyIDI5SDI1QzI0LjQ0NzcgMjkgMjQgMjguNTUyMyAyNCAyOFYyNloiIGZpbGw9IndoaXRlIiBmaWxsLW9wYWNpdHk9IjAuNyIvPjwvc3ZnPg=='
-          console.log('⚠️ Group not found in map:', conv.group_id)
-        }
-      }
-
-      const result = {
-        id: conv.id,
-        name,
-        avatar,
-        lastMessage: '',
-        timestamp: formatTime(conv.last_message_time),
-        unreadCount: conv.unread_count || 0,
-        online: true,
-        type,
-        members: memberAvatars, // Array of member objects with avatar URLs
-        hasRealAvatar, // True only if group has real avatar_url (not fallback)
-      }
-
-      if (memberAvatars.length > 0) {
-        console.warn(`✨ Conversation ${name} has ${memberAvatars.length} member avatars:`, memberAvatars.map(m => m.name))
-      }
-
-      return result
-    })
-
-    console.log(`✅ Conversations loaded`)
-
+    // ✅ Only select if has data
     if (conversations.value.length > 0 && !activeConversationId.value) {
-      conversations.value[0]?.id && selectConversation(conversations.value[0].id)
+      selectConversation(conversations.value[0].id)
     }
   }
   catch (error: any) {
     console.error('❌ Error loading conversations:', error)
+    conversations.value = [] // ✅ Set empty on error
   }
   finally {
     loading.value = false
@@ -768,11 +522,11 @@ async function loadMessages(conversationId: string) {
     return
 
   if (isLoadingMessages.value) {
-    console.log('⏭️ Already loading messages')
+    console.log('Already loading messages')
     return
   }
 
-  console.log('🔵 Loading initial messages for:', conversationId)
+  console.log('✅ Loading initial messages for:', conversationId)
 
   try {
     isLoadingMessages.value = true
@@ -780,78 +534,49 @@ async function loadMessages(conversationId: string) {
     // Get current user ID if needed
     if (currentUserId.value === 'system') {
       try {
-        const me = await client.request(readMe({ fields: ['id'] }))
-        if (me?.id)
+        const meResponse = await api.get('/users/me', {
+          params: {
+            fields: 'id',
+          },
+        })
+        const me = meResponse.data.data
+        if (me?.id) {
           currentUserId.value = me.id
+        }
       }
       catch (e) {
-        console.warn('⚠️ Could not get current user ID:', e)
+        console.warn('Could not get current user ID', e)
       }
     }
 
-    // Fetch messages from DB
-    const data = await client.request(
-      readItems('zalo_messages' as any, {
-        fields: ['*'],
-        filter: {
-          conversation_id: { _eq: conversationId },
-        },
-        sort: ['sent_at'],
-        limit: 50,
-      }),
-    )
+    // ✅ Fetch messages - backend returns enriched data
+    const messagesResponse = await api.get(`/zalo/messages/${conversationId}`)
+    const data = messagesResponse.data.data
 
-    console.log('📥 Loaded', data.length, 'messages from DB')
+    console.log('✅ Raw messages from backend:', data)
+    console.log('✅ First message:', data[0])
 
-    // Get unique sender IDs
-    const senderIds = [...new Set(data.map((msg: any) => msg.sender_id).filter(Boolean))]
+    // ✅ BACKEND ĐÃ ENRICH DATA - Không cần fetch users nữa!
+    // Backend đã trả về senderName, avatar, direction, etc.
 
-    // Fetch users
-    let usersMap = new Map()
-    if (senderIds.length > 0) {
-      const users = await client.request(
-        readItems('zalo_users' as any, {
-          fields: ['id', 'display_name', 'zalo_name', 'avatar_url'],
-          filter: { id: { _in: senderIds } },
-          limit: -1,
-        }),
-      )
-      usersMap = new Map(users.map((u: any) => [u.id, u]))
-    }
-
-    // Map messages
-    messages.value = data.map((msg: any) => {
-      const user = usersMap.get(msg.sender_id)
-      const senderName = user?.display_name || user?.zalo_name || 'Unknown'
-
-      // Proxy Zalo avatar URLs to avoid CORS
-      let senderAvatar = `https://ui-avatars.com/api/?name=${encodeURIComponent(senderName)}`
-      if (user?.avatar_url) {
-        if (user.avatar_url.startsWith('https://s120-ava-talk.zadn.vn/')
-          || user.avatar_url.startsWith('https://ava-grp-talk.zadn.vn/')) {
-          senderAvatar = `http://localhost:8055/zalo/avatar-proxy?url=${encodeURIComponent(user.avatar_url)}`
-        }
-        else {
-          senderAvatar = user.avatar_url
-        }
-      }
-
-      const direction: 'in' | 'out' = msg.sender_id === currentUserId.value ? 'out' : 'in'
-
-      return {
-        id: msg.id,
-        direction,
-        text: msg.content || '',
-        senderName,
-        senderId: msg.sender_id,
-        time: formatTime(msg.sent_at),
-        avatar: senderAvatar,
-        status: direction === 'out' ? 'read' : undefined,
-      }
-    })
+    // Map messages - chỉ cần map structure cho UI
+    messages.value = data.map((msg: any) => ({
+      id: msg.id,
+      direction: msg.direction,
+      text: msg.text || '',
+      senderName: msg.senderName,
+      senderId: msg.senderId,
+      time: msg.time,
+      avatar: msg.avatar,
+      status: msg.status,
+      files: msg.attachments || [],
+      reactions: msg.reactions || [],
+      isEdited: msg.isEdited,
+      isUndone: msg.isUndone,
+      clientId: msg.clientId,
+    }))
 
     console.log('✅ Loaded', messages.value.length, 'messages')
-
     nextTick(scrollToBottom)
   }
   catch (error: any) {
@@ -874,9 +599,10 @@ function updateConversationOnNewMessage(conversationId: string, message: any) {
   if (!conversation)
     return
 
-  // Update last message preview
-  conversation.lastMessage = message.text?.substring(0, 50) || ''
-  conversation.timestamp = message.time
+  // ✅ SỬA: Sử dụng content thay vì text (hoặc fallback)
+  const messagePreview = message.content || message.text || ''
+  conversation.lastMessage = messagePreview.substring(0, 50)
+  conversation.timestamp = message.time || message.sentat || formatTime(new Date().toISOString())
 
   // If not the active conversation, increment unread count
   if (conversationId !== activeConversationId.value) {
@@ -903,7 +629,8 @@ async function subscribeToAllConversations() {
   console.log('🌐 [GLOBAL] Starting global message subscription')
 
   try {
-    const { subscription, unsubscribe } = await directusClient.subscribe('zalo_messages', {
+    // ✅ directusClient VẪN DÙNG ĐỂ SUBSCRIBE
+    const { subscription, unsubscribe } = await directusClient.subscribe('/zalo_messages', {
       event: 'create',
       query: {
         fields: ['*'],
@@ -938,14 +665,10 @@ async function subscribeToAllConversations() {
             let senderName = 'Unknown'
             if (newMsg.sender_id) {
               try {
-                const users = await client.request(
-                  readItems('zalo_users' as any, {
-                    fields: ['display_name', 'zalo_name'],
-                    filter: { id: { _eq: newMsg.sender_id } },
-                    limit: 1,
-                  }),
-                )
-                const user = users[0]
+                // ✅ DÙNG api.get() ĐỂ LẤY USER INFO
+                const userResponse = await api.get(`/zalo/users/${newMsg.sender_id}`)
+
+                const user = userResponse.data.data[0]
                 if (user) {
                   senderName = user.display_name || user.zalo_name || 'Unknown'
                 }
@@ -989,7 +712,8 @@ async function subscribeToMessages(conversationId: string) {
   processedMessageIds.clear()
 
   try {
-    const { subscription, unsubscribe } = await directusClient.subscribe('zalo_messages', {
+    // ✅ directusClient VẪN DÙNG ĐỂ SUBSCRIBE
+    const { subscription, unsubscribe } = await directusClient.subscribe('/zalo_messages', {
       event: 'create',
       query: {
         fields: ['*'],
@@ -1008,7 +732,11 @@ async function subscribeToMessages(conversationId: string) {
     // Handle messages
     ;(async () => {
       for await (const item of subscription) {
-        console.log('📩 [WEBSOCKET] Event received:', { type: item.type, event: item.event, hasData: !!item.data })
+        console.log('📩 [WEBSOCKET] Event received:', {
+          type: item.type,
+          event: item.event,
+          hasData: !!item.data,
+        })
 
         if (item.type === 'subscription' && item.event === 'init') {
           console.log('✅ [SUBSCRIBE] Subscription initialized for:', conversationId)
@@ -1026,13 +754,14 @@ async function subscribeToMessages(conversationId: string) {
             continue
           }
 
-          console.log('📥 [WEBSOCKET] New message received:', {
+          console.log('📨 [WEBSOCKET] New message received:', {
             id: newMsg.id,
             conversationId: newMsg.conversation_id,
             senderId: newMsg.sender_id,
             clientId: newMsg.client_id,
             content: `${newMsg.content?.substring(0, 20)}...`,
           })
+
           if (processedMessageIds.has(newMsg.id)) {
             console.log('⏭️ [DEDUPE] Already processed message:', newMsg.id)
             continue
@@ -1048,6 +777,7 @@ async function subscribeToMessages(conversationId: string) {
             console.log('⏭️ Message already exists:', newMsg.id)
             continue
           }
+
           processedMessageIds.add(newMsg.id)
 
           // Fetch sender info
@@ -1056,15 +786,10 @@ async function subscribeToMessages(conversationId: string) {
 
           if (newMsg.sender_id) {
             try {
-              const users = await client.request(
-                readItems('zalo_users' as any, {
-                  fields: ['display_name', 'zalo_name', 'avatar_url'],
-                  filter: { id: { _eq: newMsg.sender_id } },
-                  limit: 1,
-                }),
-              )
+              // ✅ DÙNG api.get() ĐỂ LẤY USER INFO
+              const userResponse = await api.get(`/zalo/users/${newMsg.sender_id}`)
 
-              const user = users[0]
+              const user = userResponse.data.data[0]
 
               if (user) {
                 senderName = user.display_name || user.zalo_name || 'Unknown'
@@ -1095,27 +820,23 @@ async function subscribeToMessages(conversationId: string) {
             id: newMsg.id,
             direction,
             text: newMsg.content || '',
+            content: newMsg.content || '', // ✅ SỬA: content thay vì contend
             senderName,
             senderId: newMsg.sender_id,
             time: formatTime(newMsg.sent_at),
             avatar: senderAvatar,
             status: direction === 'out' ? 'delivered' : undefined,
             clientId: newMsg.client_id,
+            files: newMsg.attachments || [],
+            reactions: newMsg.reactions || [],
           }
 
           messages.value.push(messageToAdd)
 
-          console.log('✅ [WEBSOCKET] Message added to UI:', {
-            id: messageToAdd.id,
-            direction: messageToAdd.direction,
-            from: messageToAdd.senderName,
-            text: messageToAdd.text.substring(0, 30),
-            totalMessages: messages.value.length,
-          })
-
-          // Update conversation list: move to top and update unread count
+          // ✅ SỬA: conversation_id thay vì conversationid
           updateConversationOnNewMessage(newMsg.conversation_id, messageToAdd)
 
+          console.log('✅ [ADDED] New message to UI:', messageToAdd.id)
           nextTick(scrollToBottom)
         }
       }
@@ -1133,50 +854,7 @@ function autoResize(event: Event) {
 }
 
 // File Upload Functions (commented out - not fully implemented in BE yet)
-// function triggerFileInput() {
-//   activeDialog.value = 'upload'
-// }
-
-// function openFilePicker() {
-//   fileInput.value?.click()
-// }
-
-// function removePendingAttachment(index: number) {
-//   pendingAttachments.value.splice(index, 1)
-// }
-
-// function handleFileSelect(event: Event) {
-//   const target = event.target as HTMLInputElement
-//   if (target.files && target.files.length > 0) {
-//     const files = Array.from(target.files)
-//     selectedFiles.value = files
-//     activeDialog.value = null
-//     showFilePreviewDialog.value = true
-//   }
-// }
-
-// function removeFileFromPreview(index: number) {
-//   selectedFiles.value.splice(index, 1)
-//   if (selectedFiles.value.length === 0) {
-//     showFilePreviewDialog.value = false
-//   }
-// }
-
-// function cancelFileUpload() {
-//   selectedFiles.value = []
-//   showFilePreviewDialog.value = false
-// }
-
-// async function confirmAndUploadFiles() {
-//   showFilePreviewDialog.value = false
-//   await uploadSelectedFiles()
-// }
-
-// async function uploadSelectedFiles() {
-//   if (selectedFiles.value.length === 0)
-//     return
-//   // Upload logic commented out - not fully implemented
-// }
+// ... (Không thay đổi)
 
 // Members dialog functions
 function toggleMemberSelection(memberId: string) {
@@ -1198,22 +876,11 @@ function removeMember(memberId: string) {
 
 // Get active conversation object
 const activeConversation = computed(() => {
-  const conv = conversations.value.find(
-    conv => conv.id === activeConversationId.value,
-  )
-
-  if (conv) {
-    console.log('📋 Active Conversation:', {
-      id: conv.id,
-      name: conv.name,
-      type: conv.type,
-      hasAvatar: !!conv.avatar,
-      avatarPreview: conv.avatar?.substring(0, 50),
-      memberCount: conv.members?.length || 0,
-    })
+  // ✅ ADD: Null check
+  if (!activeConversationId.value || !conversations.value) {
+    return null
   }
-
-  return conv
+  return conversations.value.find(c => c.id === activeConversationId.value) || null
 })
 
 // Conversation stats by type
@@ -1301,12 +968,25 @@ function handleClickOutside(event: Event) {
 
 // Lifecycle hooks
 onMounted(async () => {
-  console.log('🔵 Component mounted')
+  try {
+    console.log('🚀 Chat module mounted')
 
-  await autoLogin()
-  await loadConversations()
+    await autoLogin()
 
-  document.addEventListener('click', handleClickOutside)
+    // ✅ ADD: Check authenticated before loading
+    if (isAuthenticated.value) {
+      await loadConversations()
+      subscribeToAllConversations()
+    }
+    else {
+      console.log('⚠️ Not authenticated, showing empty state')
+      conversations.value = [] // ✅ Set empty array
+    }
+  }
+  catch (error: any) {
+    console.error('❌ Error in onMounted:', error)
+    conversations.value = [] // ✅ Set empty on error
+  }
 })
 
 onBeforeUnmount(() => {
@@ -1315,19 +995,15 @@ onBeforeUnmount(() => {
   if (subscriptionCleanup) {
     subscriptionCleanup()
   }
+  if (globalSubscriptionCleanup) {
+    globalSubscriptionCleanup()
+  }
 
   directusClient.disconnect()
 })
 
 onUnmounted(() => {
   document.removeEventListener('click', handleClickOutside)
-})
-
-watch(activeConversationId, (newId) => {
-  if (newId && isAuthenticated.value) {
-    subscribeToMessages(newId)
-    nextTick(scrollToBottom)
-  }
 })
 
 // Filtered members for search
@@ -1692,7 +1368,11 @@ const filteredMembers = computed(() => {
           </div>
         </div>
       </div>
-
+      <div v-if="conversations.length === 0 && !loading" class="p-4 text-center">
+        <p class="text-text-muted text-sm">
+          No conversations yet
+        </p>
+      </div>
       <!-- Conversation List -->
       <div class="flex-1 overflow-y-auto">
         <div class="p-2 space-y-1">
