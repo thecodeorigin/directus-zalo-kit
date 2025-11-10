@@ -1,5 +1,10 @@
 import Redis from 'ioredis'
 
+/**
+ * ZaloLoginService - Function-based Module
+ * Manages Zalo login, session storage, and authentication
+ */
+
 // Module-level state
 let zalo: any = null
 let api: any = null
@@ -21,6 +26,10 @@ let sessionIsRestoring = false
 
 // Keep-alive state
 let keepAliveInterval: NodeJS.Timeout | null = null
+
+// ============================================================================
+// INITIALIZATION
+// ============================================================================
 
 /**
  * Initialize Zalo instance with dynamic import
@@ -59,12 +68,20 @@ async function initializeRedis() {
   console.warn('[ZaloLogin] Redis client initialized')
 }
 
+// ============================================================================
+// API ACCESS
+// ============================================================================
+
 /**
  * Get current API instance
  */
 export function getApi() {
   return api
 }
+
+// ============================================================================
+// SESSION STORAGE (REDIS)
+// ============================================================================
 
 /**
  * Save session to Redis
@@ -283,6 +300,10 @@ async function loginRestoreSession(session: any, callback?: (result: any) => voi
   throw new Error('Failed to restore session: No API instance returned')
 }
 
+// ============================================================================
+// LOGIN STATUS & MANAGEMENT
+// ============================================================================
+
 /**
  * Get current login status
  */
@@ -339,6 +360,10 @@ function loginReset() {
   loginPendingData = null
 }
 
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
 /**
  * Extract userId from cookies
  */
@@ -358,6 +383,10 @@ function extractUserIdFromCookies(cookies: any[]): string | null {
   }
   return null
 }
+
+// ============================================================================
+// QR LOGIN
+// ============================================================================
 
 /**
  * Handle QR callback events
@@ -442,7 +471,6 @@ async function handleLoginSuccess(apiInstance: any) {
 
 /**
  * Finalize login when both API and credentials are ready
- * This fixes the race condition issue
  */
 async function finalizeLogin() {
   // Check if both parts are ready
@@ -518,6 +546,17 @@ async function finalizeLogin() {
   // Clear pending data
   loginPendingData = null
 
+  // Notify ZaloMessage about the session
+  // Import dynamically to avoid circular dependency
+  const ZaloMessage = await import('./ZaloMessageService')
+  ZaloMessage.onSessionImported({
+    ok: true,
+    api,
+    userId,
+  }).catch((err: any) => {
+    console.error('[ZaloLogin] Error notifying ZaloMessage:', err)
+  })
+
   // Resolve the promise if waiting
   if (loginResolver) {
     loginResolver(loginGetStatus())
@@ -529,7 +568,6 @@ async function finalizeLogin() {
 
 /**
  * Initiate QR code login
- * Returns a promise that resolves when QR code is generated
  */
 export async function handleZaloLoginQR() {
   if (!zalo) {
@@ -548,7 +586,7 @@ export async function handleZaloLoginQR() {
     loginQrCode = null
     loginPendingData = null
 
-    // Create promise that resolves when QR is generated (not when login completes)
+    // Create promise that resolves when QR is generated
     return new Promise<any>((resolve, reject) => {
       // Set resolver before starting loginQR
       loginResolver = resolve
@@ -565,8 +603,6 @@ export async function handleZaloLoginQR() {
           // Login failed or QR expired
           console.error('[ZaloLogin] Login process failed:', err)
           loginReset()
-          // Don't reject if QR was already generated
-          // The user might have just not scanned in time
         })
 
       // Set a timeout just in case QR is never generated
@@ -576,7 +612,7 @@ export async function handleZaloLoginQR() {
           loginReset()
           reject(new Error('QR code generation timeout'))
         }
-      }, 10000) // 10 seconds timeout for QR generation
+      }, 10000) // 10 seconds timeout
     })
   }
   catch (error: any) {
@@ -585,6 +621,10 @@ export async function handleZaloLoginQR() {
     throw error
   }
 }
+
+// ============================================================================
+// COOKIE LOGIN
+// ============================================================================
 
 /**
  * Import session from cookies
@@ -677,6 +717,10 @@ export async function handleZaloLoginCookies(
   }
 }
 
+// ============================================================================
+// LOGOUT
+// ============================================================================
+
 /**
  * Logout
  */
@@ -699,8 +743,12 @@ export async function loginLogout() {
   }
 }
 
+// ============================================================================
+// REDIS OPERATIONS
+// ============================================================================
+
 /**
- * Redis operations - Get status
+ * Get Redis status
  */
 export async function redisGetStatus() {
   if (!redis) {
@@ -727,14 +775,14 @@ export async function redisGetStatus() {
 }
 
 /**
- * Redis operations - Get session(s)
+ * Get session(s) from Redis
  */
 export async function redisGetSession(userId?: string) {
   return await sessionLoad(userId)
 }
 
 /**
- * Redis operations - Get keys matching pattern
+ * Get keys matching pattern
  */
 export async function redisGetKeys(pattern = '*', limit = 1000) {
   if (!redis) {
@@ -752,7 +800,7 @@ export async function redisGetKeys(pattern = '*', limit = 1000) {
 }
 
 /**
- * Redis operations - Get raw value
+ * Get raw value from Redis
  */
 export async function redisGet(key: string) {
   if (!redis) {
@@ -767,6 +815,10 @@ export async function redisGet(key: string) {
     throw error
   }
 }
+
+// ============================================================================
+// KEEP-ALIVE
+// ============================================================================
 
 /**
  * Start keep-alive mechanism
