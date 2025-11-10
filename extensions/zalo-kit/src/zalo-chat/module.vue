@@ -333,6 +333,26 @@ async function autoLogin() {
   }
 }
 
+/**
+ * Stop polling for messages
+ */
+function stopMessagePolling() {
+  if (pollingInterval) {
+    clearInterval(pollingInterval)
+    pollingInterval = null
+  }
+  isPolling = false
+}
+
+/**
+ * Scroll messages container to bottom
+ */
+function scrollToBottom() {
+  if (messagesContainer.value) {
+    messagesContainer.value.scrollTop = messagesContainer.value.scrollHeight
+  }
+}
+
 // Initialize WebSocket connection using direct Directus SDK
 async function initializeWebSocket() {
   try {
@@ -632,6 +652,10 @@ function selectConversation(id: string) {
     conversation.unreadCount = 0
   }
 
+  // Stop previous polling của conversation cũ
+  stopMessagePolling()
+
+  // Load initial messages
   loadMessages(id).finally(() => {
     // Subscribe to new conversation messages via WebSocket
     if (websocketConnected.value && websocketAuthenticated.value) {
