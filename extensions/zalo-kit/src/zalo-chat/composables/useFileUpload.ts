@@ -113,9 +113,10 @@ export function useFileUpload() {
   }
 
   /**
-   * Create folder structure in Directus
+   * Create folder structure in Directus (optional - not used with S3 for simplicity)
+   * Keep this function for future use if needed
    */
-  async function createFolder(conversationId: string): Promise<string | null> {
+  async function _createFolder(conversationId: string): Promise<string | null> {
     try {
       // Check if chat_files folder exists
       const chatFilesFolder = await api.get('/folders', {
@@ -175,17 +176,24 @@ export function useFileUpload() {
     onProgress?: (progress: number) => void,
   ): Promise<UploadedFile | null> {
     try {
-      // Create FormData - simple approach
+      // Create FormData
       const formData = new FormData()
-      formData.append('file', file)
-      formData.append('title', file.name)
-      formData.append('storage', 'local') // Use local storage
+      formData.append('file', file) // The file must be in a property called 'file'
 
-      // Upload with progress tracking
+      // Add optional metadata
+      if (file.name) {
+        formData.append('title', file.name)
+      }
+
+      // Add folder metadata as a tag or in the title (S3 doesn't support folders like local storage)
+      // You can create folder structure in Directus and use folder ID if needed
+      // For now, we'll use a simple approach without folders
+
+      // Optionally add conversation ID as metadata
+      formData.append('description', `Chat file from conversation: ${conversationId}`)
+
+      // Upload without setting Content-Type header (browser will set it automatically with boundary)
       const response = await api.post('/files', formData, {
-        headers: {
-          'Content-Type': 'multipart/form-data',
-        },
         onUploadProgress: (progressEvent) => {
           if (progressEvent.total) {
             const percentCompleted = Math.round((progressEvent.loaded * 100) / progressEvent.total)
@@ -194,11 +202,10 @@ export function useFileUpload() {
         },
       })
 
-      console.log('Upload response:', response.data)
       return response.data.data
     }
     catch (error: any) {
-      console.error('Error uploading file:', error)
+      console.error('❌ Upload failed:', error)
       console.error('Error details:', error.response?.data || error.message)
       throw error
     }
