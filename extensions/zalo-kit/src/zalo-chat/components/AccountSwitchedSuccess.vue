@@ -1,3 +1,11 @@
+<script setup lang="ts">
+interface Props {
+  accountName: string
+}
+
+defineProps<Props>()
+</script>
+
 <template>
   <div class="success-state">
     <div class="success-icon">
@@ -16,20 +24,6 @@
     </div>
   </div>
 </template>
-
-<script setup lang="ts">
-interface Props {
-  accountName: string
-}
-
-defineProps<Props>()
-</script>
-
-<script lang="ts">
-export default {
-  name: 'AccountSwitchedSuccess',
-}
-</script>
 
 <style scoped>
 .success-state {
