@@ -1,14 +1,26 @@
 <script setup lang="ts">
-import PrivateView from '@directus/components/views/PrivateView.vue'
 import { useApi } from '@directus/extensions-sdk'
 import { authentication, createDirectus, realtime, rest } from '@directus/sdk'
 import { computed, nextTick, onBeforeUnmount, onMounted, onUnmounted, ref } from 'vue'
+
+// Components imports - sorted by path
+import AccountSwitchedSuccess from './components/AccountSwitchedSuccess.vue'
+import FileAttachmentPreview from './components/Chat/Dialogs/FileAttachmentPreview.vue'
+import MembersDialog from './components/Chat/Dialogs/MembersDialog.vue'
+import UploadProgress from './components/Chat/Dialogs/UploadProgress.vue'
+import ChatHeader from './components/Chat/Header/ChatHeader.vue'
+import MessageInput from './components/Chat/Input/MessageInput.vue'
+import EmptyState from './components/EmptyState.vue'
 import ConversationList from './components/Sidebar/Conversation/ConversationList.vue'
-import FilterDropdown from './components/Sidebar/FilterDropdown.vue'
-import MemberItem from './components/Sidebar/Member/MemberItem.vue'
+import ConversationSearch from './components/Sidebar/Conversation/ConversationSearch.vue'
+import ProfileDropdown from './components/Sidebar/Header/ProfileDropdown.vue'
 import SidebarDetail from './components/Sidebar/SidebarDetail.vue'
+import SwitchAccountView from './components/SwitchAccountView.vue'
+import SwitchingAccountState from './components/SwitchingAccountState.vue'
+
+// Composables and utils
 import { useFileUpload } from './composables/useFileUpload'
-import { convertEmoticonToEmoji, handleEmojiInsert } from './utils/emoticonConverter'
+import { handleEmojiInsert } from './utils/emoticonConverter'
 
 const currentFunction = ref<string | null>(null)
 
@@ -46,6 +58,7 @@ interface Message {
   type?: 'system' | 'user' | 'file'
   clientId?: string
   files?: FileAttachment[]
+  reactions?: any[]
   isEdited?: boolean
   isUndone?: boolean
 }
@@ -105,6 +118,8 @@ const currentUserAvatar = ref('')
 const isAuthenticated = ref(false)
 const isLoadingMessages = ref(false)
 const isLoadingConversations = ref(false)
+const isInitializing = ref(true) // Track khởi động app
+const conversationListReady = ref(false) // Track khi conversation list sẵn sàng hiển thị
 const showFilterDropdown = ref(false)
 const highlightedMessageId = ref<string | null>(null)
 const showMembersDialog = ref(false)
@@ -115,13 +130,12 @@ const conversationLimit = ref(50)
 const hasMoreConversations = ref(true)
 const isLoadingMore = ref(false)
 
-const conversationListRef = ref<HTMLElement | null>(null)
+const _conversationTypeFilter = ref<'all' | 'group' | 'direct'>('all')
+
+let conversationPollingInterval: any = null
 
 // File upload composable
 const {
-  uploadFiles,
-  getFileUrl,
-  getThumbnailUrl,
   formatFileSize,
   getFileIcon,
   uploadProgress,
@@ -133,6 +147,35 @@ const fileInput = ref<HTMLInputElement | null>(null)
 const selectedFiles = ref<File[]>([])
 const showFilePreviewDialog = ref(false)
 const pendingAttachments = ref<FileAttachment[]>([])
+
+// Account switching states
+const showManageAccountsView = ref(false)
+const isSwitchingAccount = ref(false)
+const switchAccountSuccess = ref(false)
+const switchedAccountName = ref('')
+const mockAccounts = ref([
+  { id: '1', name: 'Account 1', avatar: 'https://ui-avatars.com/api/?name=A1' },
+  { id: '2', name: 'Account 2', avatar: 'https://ui-avatars.com/api/?name=A2' },
+])
+
+// File library states
+const activeDialog = ref<'upload' | 'choose' | 'url' | null>(null)
+const importUrl = ref('')
+const importing = ref(false)
+const folder = ref(null)
+
+const isValidURL = computed(() => {
+  try {
+    if (!importUrl.value)
+      return false
+    // eslint-disable-next-line no-new
+    new URL(importUrl.value)
+    return true
+  }
+  catch {
+    return false
+  }
+})
 
 // Filter states
 const filterOptions = ref({
@@ -147,7 +190,11 @@ const filterOptions = ref({
   },
 })
 
-const processedMessageIds = new Set<string>()
+// Groups data (unused but kept for future implementation)
+const _groups = ref<Group[]>([])
+const _groupMessages = ref<Record<string, Message[]>>({})
+
+const _processedMessageIds = new Set<string>()
 
 function highlightSearchText(text: string, searchTerm: string): string {
   if (!searchTerm.trim())
@@ -259,6 +306,41 @@ const searchFilteredMessages = computed(() => {
   }))
 })
 
+function getInitials(name: string): string {
+  return name
+    .split(' ')
+    .map(word => word.charAt(0))
+    .join('')
+    .toUpperCase()
+    .slice(0, 2)
+}
+
+function _clearAllFilters() {
+  filterOptions.value = {
+    status: {
+      online: false,
+      offline: false,
+    },
+    messageType: {
+      unread: false,
+      important: false,
+      archived: false,
+    },
+  }
+  showFilterDropdown.value = false
+}
+
+function _applyFilters() {
+  showFilterDropdown.value = false
+}
+
+/**
+ * Send message - with optimistic update
+ */
+
+/**
+ * Send message - Optimistic update NGAY LẬP TỨC
+ */
 async function sendMessage() {
   if (!messageText.value.trim() || !activeConversationId.value || sendingMessage.value) {
     return
@@ -759,6 +841,12 @@ async function loadConversations(append = false) {
         selectConversation(firstConversation.id)
       }
     }
+    else if (!append && conversations.value.length === 0) {
+      // Nếu không có conversations, đợi 3 giây trước khi mark conversation list ready
+      setTimeout(() => {
+        conversationListReady.value = true
+      }, 3000) // 3 giây để user thấy thông báo loading
+    }
   }
   catch (error: any) {
     if (!append) {
@@ -782,7 +870,8 @@ async function loadMoreConversations() {
   await loadConversations(true) // append = true
 }
 
-function handleConversationScroll(event: Event) {
+// Infinite scroll handler
+function _handleConversationScroll(event: Event) {
   const target = event.target as HTMLElement
   const scrollTop = target.scrollTop
   const scrollHeight = target.scrollHeight
@@ -855,6 +944,11 @@ async function loadMessages(conversationId: string) {
   }
   finally {
     isLoadingMessages.value = false
+
+    // Mark conversation list ready after successfully loading messages
+    if (!conversationListReady.value) {
+      conversationListReady.value = true
+    }
   }
 }
 
@@ -883,29 +977,129 @@ function updateConversationOnNewMessage(conversationId: string, message: any) {
   sortConversations()
 }
 
-function autoResize(event: Event) {
+function startMessagePolling(conversationId: string) {
+  stopMessagePolling()
+
+  // Get last message ID
+  lastMessageId = messages.value.length > 0
+    ? messages.value[messages.value.length - 1].id
+    : null
+
+  isPolling = true
+
+  // Poll immediately first time
+  pollMessages(conversationId)
+
+  // Then poll every 2 seconds
+  pollingInterval = setInterval(() => {
+    if (isPolling) {
+      pollMessages(conversationId)
+    }
+  }, 2000)
+}
+
+async function pollMessages(conversationId: string) {
+  try {
+    const response = await api.get(`/zalo/messages/${conversationId}`, {
+      params: { limit: 50 },
+      timeout: 15000,
+    })
+
+    const latestMessages = response.data.data
+    if (latestMessages.length === 0)
+      return
+
+    const newestMessage = latestMessages[latestMessages.length - 1]
+
+    if (newestMessage.id !== lastMessageId) {
+      let addedCount = 0
+
+      for (const msg of latestMessages) {
+        const exists = messages.value.some((m) => {
+          if (m.id === msg.id)
+            return true
+          if (m.clientId && msg.clientId && m.clientId === msg.clientId) {
+            const index = messages.value.findIndex(
+              m2 => m2.clientId === msg.clientId,
+            )
+            if (index !== -1) {
+              messages.value[index] = {
+                ...messages.value[index],
+                id: msg.id,
+                senderName: msg.senderName,
+                avatar: msg.avatar,
+                time: msg.time,
+                status: 'sent',
+              }
+            }
+            return true
+          }
+          return false
+        })
+
+        if (!exists) {
+          const direction = msg.senderId === currentUserId.value ? 'out' : 'in'
+          const newMessage: Message = {
+            id: msg.id,
+            direction,
+            text: msg.text || '',
+            senderName: msg.senderName,
+            senderId: msg.senderId,
+            time: msg.time,
+            avatar: msg.avatar,
+            status: direction === 'out' ? 'sent' : undefined,
+            isEdited: msg.isEdited,
+            isUndone: msg.isUndone,
+            clientId: msg.clientId,
+          }
+          messages.value.push(newMessage)
+          addedCount++
+
+          updateConversationOnNewMessage(conversationId, msg)
+        }
+      }
+
+      lastMessageId = newestMessage.id
+
+      if (addedCount > 0) {
+        nextTick(scrollToBottom)
+      }
+    }
+  }
+  catch (error) {
+    console.error('Polling error:', error)
+  }
+}
+
+function _autoResize(event: Event) {
   const textarea = event.target as HTMLTextAreaElement
   textarea.style.height = 'auto'
   textarea.style.height = `${Math.min(textarea.scrollHeight, 120)}px`
 }
 
-function insertEmoji(event: any) {
-  const emoji = event?.emoji || event?.data || event?.native || event
-
-  if (!emoji || typeof emoji !== 'string') {
-    return
-  }
-
-  handleEmojiInsert(emoji, messageInputRef, messageText)
+function onSelectFromLibrary(files: any[]) {
+  // Handle files selected from library
+  console.warn('Select from library:', files)
+  activeDialog.value = null
 }
 
-function toggleMemberSelection(memberId: string) {
-  const index = selectedMembers.value.indexOf(memberId)
-  if (index > -1) {
-    selectedMembers.value.splice(index, 1)
+async function importFromURL() {
+  if (!isValidURL.value)
+    return
+
+  importing.value = true
+
+  try {
+    // Import logic would go here
+    console.warn('Import from URL:', importUrl.value)
+    importUrl.value = ''
+    activeDialog.value = null
   }
-  else {
-    selectedMembers.value.push(memberId)
+  catch (error) {
+    console.error('Error importing from URL:', error)
+  }
+  finally {
+    importing.value = false
   }
 }
 
@@ -916,6 +1110,146 @@ function removeMember(memberId: string) {
   }
 }
 
+// Account management functions
+function handleManageAccounts() {
+  showManageAccountsView.value = true
+}
+
+function handleSwitchAccount(accountId: string) {
+  isSwitchingAccount.value = true
+
+  // Simulate switching account
+  setTimeout(() => {
+    const account = mockAccounts.value.find(acc => acc.id === accountId)
+    if (account) {
+      switchedAccountName.value = account.name
+      isSwitchingAccount.value = false
+      switchAccountSuccess.value = true
+
+      // After 2 seconds, reload
+      setTimeout(() => {
+        switchAccountSuccess.value = false
+        showManageAccountsView.value = false
+        // Reload conversations for new account
+        loadConversations()
+      }, 2000)
+    }
+  }, 1500)
+}
+
+function handleAddAccount() {
+  // Navigate to add account flow
+  console.warn('Add account functionality not implemented yet')
+}
+
+// File upload functions
+function triggerFileInput() {
+  fileInput.value?.click()
+}
+
+function handleFileSelect(event: Event) {
+  const input = event.target as HTMLInputElement
+  if (input.files && input.files.length > 0) {
+    selectedFiles.value = Array.from(input.files).slice(0, MAX_FILES)
+    showFilePreviewDialog.value = true
+  }
+}
+
+function removeFileFromPreview(index: number) {
+  selectedFiles.value.splice(index, 1)
+  if (selectedFiles.value.length === 0) {
+    showFilePreviewDialog.value = false
+  }
+}
+
+function cancelFileUpload() {
+  selectedFiles.value = []
+  showFilePreviewDialog.value = false
+  if (fileInput.value) {
+    fileInput.value.value = ''
+  }
+}
+
+async function confirmAndUploadFiles() {
+  if (selectedFiles.value.length === 0)
+    return
+
+  showFilePreviewDialog.value = false
+
+  try {
+    // Upload files logic would go here
+    // For now, just add to pending attachments
+    const newAttachments: FileAttachment[] = selectedFiles.value.map((file, index) => ({
+      id: `temp_${Date.now()}_${index}`,
+      filename: file.name,
+      type: file.type,
+      size: file.size,
+      url: URL.createObjectURL(file),
+    }))
+
+    pendingAttachments.value.push(...newAttachments)
+    selectedFiles.value = []
+
+    if (fileInput.value) {
+      fileInput.value.value = ''
+    }
+  }
+  catch (error) {
+    console.error('Error uploading files:', error)
+  }
+}
+
+function removePendingAttachment(index: number) {
+  pendingAttachments.value.splice(index, 1)
+}
+
+function onUpload(files: File[]) {
+  selectedFiles.value = files.slice(0, MAX_FILES)
+  showFilePreviewDialog.value = true
+  activeDialog.value = null
+}
+
+function onSelectFromLibrary(files: any[]) {
+  // Handle files selected from library
+  console.warn('Select from library:', files)
+  activeDialog.value = null
+}
+
+async function importFromURL() {
+  if (!isValidURL.value)
+    return
+
+  importing.value = true
+
+  try {
+    // Import logic would go here
+    console.warn('Import from URL:', importUrl.value)
+    importUrl.value = ''
+    activeDialog.value = null
+  }
+  catch (error) {
+    console.error('Error importing from URL:', error)
+  }
+  finally {
+    importing.value = false
+  }
+}
+
+function openStickerMenu() {
+  // Open sticker/emoji menu
+  console.warn('Sticker menu not implemented yet')
+}
+
+function createGroup() {
+  if (selectedMembers.value.length === 0) {
+    return
+  }
+  // Group creation logic not implemented
+  console.warn('Create group functionality not implemented yet')
+  closeMembersDialog()
+}
+
+// Get active conversation object
 const activeConversation = computed(() => {
   if (!activeConversationId.value || !conversations.value) {
     return null
@@ -923,7 +1257,8 @@ const activeConversation = computed(() => {
   return conversations.value.find(c => c.id === activeConversationId.value) || null
 })
 
-computed(() => {
+// Conversation stats by type
+const _conversationStats = computed(() => {
   const all = conversations.value.length
   const group = conversations.value.filter(c => c.type === 'group').length
   const direct = conversations.value.filter(c => c.type === 'direct').length
@@ -987,6 +1322,7 @@ function handleClickOutside(event: Event) {
 
 onMounted(async () => {
   try {
+    isInitializing.value = true
     await autoLogin()
 
     if (isAuthenticated.value) {
@@ -999,6 +1335,9 @@ onMounted(async () => {
   }
   catch (error: any) {
     conversations.value = []
+  }
+  finally {
+    isInitializing.value = false
   }
 })
 
@@ -1024,10 +1363,33 @@ const filteredMembers = computed(() => {
     member.name.toLowerCase().includes(memberSearchQuery.value.toLowerCase()),
   )
 })
+
+// Debug info
+const debugInfo = computed(() => {
+  const info = {
+    isLoadingConversations: isLoadingConversations.value,
+    conversationListReady: conversationListReady.value,
+    conversationsCount: conversations.value.length,
+    activeConversationId: activeConversationId.value,
+  }
+  console.log('🐛 Debug State:', info)
+  return info
+})
 </script>
 
 <template>
   <PrivateView title="Messages">
+    <!-- Debug Panel -->
+    <div class="fixed top-20 right-4 bg-black/80 text-white p-4 rounded-lg text-xs z-[9999] max-w-xs">
+      <div class="font-bold mb-2">
+        🐛 Debug Info:
+      </div>
+      <div>isLoadingConversations: {{ debugInfo.isLoadingConversations }}</div>
+      <div>conversationListReady: {{ debugInfo.conversationListReady }}</div>
+      <div>conversationsCount: {{ debugInfo.conversationsCount }}</div>
+      <div>activeConvId: {{ debugInfo.activeConversationId || 'none' }}</div>
+    </div>
+
     <template #title-outer:prepend>
       <v-button class="header-icon" rounded disabled icon secondary>
         <v-icon name="inbox" />
@@ -1182,9 +1544,6 @@ const filteredMembers = computed(() => {
     </template>
 
     <template #navigation>
-      {{ conversations.length }} conversations loaded
-
-      {{ filteredConversations.length }} conversations after filter
       <!-- User Profile Component -->
       <ProfileDropdown
         :user-name="currentUserName"
@@ -1206,8 +1565,20 @@ const filteredMembers = computed(() => {
           @filter="handleFilter"
         />
 
+        <!-- Loading State for Conversations -->
+        <div
+          v-if="isLoadingConversations && conversations.length === 0"
+          class="flex flex-col items-center justify-center flex-1 gap-3 py-8"
+        >
+          <v-progress-circular indeterminate />
+          <p class="text-sm text-text-subdued">
+            Đang tải danh sách hội thoại...
+          </p>
+        </div>
+
         <!-- Conversation List -->
         <ConversationList
+          v-else
           :conversations="filteredConversations"
           :active-conversation-id="activeConversationId"
           @select-conversation="selectConversation"
@@ -1217,9 +1588,25 @@ const filteredMembers = computed(() => {
 
     <!-- Main Chat Area với absolute positioning -->
     <div class="chat-container">
+      <!-- App Initialization Loading State -->
+      <div
+        v-if="isInitializing"
+        class="flex flex-col items-center justify-center h-full gap-4"
+      >
+        <v-progress-circular indeterminate size="large" />
+        <div class="flex flex-col items-center gap-2">
+          <p class="text-lg font-semibold text-text-normal">
+            Đang khởi tạo ứng dụng...
+          </p>
+          <p class="text-sm text-text-subdued">
+            Vui lòng đợi trong giây lát
+          </p>
+        </div>
+      </div>
+
       <!-- Switch Account View -->
       <SwitchAccountView
-        v-if="showManageAccountsView && !isSwitchingAccount && !switchAccountSuccess"
+        v-else-if="showManageAccountsView && !isSwitchingAccount && !switchAccountSuccess"
         :accounts="mockAccounts"
         @switch-account="handleSwitchAccount"
         @add-account="handleAddAccount"
@@ -1251,7 +1638,20 @@ const filteredMembers = computed(() => {
           ref="messagesContainer"
           class="messages-area"
         >
+          <!-- Loading State -->
           <div
+            v-if="isLoadingMessages"
+            class="flex flex-col items-center justify-center h-full gap-4"
+          >
+            <v-progress-circular indeterminate />
+            <p class="text-base text-text-subdued">
+              Đang tải tin nhắn...
+            </p>
+          </div>
+
+          <!-- Messages Content -->
+          <div
+            v-else
             class="min-h-full flex flex-col justify-end"
           >
             <div class="space-y-1">
@@ -1425,6 +1825,7 @@ const filteredMembers = computed(() => {
               </div>
             </div>
           </div>
+          <!-- End Messages Content -->
         </div>
 
         <!-- Message input - Fixed tại bottom -->
@@ -1669,7 +2070,28 @@ const filteredMembers = computed(() => {
           </MessageInput>
         </div>
 
-        <!-- Empty state -->
+        <!-- Loading state - hiển thị cho đến khi conversation list sẵn sàng -->
+        <div
+          v-else-if="!conversationListReady"
+          class="flex flex-col items-center justify-center h-full gap-6 p-8"
+        >
+          <v-notice type="info" icon="info">
+            <div class="flex flex-col gap-2">
+              <div class="font-semibold text-base">
+                Đang tải dữ liệu từ Zalo...
+              </div>
+              <div class="text-sm">
+                Vui lòng đợi trong giây lát, hệ thống đang kết nối và tải danh sách hội thoại của bạn.
+              </div>
+            </div>
+          </v-notice>
+          <v-progress-circular indeterminate />
+        </div>
+
+        <!-- Empty state when no conversation available and list is ready -->
+        <EmptyState v-else-if="conversations.length === 0" />
+
+        <!-- Select conversation prompt -->
         <EmptyState v-else />
       </template>
     </div>
