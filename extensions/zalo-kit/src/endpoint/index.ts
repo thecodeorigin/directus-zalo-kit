@@ -21,7 +21,9 @@ import logoutHandler from './routes/logout.post'
 import meHandler from './routes/me.get'
 import messagesHandler from './routes/messages/[conversationId].get'
 import reactHandler from './routes/messages/react.post'
+import saveAttachmentHandler from './routes/messages/save-attachment.post'
 import sendMessageHandler from './routes/messages/send.post'
+import uploadAttachmentHandler from './routes/messages/upload-attachment.post'
 import quickMessagesHandler from './routes/quick-messages/index.get'
 import sessionHandler from './routes/session.get'
 import statusHandler from './routes/status.get'
@@ -73,6 +75,8 @@ export default defineEndpoint(async (router, context) => {
 
   router.get('/messages/:conversationId', messagesHandler(context) as any)
   router.post('/messages/:messageId/react', reactHandler(context) as any)
+  router.post('/messages/save-attachment', saveAttachmentHandler(context) as any)
+  router.post('/messages/upload-attachment', uploadAttachmentHandler(context) as any)
 
   router.get('/avatar-proxy', avatarProxyHandler(context) as any)
 

@@ -722,6 +722,19 @@ async function sendMessage(
   return result
 }
 
+async function sendImage(
+  imageUrl: string,
+  threadId: string,
+  threadType: number,
+): Promise<any> {
+  if (!api)
+    throw new Error('Not logged in')
+
+  // ZCA-JS supports sending images from URL or local path
+  const result = await api.sendImageMessage?.(imageUrl, threadId, threadType)
+  return result
+}
+
 async function sendReaction(
   messageId: string,
   reactionIcon: string,
@@ -1679,6 +1692,7 @@ export {
   quickMessageUpdate,
   reprocessFailedMessages,
   // Message Operations
+  sendImage,
   sendMessage,
 
   sendReaction,
