@@ -392,23 +392,39 @@ async function autoLogin() {
       const users = userResponse.data.data
       const currentUser = users[0]
 
-      if (currentUser) {
-        currentUserName.value = currentUser.displayname || currentUser.zaloname || 'You'
+      console.log('🔍 API Response - Current User:', currentUser)
 
-        if (currentUser.avatarurl) {
-          if (currentUser.avatarurl.startsWith('https://s120-ava-talk.zadn.vn')
-            || currentUser.avatarurl.startsWith('https://ava-grp-talk.zadn.vn')) {
-            currentUserAvatar.value = `http://localhost:8055/zalo/avatar-proxy?url=${encodeURIComponent(currentUser.avatarurl)}`
+      if (currentUser) {
+        currentUserName.value = currentUser.display_name || currentUser.zalo_name || 'You'
+
+        // API trả về avatar_url (snake_case) từ DB
+        const avatarUrl = currentUser.avatar_url
+        if (avatarUrl) {
+          // Sử dụng URL tương đối thay vì hardcode localhost
+          const baseUrl = window.location.origin
+          if (avatarUrl.startsWith('https://s120-ava-talk.zadn.vn')
+            || avatarUrl.startsWith('https://ava-grp-talk.zadn.vn')) {
+            currentUserAvatar.value = `${baseUrl}/zalo/avatar-proxy?url=${encodeURIComponent(avatarUrl)}`
+            console.log('🖼️ User Avatar (via proxy):', currentUserAvatar.value)
           }
           else {
-            currentUserAvatar.value = currentUser.avatarurl
+            currentUserAvatar.value = avatarUrl
+            console.log('🖼️ User Avatar (direct):', currentUserAvatar.value)
           }
         }
         else {
           currentUserAvatar.value = `https://ui-avatars.com/api/?name=${encodeURIComponent(currentUserName.value)}`
+          console.log('🖼️ User Avatar (fallback):', currentUserAvatar.value)
         }
+
+        console.log('👤 Current User:', {
+          name: currentUserName.value,
+          id: currentUserId.value,
+          avatar: currentUserAvatar.value,
+        })
       }
 
+      // ✅ Authentication successful
       isAuthenticated.value = true
     }
     else {
@@ -752,36 +768,111 @@ function selectConversation(id: string) {
     isSelectingConversation = false
   })
 }
-
-function sortConversations() {
-  conversations.value.sort((a, b) => {
-    if (b.lastMessageTimestamp !== a.lastMessageTimestamp) {
-      return b.lastMessageTimestamp - a.lastMessageTimestamp
-    }
-    if (b.unreadCount !== a.unreadCount) {
-      return b.unreadCount - a.unreadCount
-    }
-    return a.name.localeCompare(b.name)
-  })
+function stopConversationPolling() {
+  if (conversationPollingInterval) {
+    clearInterval(conversationPollingInterval)
+    conversationPollingInterval = null
+  }
 }
-
-async function loadConversations(append = false) {
+async function loadConversations() {
   if (!isAuthenticated.value) {
     conversations.value = []
     return
   }
 
   try {
-    if (!append) {
-      loading.value = true
-      isLoadingConversations.value = true
-      conversationPage.value = 1
-    }
-    else {
-      isLoadingMore.value = true
-    }
+    loading.value = true
+    isLoadingConversations.value = true
 
     const convResponse = await api.get('/zalo/index', {
+      params: {
+        page: 1,
+        limit: conversationLimit.value,
+      },
+    })
+
+    const data = convResponse.data.data
+    const meta = convResponse.data.meta
+
+    if (!meta) {
+      return
+    }
+
+    const newConversations = data.map((conv: any) => {
+      const rawTimestamp = conv.timestamp || conv.lastMessageTime || new Date().toISOString()
+      const timestampDate = new Date(rawTimestamp)
+      const timestampMs = timestampDate.getTime()
+
+      return {
+        id: conv.id,
+        name: conv.name || 'Unknown',
+        avatar: conv.avatar || `https://ui-avatars.com/api?name=U&background=random`,
+        lastMessage: conv.lastMessage || '',
+        timestamp: formatTime(rawTimestamp),
+        timestampRaw: rawTimestamp,
+        lastMessageTimestamp: timestampMs,
+        unreadCount: conv.unreadCount || 0,
+        online: true,
+        type: conv.type || 'direct',
+        members: Array.isArray(conv.members)
+          ? conv.members.map((m: any) => ({
+              id: m.id,
+              name: m.name || 'Unknown',
+              avatar: m.avatar || `https://ui-avatars.com/api?name=U&background=random`,
+            }))
+          : [],
+        hasRealAvatar: !!conv.avatar && !conv.avatar.includes('ui-avatars.com'),
+      }
+    })
+
+    // Replace with new conversations
+    conversations.value = newConversations
+    sortConversations()
+
+    hasMoreConversations.value = meta.hasMore
+
+    // Kiểm tra nếu có conversations và chưa select conversation nào
+    if (conversations.value.length > 0 && !activeConversationId.value) {
+      const firstConversation = conversations.value[0]
+      if (firstConversation) {
+        selectConversation(firstConversation.id)
+      }
+    }
+
+    // Mark conversation list as ready khi đã có data hoặc confirm là empty
+    if (!conversationListReady.value) {
+      if (conversations.value.length > 0) {
+        // Có data - mark ready ngay
+        conversationListReady.value = true
+      }
+      else {
+        // Không có data - đợi 6 giây trước khi mark ready
+        setTimeout(() => {
+          conversationListReady.value = true
+        }, 6000)
+      }
+    }
+  }
+  catch (error: any) {
+    console.error('❌ Error loading conversations:', error)
+    conversations.value = []
+  }
+  finally {
+    loading.value = false
+    isLoadingConversations.value = false
+  }
+}
+
+async function loadMoreConversations() {
+  if (isLoadingMore.value || !hasMoreConversations.value) {
+    return
+  }
+
+  isLoadingMore.value = true
+  conversationPage.value++
+
+  try {
+    const convResponse = await api.get('/zalo/conversations', {
       params: {
         page: conversationPage.value,
         limit: conversationLimit.value,
@@ -822,52 +913,22 @@ async function loadConversations(append = false) {
       }
     })
 
-    if (append) {
-      const existingIds = new Set(conversations.value.map(c => c.id))
-      const uniqueNew = newConversations.filter((c: Conversation) => !existingIds.has(c.id))
-      conversations.value.push(...uniqueNew)
-    }
-    else {
-      conversations.value = newConversations
-    }
+    // Append unique conversations
+    const existingIds = new Set(conversations.value.map(c => c.id))
+    const uniqueNew = newConversations.filter((c: Conversation) => !existingIds.has(c.id))
+    conversations.value.push(...uniqueNew)
 
     sortConversations()
 
+    // Update pagination state
     hasMoreConversations.value = meta.hasMore
-
-    if (!append && conversations.value.length > 0 && !activeConversationId.value) {
-      const firstConversation = conversations.value[0]
-      if (firstConversation) {
-        selectConversation(firstConversation.id)
-      }
-    }
-    else if (!append && conversations.value.length === 0) {
-      // Nếu không có conversations, đợi 3 giây trước khi mark conversation list ready
-      setTimeout(() => {
-        conversationListReady.value = true
-      }, 3000) // 3 giây để user thấy thông báo loading
-    }
   }
   catch (error: any) {
-    if (!append) {
-      conversations.value = []
-    }
+    console.error('❌ Error loading more conversations:', error)
   }
   finally {
-    loading.value = false
-    isLoadingConversations.value = false
     isLoadingMore.value = false
   }
-}
-
-async function loadMoreConversations() {
-  if (isLoadingMore.value || !hasMoreConversations.value) {
-    return
-  }
-
-  conversationPage.value++
-
-  await loadConversations(true) // append = true
 }
 
 // Infinite scroll handler
@@ -1171,25 +1232,40 @@ function cancelFileUpload() {
 }
 
 async function confirmAndUploadFiles() {
-  if (selectedFiles.value.length === 0)
+  if (selectedFiles.value.length === 0 || !activeConversationId.value)
     return
 
   showFilePreviewDialog.value = false
 
   try {
-    // Upload files logic would go here
-    // For now, just add to pending attachments
-    const newAttachments: FileAttachment[] = selectedFiles.value.map((file, index) => ({
-      id: `temp_${Date.now()}_${index}`,
-      filename: file.name,
-      type: file.type,
-      size: file.size,
-      url: URL.createObjectURL(file),
-    }))
+    // Use the composable to upload files
+    const { uploadFiles } = useFileUpload()
 
-    pendingAttachments.value.push(...newAttachments)
+    console.log('📤 Uploading files to Directus...')
+    const result = await uploadFiles(selectedFiles.value, activeConversationId.value)
+
+    if (result.success.length > 0) {
+      console.log('✅ Files uploaded successfully:', result.success)
+
+      // Create attachments from uploaded files
+      const newAttachments: FileAttachment[] = result.success.map(file => ({
+        id: file.id,
+        filename: file.filename_download,
+        type: file.type,
+        size: file.filesize,
+        url: `/assets/${file.id}`,
+        width: file.width,
+        height: file.height,
+      }))
+
+      pendingAttachments.value.push(...newAttachments)
+    }
+
+    if (result.errors.length > 0) {
+      console.error('❌ Some files failed to upload:', result.errors)
+    }
+
     selectedFiles.value = []
-
     if (fileInput.value) {
       fileInput.value.value = ''
     }
@@ -1363,33 +1439,10 @@ const filteredMembers = computed(() => {
     member.name.toLowerCase().includes(memberSearchQuery.value.toLowerCase()),
   )
 })
-
-// Debug info
-const debugInfo = computed(() => {
-  const info = {
-    isLoadingConversations: isLoadingConversations.value,
-    conversationListReady: conversationListReady.value,
-    conversationsCount: conversations.value.length,
-    activeConversationId: activeConversationId.value,
-  }
-  console.log('🐛 Debug State:', info)
-  return info
-})
 </script>
 
 <template>
   <PrivateView title="Messages">
-    <!-- Debug Panel -->
-    <div class="fixed top-20 right-4 bg-black/80 text-white p-4 rounded-lg text-xs z-[9999] max-w-xs">
-      <div class="font-bold mb-2">
-        🐛 Debug Info:
-      </div>
-      <div>isLoadingConversations: {{ debugInfo.isLoadingConversations }}</div>
-      <div>conversationListReady: {{ debugInfo.conversationListReady }}</div>
-      <div>conversationsCount: {{ debugInfo.conversationsCount }}</div>
-      <div>activeConvId: {{ debugInfo.activeConversationId || 'none' }}</div>
-    </div>
-
     <template #title-outer:prepend>
       <v-button class="header-icon" rounded disabled icon secondary>
         <v-icon name="inbox" />

@@ -1,4 +1,3 @@
-import { useApi } from '@directus/extensions-sdk'
 import { ref } from 'vue'
 
 interface FileUploadProgress {
@@ -56,7 +55,6 @@ const FILE_CONFIGS = {
 const MAX_FILES = 10
 
 export function useFileUpload() {
-  const api = useApi()
   const uploadProgress = ref<Map<string, FileUploadProgress>>(new Map())
   const isUploading = ref(false)
 
@@ -113,100 +111,77 @@ export function useFileUpload() {
   }
 
   /**
-   * Create folder structure in Directus (optional - not used with S3 for simplicity)
-   * Keep this function for future use if needed
-   */
-  async function _createFolder(conversationId: string): Promise<string | null> {
-    try {
-      // Check if chat_files folder exists
-      const chatFilesFolder = await api.get('/folders', {
-        params: {
-          filter: {
-            name: { _eq: 'chat_files' },
-          },
-        },
-      })
-
-      let chatFilesFolderId: string
-
-      if (chatFilesFolder.data.data.length === 0) {
-        // Create chat_files folder
-        const newChatFolder = await api.post('/folders', {
-          name: 'chat_files',
-        })
-        chatFilesFolderId = newChatFolder.data.data.id
-      }
-      else {
-        chatFilesFolderId = chatFilesFolder.data.data[0].id
-      }
-
-      // Check if conversation folder exists
-      const conversationFolder = await api.get('/folders', {
-        params: {
-          filter: {
-            name: { _eq: conversationId },
-            parent: { _eq: chatFilesFolderId },
-          },
-        },
-      })
-
-      if (conversationFolder.data.data.length === 0) {
-        // Create conversation folder
-        const newConvFolder = await api.post('/folders', {
-          name: conversationId,
-          parent: chatFilesFolderId,
-        })
-        return newConvFolder.data.data.id
-      }
-
-      return conversationFolder.data.data[0].id
-    }
-    catch (error) {
-      console.error('Error creating folder:', error)
-      return null
-    }
-  }
-
-  /**
-   * Upload single file to Directus
+   * Upload single file to Directus via Zalo endpoint
    */
   async function uploadFile(
     file: File,
     conversationId: string,
-    onProgress?: (progress: number) => void,
+    _onProgress?: (progress: number) => void,
   ): Promise<UploadedFile | null> {
     try {
-      // Create FormData
+      // Step 1: Upload to Directus /files endpoint first
       const formData = new FormData()
-      formData.append('file', file) // The file must be in a property called 'file'
+      formData.append('file', file)
+      formData.append('title', file.name)
+      formData.append('description', `Uploaded from Zalo chat conversation: ${conversationId}`)
 
-      // Add optional metadata
-      if (file.name) {
-        formData.append('title', file.name)
-      }
+      const baseUrl = window.location.origin
 
-      // Add folder metadata as a tag or in the title (S3 doesn't support folders like local storage)
-      // You can create folder structure in Directus and use folder ID if needed
-      // For now, we'll use a simple approach without folders
-
-      // Optionally add conversation ID as metadata
-      formData.append('description', `Chat file from conversation: ${conversationId}`)
-
-      // Upload without setting Content-Type header (browser will set it automatically with boundary)
-      const response = await api.post('/files', formData, {
-        onUploadProgress: (progressEvent) => {
-          if (progressEvent.total) {
-            const percentCompleted = Math.round((progressEvent.loaded * 100) / progressEvent.total)
-            onProgress?.(percentCompleted)
-          }
-        },
+      // Upload to Directus files
+      const uploadResponse = await fetch(`${baseUrl}/files`, {
+        method: 'POST',
+        body: formData,
       })
 
-      return response.data.data
+      if (!uploadResponse.ok) {
+        const errorData = await uploadResponse.json().catch(() => ({ message: uploadResponse.statusText }))
+        throw new Error(errorData.errors?.[0]?.message || errorData.message || `Upload failed with status ${uploadResponse.status}`)
+      }
+
+      const uploadResult = await uploadResponse.json()
+      const uploadedFile = uploadResult.data
+
+      // Step 2: Save to zalo_attachments table via our endpoint
+      const attachmentResponse = await fetch(`${baseUrl}/zalo/messages/save-attachment`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          conversationId,
+          file_id: uploadedFile.id,
+          url: `${baseUrl}/assets/${uploadedFile.id}`,
+          file_name: uploadedFile.filename_download,
+          mime_type: uploadedFile.type,
+          file_size: uploadedFile.filesize,
+        }),
+      })
+
+      if (!attachmentResponse.ok) {
+        console.error('⚠️ Failed to save attachment metadata, but file uploaded successfully')
+      }
+
+      const attachmentResult = await attachmentResponse.json()
+
+      // Return uploaded file info
+      return {
+        id: uploadedFile.id,
+        filename_download: uploadedFile.filename_download,
+        filename_disk: uploadedFile.filename_disk,
+        type: uploadedFile.type,
+        filesize: uploadedFile.filesize,
+        uploaded_on: uploadedFile.uploaded_on,
+        storage: uploadedFile.storage,
+        uploaded_by: uploadedFile.uploaded_by,
+        // Include Zalo info if available
+        ...(attachmentResult.data?.sent_to_zalo && {
+          zalo_message_id: attachmentResult.data.zalo_message_id,
+        }),
+      }
     }
     catch (error: any) {
       console.error('❌ Upload failed:', error)
-      console.error('Error details:', error.response?.data || error.message)
+      console.error('Error details:', error.message)
       throw error
     }
   }
