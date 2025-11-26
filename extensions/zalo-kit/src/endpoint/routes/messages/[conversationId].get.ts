@@ -55,7 +55,69 @@ export default defineEventHandler(async (context, { req, res }) => {
 
     messages.reverse()
 
-    // Enrich messages with sender info (already included via ItemsService fields)
+    const senderIds = [...new Set(messages.map((m: any) => m.sender_id).filter(id => id))]
+    const messageIds = messages.map((m: any) => m.id)
+
+    let userMap = new Map()
+    let attachmentsMap = new Map()
+
+    if (senderIds.length > 0) {
+      try {
+        const users = await database('zalo_users')
+          .whereIn('id', senderIds)
+          .select(['id', 'display_name', 'avatar_url', 'zalo_name'])
+          .timeout(queryTimeout)
+
+        userMap = new Map(users.map((u: any) => [u.id, u]))
+      }
+      catch (userError) {
+        console.error('[Endpoint] Error fetching users:', userError)
+        // Continue without user data
+      }
+    }
+
+    // Fetch attachments for all messages
+    if (messageIds.length > 0) {
+      try {
+        const attachments = await database('zalo_attachments')
+          .whereIn('message_id', messageIds)
+          .select([
+            'id',
+            'message_id',
+            'url',
+            'file_name',
+            'mime_type',
+            'file_size',
+            'width',
+            'height',
+            'thumbnail_url',
+          ])
+          .timeout(queryTimeout)
+
+        // Group attachments by message_id
+        attachments.forEach((att: any) => {
+          if (!attachmentsMap.has(att.message_id)) {
+            attachmentsMap.set(att.message_id, [])
+          }
+          attachmentsMap.get(att.message_id).push({
+            id: att.id,
+            url: att.url,
+            filename: att.file_name,
+            type: att.mime_type,
+            size: att.file_size,
+            width: att.width,
+            height: att.height,
+            thumbnail: att.thumbnail_url,
+          })
+        })
+      }
+      catch (attError) {
+        console.error('[Endpoint] Error fetching attachments:', attError)
+        // Continue without attachment data
+      }
+    }
+
+    // Enrich messages with sender info
     const enrichedMessages = messages.map((msg: any) => {
       try {
         const sender = typeof msg.sender_id === 'object' ? msg.sender_id : null
@@ -95,7 +157,7 @@ export default defineEventHandler(async (context, { req, res }) => {
           status: 'delivered',
           isEdited: msg.is_edited || false,
           isUndone: msg.is_undone || false,
-          attachments: [],
+          attachments: attachmentsMap.get(msg.id) || [],
         }
       }
       catch (enrichError) {
@@ -114,7 +176,7 @@ export default defineEventHandler(async (context, { req, res }) => {
           status: 'delivered',
           isEdited: false,
           isUndone: false,
-          attachments: [],
+          attachments: attachmentsMap.get(msg.id) || [],
         }
       }
     })
