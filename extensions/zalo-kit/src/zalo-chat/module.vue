@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { useApi } from '@directus/extensions-sdk'
 import { authentication, createDirectus, realtime, rest } from '@directus/sdk'
-import { computed, nextTick, onBeforeUnmount, onMounted, onUnmounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, onUnmounted, ref, watchEffect } from 'vue'
 
 // Components imports - sorted by path
 import AccountSwitchedSuccess from './components/AccountSwitchedSuccess.vue'
@@ -248,6 +248,10 @@ function handleImageError(event: Event, name: string) {
   target.src = `https://ui-avatars.com/api/?name=${encodeURIComponent(name)}&background=random`
 }
 
+function openFileInNewTab(url: string) {
+  window.open(url, '_blank')
+}
+
 const filteredConversations = computed(() => {
   let filtered = conversations.value
 
@@ -342,21 +346,80 @@ function _applyFilters() {
  * Send message - Optimistic update NGAY LẬP TỨC
  */
 async function sendMessage() {
-  if (!messageText.value.trim() || !activeConversationId.value || sendingMessage.value) {
+  if ((!messageText.value.trim() && pendingAttachments.value.length === 0) || !activeConversationId.value || sendingMessage.value) {
     return
   }
 
   const content = messageText.value.trim()
+  const clientId = `client_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
+  const attachmentsToSend = [...pendingAttachments.value]
+
+  messageText.value = ''
+  pendingAttachments.value = []
   sendingMessage.value = true
   messageText.value = ''
 
+  // ✅ Thêm message NGAY VÀO UI (optimistic update)
+  const optimisticMessage = {
+    id: clientId, // Dùng clientId tạm thời
+    direction: 'out' as const,
+    text: content || '',
+    senderName: currentUserName.value,
+    senderId: currentUserId.value,
+    time: new Date().toISOString(),
+    avatar: currentUserAvatar.value,
+    status: 'sent' as const,
+    files: attachmentsToSend.map(att => ({
+      id: att.id,
+      url: att.url,
+      filename: att.filename,
+      type: att.type,
+      size: att.size,
+    })),
+    reactions: [],
+    isEdited: false,
+    isUndone: false,
+    clientId,
+  }
+  
+  messages.value.push(optimisticMessage)
+  
+  // Scroll xuống cuối ngay lập tức với behavior: instant để không bị giật
+  nextTick(() => {
+    if (messagesContainer.value) {
+      messagesContainer.value.scrollTop = messagesContainer.value.scrollHeight
+      console.warn('✅ Scrolled to bottom after optimistic update')
+    }
+  })
+
+  try {
+    // Send message with attachments
+    const payload = {
   try {
     // Always use HTTP API for sending messages
     await api.post('/zalo/send', {
       conversationId: activeConversationId.value,
-      message: content,
-    })
+      message: content || (attachmentsToSend.length > 0 ? `📎 ${attachmentsToSend.length} file(s)` : ''),
+      attachments: attachmentsToSend.map(att => ({
+        file_id: att.id,
+        url: att.url,
+        filename: att.filename,
+        type: att.type,
+        size: att.size,
+      })),
+    }
 
+    console.log('📤 Sending payload:', payload)
+    console.log('📎 Attachments array:', payload.attachments)
+
+    const response = await api.post('/zalo/send', payload)
+
+    // Cập nhật conversation ngay lập tức khi gửi tin
+    const now = new Date().toISOString()
+    updateConversationOnNewMessage(activeConversationId.value, {
+      text: content || `📎 ${attachmentsToSend.length} file(s)`,
+      time: now,
+      sentAt: now,
     // Auto scroll to bottom after sending
     nextTick(() => {
       if (messagesContainer.value) {
@@ -368,7 +431,9 @@ async function sendMessage() {
     // No need to manually update UI
   }
   catch (error: any) {
+    console.error('❌ Failed to send message:', error)
     messageText.value = content
+    pendingAttachments.value = attachmentsToSend
   }
   finally {
     sendingMessage.value = false
@@ -803,11 +868,26 @@ async function loadConversations() {
       const timestampDate = new Date(rawTimestamp)
       const timestampMs = timestampDate.getTime()
 
+      // ✅ Filter JSON string trong lastMessage
+      let lastMessage = conv.lastMessage || ''
+      if (lastMessage && typeof lastMessage === 'string') {
+        const trimmed = lastMessage.trim()
+        if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || 
+            (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+          try {
+            JSON.parse(trimmed)
+            lastMessage = '📎 Attachment' // Hiển thị "Attachment" thay vì JSON
+          } catch {
+            // Not JSON, keep as-is
+          }
+        }
+      }
+
       return {
         id: conv.id,
         name: conv.name || 'Unknown',
         avatar: conv.avatar || `https://ui-avatars.com/api?name=U&background=random`,
-        lastMessage: conv.lastMessage || '',
+        lastMessage,
         timestamp: formatTime(rawTimestamp),
         timestampRaw: rawTimestamp,
         lastMessageTimestamp: timestampMs,
@@ -825,9 +905,18 @@ async function loadConversations() {
       }
     })
 
-    // Replace with new conversations
-    conversations.value = newConversations
-    sortConversations()
+    // ✅ CHỈ update nếu có thay đổi thực sự
+    const hasConversationChanges = conversations.value.length !== newConversations.length ||
+      JSON.stringify(conversations.value.map((c: Conversation) => ({ id: c.id, lastMessage: c.lastMessage, unreadCount: c.unreadCount }))) !==
+      JSON.stringify(newConversations.map((c: Conversation) => ({ id: c.id, lastMessage: c.lastMessage, unreadCount: c.unreadCount })))
+
+    if (hasConversationChanges) {
+      console.warn('🔄 Conversations changed, updating...')
+      conversations.value = newConversations
+      sortConversations()
+    } else {
+      console.warn('✅ No conversation changes, skip update')
+    }
 
     hasMoreConversations.value = meta.hasMore
 
@@ -1035,7 +1124,16 @@ function updateConversationOnNewMessage(conversationId: string, message: any) {
     conversation.unreadCount = (conversation.unreadCount || 0) + 1
   }
 
-  sortConversations()
+  // ✅ Chỉ sort nếu conversation này cần lên đầu
+  // Check xem có cần move lên đầu không
+  const currentIndex = conversations.value.findIndex(c => c.id === conversationId)
+  if (currentIndex > 0) {
+    const prevConv = conversations.value[0]
+    // Chỉ sort nếu conversation này có timestamp mới hơn conversation đầu tiên
+    if (prevConv && messageTimestamp > prevConv.lastMessageTimestamp) {
+      sortConversations()
+    }
+  }
 }
 
 function startMessagePolling(conversationId: string) {
@@ -1051,12 +1149,12 @@ function startMessagePolling(conversationId: string) {
   // Poll immediately first time
   pollMessages(conversationId)
 
-  // Then poll every 2 seconds
+  // Then poll every 3 seconds
   pollingInterval = setInterval(() => {
     if (isPolling) {
       pollMessages(conversationId)
     }
-  }, 2000)
+  }, 3000) // Poll message mỗi 3 giây
 }
 
 async function pollMessages(conversationId: string) {
@@ -1247,13 +1345,16 @@ async function confirmAndUploadFiles() {
     if (result.success.length > 0) {
       console.log('✅ Files uploaded successfully:', result.success)
 
+      // Get base URL for assets
+      const baseUrl = window.location.origin
+
       // Create attachments from uploaded files
       const newAttachments: FileAttachment[] = result.success.map(file => ({
         id: file.id,
         filename: file.filename_download,
         type: file.type,
         size: file.filesize,
-        url: `/assets/${file.id}`,
+        url: `${baseUrl}/assets/${file.id}`,
         width: file.width,
         height: file.height,
       }))
@@ -1414,6 +1515,13 @@ onMounted(async () => {
   }
   finally {
     isInitializing.value = false
+  }
+})
+
+// 🔍 Debug: Track scroll position changes
+watchEffect(() => {
+  if (messagesContainer.value) {
+    console.warn('📍 ScrollTop changed:', messagesContainer.value.scrollTop)
   }
 })
 
@@ -1828,7 +1936,9 @@ const filteredMembers = computed(() => {
                             :src="file.thumbnail || file.url"
                             :alt="file.filename"
                             class="max-w-full h-auto max-h-96 object-cover cursor-pointer hover:opacity-90 transition-opacity"
-                            @click="window.open(file.url, '_blank')"
+                            style="min-height: 200px; background: #f3f4f6;"
+                            loading="eager"
+                            @click="openFileInNewTab(file.url)"
                           >
                           <div class="absolute bottom-2 right-2 bg-black/50 text-white text-xs px-2 py-1 rounded">
                             {{ formatFileSize(Number(file.size)) }}
@@ -1853,7 +1963,7 @@ const filteredMembers = computed(() => {
                           </div>
                           <button
                             class="flex-shrink-0 w-8 h-8 flex items-center justify-center rounded-lg hover:bg-black/10 transition-colors"
-                            @click="window.open(file.url, '_blank')"
+                            @click="openFileInNewTab(file.url)"
                           >
                             <v-icon
                               name="download"
@@ -1866,7 +1976,7 @@ const filteredMembers = computed(() => {
 
                     <!-- Message content (text) -->
                     <div
-                      v-if="message.text"
+                      v-if="message.text && !message.text.startsWith('📎')"
                       class="rounded-lg max-w-full break-words text-sm text-text-secondary leading-relaxed border-neutral-200"
                     >
                       <p class="">

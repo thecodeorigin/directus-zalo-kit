@@ -59,7 +59,7 @@ export default defineEventHandler(async (context, { req, res }) => {
     const messageIds = messages.map((m: any) => m.id)
 
     let userMap = new Map()
-    let attachmentsMap = new Map()
+    const attachmentsMap = new Map()
 
     if (senderIds.length > 0) {
       try {
@@ -99,15 +99,20 @@ export default defineEventHandler(async (context, { req, res }) => {
           if (!attachmentsMap.has(att.message_id)) {
             attachmentsMap.set(att.message_id, [])
           }
+
+          // Get base URL from request
+          const baseUrl = req.get('origin') || `http://localhost:8055`
+          const fullUrl = att.url.startsWith('http') ? att.url : `${baseUrl}${att.url}`
+
           attachmentsMap.get(att.message_id).push({
             id: att.id,
-            url: att.url,
+            url: fullUrl,
             filename: att.file_name,
             type: att.mime_type,
             size: att.file_size,
             width: att.width,
             height: att.height,
-            thumbnail: att.thumbnail_url,
+            thumbnail: att.thumbnail_url ? (att.thumbnail_url.startsWith('http') ? att.thumbnail_url : `${baseUrl}${att.thumbnail_url}`) : fullUrl,
           })
         })
       }
@@ -115,6 +120,8 @@ export default defineEventHandler(async (context, { req, res }) => {
         console.error('[Endpoint] Error fetching attachments:', attError)
         // Continue without attachment data
       }
+
+      console.warn(`[Endpoint] Loaded ${attachmentsMap.size} messages with attachments`)
     }
 
     // Enrich messages with sender info
@@ -130,8 +137,41 @@ export default defineEventHandler(async (context, { req, res }) => {
           senderAvatar = `https://ui-avatars.com/api/?name=${encodeURIComponent(avatarName)}&background=random`
         }
 
-        // Parse content
-        let parsedContent = msg.content || ''
+        // Parse content - xử lý cả string và object
+        let parsedContent = ''
+        if (msg.content) {
+          if (typeof msg.content === 'string') {
+            // ✅ Filter JSON string - không hiển thị nếu là JSON object serialized
+            const trimmed = msg.content.trim()
+            
+            // Check if it's a JSON object string (starts with { or [)
+            if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || 
+                (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+              try {
+                // Try to parse - nếu parse được thì đây là JSON, không hiển thị
+                JSON.parse(trimmed)
+                parsedContent = '' // Ẩn JSON object
+                console.warn(`[Endpoint] Filtered JSON content from message ${msg.id}`)
+              } catch {
+                // Not valid JSON, display as-is
+                parsedContent = msg.content
+              }
+            } else {
+              parsedContent = msg.content
+            }
+          } else if (typeof msg.content === 'object') {
+            // Nếu là object JSON, có thể là từ Zalo raw data
+            // Không hiển thị raw object, chỉ hiển thị nếu có attachments
+            parsedContent = ''
+            console.warn(`[Endpoint] Filtered object content from message ${msg.id}`)
+          }
+        }
+
+        // Nếu có attachments nhưng không có text, để trống
+        const hasAttachments = attachmentsMap.has(msg.id) && attachmentsMap.get(msg.id).length > 0
+        if (hasAttachments && !parsedContent) {
+          parsedContent = '' // Không hiển thị text khi chỉ có attachment
+        }
 
         // Format time
         const time = msg.sent_at
