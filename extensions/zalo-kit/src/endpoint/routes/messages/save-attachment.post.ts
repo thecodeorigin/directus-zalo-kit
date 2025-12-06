@@ -1,11 +1,11 @@
 import type { Accountability } from '@directus/types'
-import { ThreadType } from 'zca-js'
-import * as ZaloMessage from '../../services/ZaloMessageService'
 import { defineEventHandler } from '../../utils'
 
 /**
- * Save attachment metadata to zalo_attachments table and send to Zalo chat
+ * Save attachment metadata to zalo_attachments table
  * This endpoint receives file info after file is uploaded to Directus /files
+ * NOTE: ZCA does not support sending files/images for personal Zalo chat,
+ * so we only save to database and display in UI
  */
 export default defineEventHandler(async (context, { req, res }) => {
   const _req = req as typeof req & { accountability: Accountability | null }
@@ -66,53 +66,9 @@ export default defineEventHandler(async (context, { req, res }) => {
       .insert(attachmentData)
       .returning('*')
 
-    // Try to send image to Zalo chat if it's an image
-    let zaloMessageId = null
-    const isImage = mime_type.startsWith('image/')
-
-    if (isImage) {
-      try {
-        // Get conversation info to determine thread type
-        const [conversation] = await database('zalo_conversations')
-          .where('id', conversationId)
-          .select(['participant_id', 'group_id'])
-          .limit(1)
-
-        if (conversation) {
-          const zaloThreadId = conversation.group_id || conversation.participant_id
-          const threadType = conversation.group_id ? ThreadType.Group : ThreadType.User
-
-          // Send image to Zalo
-          const zaloResult = await ZaloMessage.sendImage(
-            url,
-            String(zaloThreadId),
-            threadType,
-          )
-
-          if (zaloResult?.data?.msgId || zaloResult?.msgId) {
-            zaloMessageId = zaloResult.data?.msgId || zaloResult.msgId
-
-            // Update attachment with Zalo message ID
-            await database('zalo_attachments')
-              .where('id', attachment.id)
-              .update({
-                message_id: zaloMessageId,
-                updated_at: new Date().toISOString(),
-              })
-          }
-        }
-      }
-      catch (zaloError: any) {
-        console.error('⚠️ Failed to send image to Zalo:', zaloError.message)
-        // Continue even if Zalo send fails - file is still uploaded to Directus
-      }
-    }
-
     res.json({
       success: true,
-      message: zaloMessageId
-        ? 'File saved and sent to Zalo successfully'
-        : 'File saved to database successfully',
+      message: 'File saved to database successfully',
       data: {
         attachment_id: attachment.id,
         file_id,
@@ -120,8 +76,6 @@ export default defineEventHandler(async (context, { req, res }) => {
         filename: file_name,
         type: mime_type,
         size: file_size,
-        zalo_message_id: zaloMessageId,
-        sent_to_zalo: !!zaloMessageId,
       },
     })
   }
