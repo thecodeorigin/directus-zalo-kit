@@ -74,6 +74,7 @@ services:
       - ./extensions:/directus/extensions
       - ./migrations:/directus/migrations
       - ./templates:/directus/templates
+      - ./uploads:/directus/uploads
     depends_on:
       cache:
         condition: service_healthy
@@ -107,15 +108,9 @@ services:
 
       PUBLIC_URL: ${PUBLIC_URL}
 
-      # S3 Configuration for LocalStack
-      STORAGE_LOCATIONS: "s3"
-      STORAGE_S3_DRIVER: "s3"
-      STORAGE_S3_KEY: "test"
-      STORAGE_S3_SECRET: "test"
-      STORAGE_S3_BUCKET: "directus-uploads"
-      STORAGE_S3_REGION: "us-east-1"
-      STORAGE_S3_ENDPOINT: "http://localstack:4566"
-      STORAGE_S3_FORCE_PATH_STYLE: "true"
+      # Storage Configuration - Using Local Storage
+      STORAGE_LOCATIONS: "local"
+      STORAGE_LOCAL_ROOT: "./uploads"
 
       # Email Configuration (points to MailHog)
       EMAIL_TRANSPORT: smtp
@@ -132,6 +127,11 @@ services:
       EXTENSIONS_AUTO_RELOAD: ${EXTENSIONS_AUTO_RELOAD:-true}
       REFRESH_TOKEN_COOKIE_SECURE: false
       SESSION_COOKIE_SECURE: false
+      
+      # Files & Assets Configuration
+      FILES_MAX_UPLOAD_SIZE: "100mb"
+      ASSETS_CACHE_TTL: "30m"
+      ASSETS_TRANSFORM_MAX_CONCURRENT: 25
       WEBSOCKETS_ENABLED: ${WEBSOCKETS_ENABLED:-true}
 
       # Sepay Configuration
@@ -139,7 +139,11 @@ services:
       SEPAY_BANK_CODE: ${SEPAY_BANK_CODE}
       SEPAY_QR_BASE: ${SEPAY_QR_BASE}
 
+      # Content Security Policy
+      CONTENT_SECURITY_POLICY: "true"
       CONTENT_SECURITY_POLICY_DIRECTIVES__IMG_SRC: ${CONTENT_SECURITY_POLICY_DIRECTIVES__IMG_SRC}
+      ASSETS_CONTENT_SECURITY_POLICY_DIRECTIVES__MEDIA_SRC: ${ASSETS_CONTENT_SECURITY_POLICY_DIRECTIVES__MEDIA_SRC}   
+      ASSETS_CONTENT_SECURITY_POLICY_DIRECTIVES__IMG_SRC: ${ASSETS_CONTENT_SECURITY_POLICY_DIRECTIVES__IMG_SRC}
     command: >
       sh -c "
         npx directus bootstrap &&
