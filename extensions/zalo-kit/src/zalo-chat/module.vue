@@ -381,9 +381,9 @@ async function sendMessage() {
     isUndone: false,
     clientId,
   }
-  
+
   messages.value.push(optimisticMessage)
-  
+
   // Scroll to bottom immediately
   nextTick(() => {
     if (messagesContainer.value) {
@@ -418,13 +418,13 @@ async function sendMessage() {
   }
   catch (error: any) {
     console.error('❌ Failed to send message:', error)
-    
+
     // Remove optimistic message on error
     const index = messages.value.findIndex(m => m.clientId === clientId)
     if (index !== -1) {
       messages.value.splice(index, 1)
     }
-    
+
     // Restore input
     messageText.value = content
     pendingAttachments.value = attachmentsToSend
@@ -495,8 +495,6 @@ async function autoLogin() {
   }
 }
 
-
-
 /**
  * Scroll messages container to bottom
  */
@@ -510,7 +508,7 @@ function scrollToBottom() {
 async function initializeWebSocket() {
   try {
     console.log('[WebSocket] Initializing WebSocket connection...')
-    
+
     // Get session token from endpoint
     const tokenResponse = await api.get('/zalo/get-session-token')
     const sessionToken = tokenResponse.data?.sessionToken
@@ -525,7 +523,7 @@ async function initializeWebSocket() {
     // Set token and connect
     await directusClient.setToken(sessionToken)
     console.log('[WebSocket] Token set, connecting...')
-    
+
     await directusClient.connect()
     console.log('[WebSocket] Connected successfully')
 
@@ -535,11 +533,8 @@ async function initializeWebSocket() {
     // Subscribe to global conversations for real-time updates
     await subscribeToAllConversations()
 
-    // Subscribe to messages for active conversation if any
-    if (activeConversationId.value) {
-      console.log('[WebSocket] Subscribing to active conversation:', activeConversationId.value)
-      await subscribeToConversationMessages(activeConversationId.value)
-    }
+    // Subscribe to messages globally (all conversations)
+    await subscribeToAllMessages()
   }
   catch (error) {
     console.error('[WebSocket] Failed to initialize:', error)
@@ -550,7 +545,7 @@ async function initializeWebSocket() {
 async function subscribeToAllConversations() {
   try {
     console.log('[WebSocket] Subscribing to conversations...')
-    
+
     // Subscribe to conversation creation
     const createSub = await directusClient.subscribe('zalo_conversations', {
       event: 'create',
@@ -607,12 +602,12 @@ async function subscribeToAllConversations() {
   }
 }
 
-// Subscribe to messages for a specific conversation
-async function subscribeToConversationMessages(conversationId: string) {
+// Subscribe to messages globally (all conversations)
+async function subscribeToAllMessages() {
   try {
-    console.log('[WebSocket] Subscribing to messages for conversation:', conversationId)
-    
-    // Unsubscribe from previous conversation if any
+    console.log('[WebSocket] Subscribing to ALL messages (global subscription)')
+
+    // If there's an existing messageUnsubscribe from old logic, clear it
     if (messageUnsubscribe) {
       messageUnsubscribe()
       messageUnsubscribe = null
@@ -622,49 +617,58 @@ async function subscribeToConversationMessages(conversationId: string) {
       event: 'create',
       query: {
         fields: ['*', 'sender_id.*'],
-        filter: {
-          conversation_id: {
-            _eq: conversationId,
-          },
-        },
+        // no filter - listen to all conversations
         sort: ['sent_at'],
       },
-      uid: `messages-${conversationId}`,
+      uid: 'messages-global',
     })
 
-    console.log('[WebSocket] Successfully subscribed to messages for:', conversationId)
     messageUnsubscribe = unsubscribe
 
-    // Process events in background
     ;(async () => {
       for await (const item of subscription) {
-        console.log('[WebSocket] Received message event:', item)
-        
         if (item.type === 'subscription' && item.event === 'create') {
-          const messageData = item.data[0]
-
-          console.log('[WebSocket] Processing new message:', messageData?.id)
-
-          // Check for duplicates
-          if (processedMessageIds.has(messageData.id)) {
-            console.log('[WebSocket] Skipping duplicate message:', messageData.id)
+          if (!item.data || !Array.isArray(item.data) || item.data.length === 0) {
             continue
           }
 
-          processedMessageIds.add(messageData.id)
+          const messageData = item.data[0]
+          if (!messageData || !messageData.id) {
+            continue
+          }
 
-          handleNewMessage({
-            conversationId,
-            message: messageData,
+          const conversationId = messageData.conversation_id || messageData.conversationId
+
+          // ⚠️ DON'T check or add to processedMessageIds here
+          // Let handleNewMessage() or updateConversationOnNewMessage() handle it
+          // This allows messages to be properly added to UI when conversation is active
+
+          // Always update conversation preview
+          updateConversationOnNewMessage(conversationId, messageData)
+
+          // Only add to messages list if it's the active conversation
+          console.log('[WebSocket] Checking if message is for active conversation:', {
+            messageConversationId: conversationId,
+            activeConversationId: activeConversationId.value,
+            shouldAdd: conversationId === activeConversationId.value,
+            messageId: messageData.id,
           })
+
+          if (conversationId === activeConversationId.value) {
+            console.log('[WebSocket] Adding message to active conversation UI')
+            handleNewMessage({ conversationId, message: messageData })
+          }
+          else {
+            console.log('[WebSocket] Message is for different conversation, only updating preview')
+          }
         }
       }
     })().catch((err) => {
-      console.error('[WebSocket] Message subscription error:', err)
+      console.error('[WebSocket] Global message subscription error:', err)
     })
   }
   catch (error) {
-    // Silent fail
+    console.error('[WebSocket] Failed to subscribe to all messages:', error)
   }
 }
 
@@ -696,8 +700,10 @@ function handleNewMessage(data: any) {
   const messageData = data.message || data.data || data
   const conversationId = data.conversationId || messageData.conversation_id
 
-  console.log('[UI] handleNewMessage called:', {
-    conversationId,
+  console.log('[UI] handleNewMessage called with full data:', {
+    rawData: data,
+    extractedMessageData: messageData,
+    extractedConversationId: conversationId,
     messageId: messageData?.id,
     activeConversationId: activeConversationId.value,
   })
@@ -866,11 +872,8 @@ function selectConversation(id: string) {
     return
 
   console.log('[UI] Selecting conversation:', id)
-  
-  isSelectingConversation = true
 
-  // Unsubscribe from old conversation messages
-  unsubscribeFromMessages()
+  isSelectingConversation = true
 
   activeConversationId.value = id
   messages.value = []
@@ -883,12 +886,9 @@ function selectConversation(id: string) {
 
   // Load initial messages
   loadMessages(id).finally(() => {
-    // Subscribe to new conversation messages via WebSocket
-    if (websocketConnected.value && websocketAuthenticated.value) {
-      console.log('[UI] WebSocket connected, subscribing to messages...')
-      subscribeToConversationMessages(id)
-    } else {
-      console.warn('[UI] WebSocket not connected, skipping subscription')
+    // With global subscription enabled we don't need to subscribe per-conversation
+    if (!(websocketConnected.value && websocketAuthenticated.value)) {
+      console.warn('[UI] WebSocket not connected, skipping realtime updates')
     }
 
     isSelectingConversation = false
@@ -927,12 +927,13 @@ async function loadConversations() {
       let lastMessage = conv.lastMessage || ''
       if (lastMessage && typeof lastMessage === 'string') {
         const trimmed = lastMessage.trim()
-        if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || 
-            (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+        if ((trimmed.startsWith('{') && trimmed.endsWith('}'))
+          || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
           try {
             JSON.parse(trimmed)
             lastMessage = '📎 Attachment' // Hiển thị "Attachment" thay vì JSON
-          } catch {
+          }
+          catch {
             // Not JSON, keep as-is
           }
         }
@@ -961,15 +962,16 @@ async function loadConversations() {
     })
 
     // ✅ CHỈ update nếu có thay đổi thực sự
-    const hasConversationChanges = conversations.value.length !== newConversations.length ||
-      JSON.stringify(conversations.value.map((c: Conversation) => ({ id: c.id, lastMessage: c.lastMessage, unreadCount: c.unreadCount }))) !==
-      JSON.stringify(newConversations.map((c: Conversation) => ({ id: c.id, lastMessage: c.lastMessage, unreadCount: c.unreadCount })))
+    const hasConversationChanges = conversations.value.length !== newConversations.length
+      || JSON.stringify(conversations.value.map((c: Conversation) => ({ id: c.id, lastMessage: c.lastMessage, unreadCount: c.unreadCount })))
+      !== JSON.stringify(newConversations.map((c: Conversation) => ({ id: c.id, lastMessage: c.lastMessage, unreadCount: c.unreadCount })))
 
     if (hasConversationChanges) {
       console.warn('🔄 Conversations changed, updating...')
       conversations.value = newConversations
       sortConversations()
-    } else {
+    }
+    else {
       console.warn('✅ No conversation changes, skip update')
     }
 
@@ -1191,9 +1193,6 @@ function updateConversationOnNewMessage(conversationId: string, message: any) {
   }
 }
 
-
-
-
 function removeMember(memberId: string) {
   const index = selectedMembers.value.indexOf(memberId)
   if (index > -1) {
@@ -1375,7 +1374,8 @@ function toggleMemberSelection(memberId: string) {
   const index = selectedMembers.value.indexOf(memberId)
   if (index > -1) {
     selectedMembers.value.splice(index, 1)
-  } else {
+  }
+  else {
     selectedMembers.value.push(memberId)
   }
 }
@@ -1866,16 +1866,16 @@ const filteredMembers = computed(() => {
                     >
                   </div>
 
-                <div class="flex flex-col max-w-[70%]">
-                  <!-- Message header with name and time -->
-                  <div class="flex items-center gap-2 mb-2">
-                    <span class="font-semibold text-sm text-text-secondary">
-                      {{ message.senderName }}
-                    </span>
-                    <span class="text-xs text-text-muted">
-                      {{ formatTime(message.time) }}
-                    </span>
-                  </div>
+                  <div class="flex flex-col max-w-[70%]">
+                    <!-- Message header with name and time -->
+                    <div class="flex items-center gap-2 mb-2">
+                      <span class="font-semibold text-sm text-text-secondary">
+                        {{ message.senderName }}
+                      </span>
+                      <span class="text-xs text-text-muted">
+                        {{ formatTime(message.time) }}
+                      </span>
+                    </div>
 
                     <!-- File Attachments -->
                     <div v-if="message.files && message.files.length > 0" class="flex flex-col gap-2 mb-2">
