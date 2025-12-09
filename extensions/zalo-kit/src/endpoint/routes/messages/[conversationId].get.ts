@@ -61,27 +61,19 @@ export default defineEventHandler(async (context, { req, res }) => {
     let userMap = new Map()
     const attachmentsMap = new Map()
 
-    if (senderIds.length > 0) {
-      try {
-        const users = await database('zalo_users')
-          .whereIn('id', senderIds)
-          .select(['id', 'display_name', 'avatar_url', 'zalo_name'])
-          .timeout(queryTimeout)
-
-        userMap = new Map(users.map((u: any) => [u.id, u]))
-      }
-      catch (userError) {
-        console.error('[Endpoint] Error fetching users:', userError)
-        // Continue without user data
-      }
-    }
-
-    // Fetch attachments for all messages
+    // Fetch attachments using ItemsService instead of database
     if (messageIds.length > 0) {
       try {
-        const attachments = await database('zalo_attachments')
-          .whereIn('message_id', messageIds)
-          .select([
+        const attachmentsService = new context.services.ItemsService('zalo_attachments', {
+          schema: await context.getSchema(),
+          accountability: { admin: true, role: null, user: null, roles: [], app: false, ip: null },
+        })
+
+        const attachments = await attachmentsService.readByQuery({
+          filter: {
+            message_id: { _in: messageIds },
+          },
+          fields: [
             'id',
             'message_id',
             'url',
@@ -91,8 +83,9 @@ export default defineEventHandler(async (context, { req, res }) => {
             'width',
             'height',
             'thumbnail_url',
-          ])
-          .timeout(queryTimeout)
+          ],
+          limit: -1,
+        })
 
         // Group attachments by message_id
         attachments.forEach((att: any) => {
