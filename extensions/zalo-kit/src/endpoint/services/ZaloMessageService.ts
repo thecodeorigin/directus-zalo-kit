@@ -599,15 +599,21 @@ async function listenerHandleMessageDirect(rawData: any): Promise<void> {
     }
 
     // 8. Cập nhật last message using ItemsService
+    // ✅ Use updateOne instead of updateByQuery to ensure WebSocket events trigger
     const conversationsService = await getService('zalo_conversations')
-    await conversationsService.updateByQuery(
-      { filter: { id: { _eq: conversationId } } },
-      {
+    const existingConvs = await conversationsService.readByQuery({
+      filter: { id: { _eq: conversationId } },
+      fields: ['id'],
+      limit: 1,
+    })
+
+    if (existingConvs.length > 0) {
+      await conversationsService.updateOne(existingConvs[0].id, {
         last_message_id: messageId,
-        last_message: content, // ✅ Add last_message content
+        last_message: content,
         last_message_time: sentAt.toISOString(),
-      },
-    )
+      })
+    }
 
     // Broadcast message via WebSocket
     try {
