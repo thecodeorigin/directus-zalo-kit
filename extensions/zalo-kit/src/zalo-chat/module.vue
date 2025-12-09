@@ -87,8 +87,9 @@ interface FileAttachment {
 // Reactive data
 const api = useApi()
 
-// Direct Directus client for WebSocket
-const directusClient = createDirectus('http://localhost:8055')
+// Direct Directus client for WebSocket - use dynamic URL
+const baseUrl = window.location.origin
+const directusClient = createDirectus(baseUrl)
   .with(authentication())
   .with(realtime())
   .with(rest())
@@ -132,7 +133,8 @@ const isLoadingMore = ref(false)
 
 const _conversationTypeFilter = ref<'all' | 'group' | 'direct'>('all')
 
-let conversationPollingInterval: any = null
+// Track processed message IDs to avoid duplicates
+const processedMessageIds = new Set<string>()
 
 // File upload composable
 const {
@@ -319,6 +321,14 @@ function getInitials(name: string): string {
     .slice(0, 2)
 }
 
+function sortConversations() {
+  conversations.value.sort((a, b) => {
+    const timeA = a.lastMessageTimestamp || 0
+    const timeB = b.lastMessageTimestamp || 0
+    return timeB - timeA // Sort descending (newest first)
+  })
+}
+
 function _clearAllFilters() {
   filterOptions.value = {
     status: {
@@ -339,11 +349,7 @@ function _applyFilters() {
 }
 
 /**
- * Send message - with optimistic update
- */
-
-/**
- * Send message - Optimistic update NGAY LẬP TỨC
+ * Send message - with optimistic update and WebSocket sync
  */
 async function sendMessage() {
   if ((!messageText.value.trim() && pendingAttachments.value.length === 0) || !activeConversationId.value || sendingMessage.value) {
@@ -354,28 +360,22 @@ async function sendMessage() {
   const clientId = `client_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
   const attachmentsToSend = [...pendingAttachments.value]
 
+  // Clear input immediately
   messageText.value = ''
   pendingAttachments.value = []
   sendingMessage.value = true
-  messageText.value = ''
 
-  // ✅ Thêm message NGAY VÀO UI (optimistic update)
-  const optimisticMessage = {
-    id: clientId, // Dùng clientId tạm thời
-    direction: 'out' as const,
+  // ✅ Optimistic update - add message to UI immediately
+  const optimisticMessage: Message = {
+    id: clientId,
+    direction: 'out',
     text: content || '',
     senderName: currentUserName.value,
     senderId: currentUserId.value,
     time: new Date().toISOString(),
     avatar: currentUserAvatar.value,
-    status: 'sent' as const,
-    files: attachmentsToSend.map(att => ({
-      id: att.id,
-      url: att.url,
-      filename: att.filename,
-      type: att.type,
-      size: att.size,
-    })),
+    status: 'sent',
+    files: attachmentsToSend,
     reactions: [],
     isEdited: false,
     isUndone: false,
@@ -384,19 +384,15 @@ async function sendMessage() {
   
   messages.value.push(optimisticMessage)
   
-  // Scroll xuống cuối ngay lập tức với behavior: instant để không bị giật
+  // Scroll to bottom immediately
   nextTick(() => {
     if (messagesContainer.value) {
       messagesContainer.value.scrollTop = messagesContainer.value.scrollHeight
-      console.warn('✅ Scrolled to bottom after optimistic update')
     }
   })
 
   try {
-    // Send message with attachments
-    const payload = {
-  try {
-    // Always use HTTP API for sending messages
+    // Send via HTTP API - BE will broadcast via WebSocket
     await api.post('/zalo/send', {
       conversationId: activeConversationId.value,
       message: content || (attachmentsToSend.length > 0 ? `📎 ${attachmentsToSend.length} file(s)` : ''),
@@ -407,31 +403,29 @@ async function sendMessage() {
         type: att.type,
         size: att.size,
       })),
-    }
-
-    console.log('📤 Sending payload:', payload)
-    console.log('📎 Attachments array:', payload.attachments)
-
-    const response = await api.post('/zalo/send', payload)
-
-    // Cập nhật conversation ngay lập tức khi gửi tin
-    const now = new Date().toISOString()
-    updateConversationOnNewMessage(activeConversationId.value, {
-      text: content || `📎 ${attachmentsToSend.length} file(s)`,
-      time: now,
-      sentAt: now,
-    // Auto scroll to bottom after sending
-    nextTick(() => {
-      if (messagesContainer.value) {
-        messagesContainer.value.scrollTop = messagesContainer.value.scrollHeight
-      }
+      clientId, // Send clientId to match with optimistic update
     })
 
-    // WebSocket will receive the new message automatically via subscription
-    // No need to manually update UI
+    // Update conversation preview
+    const now = new Date().toISOString()
+    updateConversationOnNewMessage(activeConversationId.value, {
+      content: content || `📎 ${attachmentsToSend.length} file(s)`,
+      sent_at: now,
+    })
+
+    // WebSocket will automatically receive and sync the message
+    // The optimistic message will be replaced when real message arrives
   }
   catch (error: any) {
     console.error('❌ Failed to send message:', error)
+    
+    // Remove optimistic message on error
+    const index = messages.value.findIndex(m => m.clientId === clientId)
+    if (index !== -1) {
+      messages.value.splice(index, 1)
+    }
+    
+    // Restore input
     messageText.value = content
     pendingAttachments.value = attachmentsToSend
   }
@@ -501,16 +495,7 @@ async function autoLogin() {
   }
 }
 
-/**
- * Stop polling for messages
- */
-function stopMessagePolling() {
-  if (pollingInterval) {
-    clearInterval(pollingInterval)
-    pollingInterval = null
-  }
-  isPolling = false
-}
+
 
 /**
  * Scroll messages container to bottom
@@ -524,17 +509,25 @@ function scrollToBottom() {
 // Initialize WebSocket connection using direct Directus SDK
 async function initializeWebSocket() {
   try {
+    console.log('[WebSocket] Initializing WebSocket connection...')
+    
     // Get session token from endpoint
     const tokenResponse = await api.get('/zalo/get-session-token')
     const sessionToken = tokenResponse.data?.sessionToken
 
+    console.log('[WebSocket] Session token received:', !!sessionToken)
+
     if (!sessionToken) {
+      console.warn('[WebSocket] No session token, skipping WebSocket init')
       return
     }
 
     // Set token and connect
     await directusClient.setToken(sessionToken)
+    console.log('[WebSocket] Token set, connecting...')
+    
     await directusClient.connect()
+    console.log('[WebSocket] Connected successfully')
 
     websocketConnected.value = true
     websocketAuthenticated.value = true
@@ -544,17 +537,20 @@ async function initializeWebSocket() {
 
     // Subscribe to messages for active conversation if any
     if (activeConversationId.value) {
+      console.log('[WebSocket] Subscribing to active conversation:', activeConversationId.value)
       await subscribeToConversationMessages(activeConversationId.value)
     }
   }
   catch (error) {
-    // Silent fail
+    console.error('[WebSocket] Failed to initialize:', error)
   }
 }
 
 // Subscribe to all conversations for global updates
 async function subscribeToAllConversations() {
   try {
+    console.log('[WebSocket] Subscribing to conversations...')
+    
     // Subscribe to conversation creation
     const createSub = await directusClient.subscribe('zalo_conversations', {
       event: 'create',
@@ -564,6 +560,8 @@ async function subscribeToAllConversations() {
       uid: 'conversations-create',
     })
 
+    console.log('[WebSocket] Subscribed to conversation create events')
+
     // Subscribe to conversation updates (when new messages arrive)
     const updateSub = await directusClient.subscribe('zalo_conversations', {
       event: 'update',
@@ -572,6 +570,8 @@ async function subscribeToAllConversations() {
       },
       uid: 'conversations-update',
     })
+
+    console.log('[WebSocket] Subscribed to conversation update events')
 
     // Store unsubscribe functions
     const unsubscribeCreate = createSub.unsubscribe
@@ -610,6 +610,8 @@ async function subscribeToAllConversations() {
 // Subscribe to messages for a specific conversation
 async function subscribeToConversationMessages(conversationId: string) {
   try {
+    console.log('[WebSocket] Subscribing to messages for conversation:', conversationId)
+    
     // Unsubscribe from previous conversation if any
     if (messageUnsubscribe) {
       messageUnsubscribe()
@@ -630,16 +632,22 @@ async function subscribeToConversationMessages(conversationId: string) {
       uid: `messages-${conversationId}`,
     })
 
+    console.log('[WebSocket] Successfully subscribed to messages for:', conversationId)
     messageUnsubscribe = unsubscribe
 
     // Process events in background
     ;(async () => {
       for await (const item of subscription) {
+        console.log('[WebSocket] Received message event:', item)
+        
         if (item.type === 'subscription' && item.event === 'create') {
           const messageData = item.data[0]
 
+          console.log('[WebSocket] Processing new message:', messageData?.id)
+
           // Check for duplicates
           if (processedMessageIds.has(messageData.id)) {
+            console.log('[WebSocket] Skipping duplicate message:', messageData.id)
             continue
           }
 
@@ -651,7 +659,9 @@ async function subscribeToConversationMessages(conversationId: string) {
           })
         }
       }
-    })().catch(() => {})
+    })().catch((err) => {
+      console.error('[WebSocket] Message subscription error:', err)
+    })
   }
   catch (error) {
     // Silent fail
@@ -686,48 +696,96 @@ function handleNewMessage(data: any) {
   const messageData = data.message || data.data || data
   const conversationId = data.conversationId || messageData.conversation_id
 
+  console.log('[UI] handleNewMessage called:', {
+    conversationId,
+    messageId: messageData?.id,
+    activeConversationId: activeConversationId.value,
+  })
+
   if (conversationId !== activeConversationId.value) {
+    console.log('[UI] Message not for active conversation, skipping UI update')
     // Still update conversation preview even if not active
     updateConversationOnNewMessage(conversationId, messageData)
     return
   }
 
   const messageId = messageData.id
-  const exists = messages.value.some(m => m.id === messageId)
+  const clientId = messageData.client_id || messageData.clientId
 
-  if (!exists) {
-    // Handle nested sender_id from ItemsService (could be {id, display_name, avatar_url} or just string)
-    const senderIdRaw = messageData.sender_id || messageData.senderId
-    const senderId = typeof senderIdRaw === 'object' ? senderIdRaw?.id : senderIdRaw
-    const senderName = typeof senderIdRaw === 'object' ? senderIdRaw?.display_name : (messageData.sender_name || messageData.senderName || 'Unknown')
-    const senderAvatar = typeof senderIdRaw === 'object' ? senderIdRaw?.avatar_url : messageData.avatar
-
-    const direction = senderId === currentUserId.value ? 'out' : 'in'
-
-    messages.value.push({
-      id: messageId,
-      direction,
-      text: messageData.content || messageData.text || '',
-      senderName,
-      senderId,
-      time: messageData.sent_at || messageData.time || new Date().toISOString(),
-      avatar: senderAvatar,
-      status: direction === 'out' ? 'sent' : undefined,
-      files: messageData.attachments,
-      isEdited: messageData.is_edited || messageData.isEdited || false,
-      isUndone: messageData.is_undone || messageData.isUndone || false,
-      clientId: messageData.client_id || messageData.clientId,
-    })
-
-    updateConversationOnNewMessage(conversationId, messageData)
-
-    // Auto scroll to bottom
-    nextTick(() => {
-      if (messagesContainer.value) {
-        messagesContainer.value.scrollTop = messagesContainer.value.scrollHeight
-      }
-    })
+  // Check if already processed
+  if (processedMessageIds.has(messageId)) {
+    return
   }
+
+  processedMessageIds.add(messageId)
+
+  // Check if this is replacing an optimistic update
+  if (clientId) {
+    const optimisticIndex = messages.value.findIndex(m => m.clientId === clientId)
+    if (optimisticIndex !== -1) {
+      // Replace optimistic message with real one
+      const senderIdRaw = messageData.sender_id || messageData.senderId
+      const senderId = typeof senderIdRaw === 'object' ? senderIdRaw?.id : senderIdRaw
+      const senderName = typeof senderIdRaw === 'object' ? senderIdRaw?.display_name : (messageData.sender_name || messageData.senderName || 'Unknown')
+      const senderAvatar = typeof senderIdRaw === 'object' ? senderIdRaw?.avatar_url : messageData.avatar
+      const direction = senderId === currentUserId.value ? 'out' : 'in'
+
+      messages.value[optimisticIndex] = {
+        id: messageId,
+        direction,
+        text: messageData.content || messageData.text || '',
+        senderName,
+        senderId,
+        time: messageData.sent_at || messageData.time || new Date().toISOString(),
+        avatar: senderAvatar,
+        status: direction === 'out' ? 'sent' : undefined,
+        files: messageData.attachments || [],
+        reactions: messageData.reactions || [],
+        isEdited: messageData.is_edited || messageData.isEdited || false,
+        isUndone: messageData.is_undone || messageData.isUndone || false,
+        clientId,
+      }
+      return
+    }
+  }
+
+  // Check if message already exists (by ID)
+  const exists = messages.value.some(m => m.id === messageId)
+  if (exists) {
+    return
+  }
+
+  // Add new message
+  const senderIdRaw = messageData.sender_id || messageData.senderId
+  const senderId = typeof senderIdRaw === 'object' ? senderIdRaw?.id : senderIdRaw
+  const senderName = typeof senderIdRaw === 'object' ? senderIdRaw?.display_name : (messageData.sender_name || messageData.senderName || 'Unknown')
+  const senderAvatar = typeof senderIdRaw === 'object' ? senderIdRaw?.avatar_url : messageData.avatar
+  const direction = senderId === currentUserId.value ? 'out' : 'in'
+
+  messages.value.push({
+    id: messageId,
+    direction,
+    text: messageData.content || messageData.text || '',
+    senderName,
+    senderId,
+    time: messageData.sent_at || messageData.time || new Date().toISOString(),
+    avatar: senderAvatar,
+    status: direction === 'out' ? 'sent' : undefined,
+    files: messageData.attachments || [],
+    reactions: messageData.reactions || [],
+    isEdited: messageData.is_edited || messageData.isEdited || false,
+    isUndone: messageData.is_undone || messageData.isUndone || false,
+    clientId,
+  })
+
+  updateConversationOnNewMessage(conversationId, messageData)
+
+  // Auto scroll to bottom
+  nextTick(() => {
+    if (messagesContainer.value) {
+      messagesContainer.value.scrollTop = messagesContainer.value.scrollHeight
+    }
+  })
 }
 
 function handleConversationUpdate(data: any) {
@@ -807,6 +865,8 @@ function selectConversation(id: string) {
   if (activeConversationId.value === id)
     return
 
+  console.log('[UI] Selecting conversation:', id)
+  
   isSelectingConversation = true
 
   // Unsubscribe from old conversation messages
@@ -814,30 +874,25 @@ function selectConversation(id: string) {
 
   activeConversationId.value = id
   messages.value = []
+  processedMessageIds.clear()
 
   const conversation = conversations.value.find(c => c.id === id)
   if (conversation && conversation.unreadCount > 0) {
     conversation.unreadCount = 0
   }
 
-  // Stop previous polling của conversation cũ
-  stopMessagePolling()
-
   // Load initial messages
   loadMessages(id).finally(() => {
     // Subscribe to new conversation messages via WebSocket
     if (websocketConnected.value && websocketAuthenticated.value) {
+      console.log('[UI] WebSocket connected, subscribing to messages...')
       subscribeToConversationMessages(id)
+    } else {
+      console.warn('[UI] WebSocket not connected, skipping subscription')
     }
 
     isSelectingConversation = false
   })
-}
-function stopConversationPolling() {
-  if (conversationPollingInterval) {
-    clearInterval(conversationPollingInterval)
-    conversationPollingInterval = null
-  }
 }
 async function loadConversations() {
   if (!isAuthenticated.value) {
@@ -1136,97 +1191,13 @@ function updateConversationOnNewMessage(conversationId: string, message: any) {
   }
 }
 
-function startMessagePolling(conversationId: string) {
-  stopMessagePolling()
 
-  // Get last message ID
-  lastMessageId = messages.value.length > 0
-    ? messages.value[messages.value.length - 1].id
-    : null
 
-  isPolling = true
 
-  // Poll immediately first time
-  pollMessages(conversationId)
-
-  // Then poll every 3 seconds
-  pollingInterval = setInterval(() => {
-    if (isPolling) {
-      pollMessages(conversationId)
-    }
-  }, 3000) // Poll message mỗi 3 giây
-}
-
-async function pollMessages(conversationId: string) {
-  try {
-    const response = await api.get(`/zalo/messages/${conversationId}`, {
-      params: { limit: 50 },
-      timeout: 15000,
-    })
-
-    const latestMessages = response.data.data
-    if (latestMessages.length === 0)
-      return
-
-    const newestMessage = latestMessages[latestMessages.length - 1]
-
-    if (newestMessage.id !== lastMessageId) {
-      let addedCount = 0
-
-      for (const msg of latestMessages) {
-        const exists = messages.value.some((m) => {
-          if (m.id === msg.id)
-            return true
-          if (m.clientId && msg.clientId && m.clientId === msg.clientId) {
-            const index = messages.value.findIndex(
-              m2 => m2.clientId === msg.clientId,
-            )
-            if (index !== -1) {
-              messages.value[index] = {
-                ...messages.value[index],
-                id: msg.id,
-                senderName: msg.senderName,
-                avatar: msg.avatar,
-                time: msg.time,
-                status: 'sent',
-              }
-            }
-            return true
-          }
-          return false
-        })
-
-        if (!exists) {
-          const direction = msg.senderId === currentUserId.value ? 'out' : 'in'
-          const newMessage: Message = {
-            id: msg.id,
-            direction,
-            text: msg.text || '',
-            senderName: msg.senderName,
-            senderId: msg.senderId,
-            time: msg.time,
-            avatar: msg.avatar,
-            status: direction === 'out' ? 'sent' : undefined,
-            isEdited: msg.isEdited,
-            isUndone: msg.isUndone,
-            clientId: msg.clientId,
-          }
-          messages.value.push(newMessage)
-          addedCount++
-
-          updateConversationOnNewMessage(conversationId, msg)
-        }
-      }
-
-      lastMessageId = newestMessage.id
-
-      if (addedCount > 0) {
-        nextTick(scrollToBottom)
-      }
-    }
-  }
-  catch (error) {
-    console.error('Polling error:', error)
+function removeMember(memberId: string) {
+  const index = selectedMembers.value.indexOf(memberId)
+  if (index > -1) {
+    selectedMembers.value.splice(index, 1)
   }
 }
 
@@ -1234,39 +1205,6 @@ function _autoResize(event: Event) {
   const textarea = event.target as HTMLTextAreaElement
   textarea.style.height = 'auto'
   textarea.style.height = `${Math.min(textarea.scrollHeight, 120)}px`
-}
-
-function onSelectFromLibrary(files: any[]) {
-  // Handle files selected from library
-  console.warn('Select from library:', files)
-  activeDialog.value = null
-}
-
-async function importFromURL() {
-  if (!isValidURL.value)
-    return
-
-  importing.value = true
-
-  try {
-    // Import logic would go here
-    console.warn('Import from URL:', importUrl.value)
-    importUrl.value = ''
-    activeDialog.value = null
-  }
-  catch (error) {
-    console.error('Error importing from URL:', error)
-  }
-  finally {
-    importing.value = false
-  }
-}
-
-function removeMember(memberId: string) {
-  const index = selectedMembers.value.indexOf(memberId)
-  if (index > -1) {
-    selectedMembers.value.splice(index, 1)
-  }
 }
 
 // Account management functions
@@ -1424,6 +1362,22 @@ function createGroup() {
   // Group creation logic not implemented
   console.warn('Create group functionality not implemented yet')
   closeMembersDialog()
+}
+
+function insertEmoji(event: any) {
+  const emoji = event?.emoji || event?.detail?.unicode || event
+  if (emoji) {
+    handleEmojiInsert(emoji, { value: messageInputRef.value }, { value: messageText.value })
+  }
+}
+
+function toggleMemberSelection(memberId: string) {
+  const index = selectedMembers.value.indexOf(memberId)
+  if (index > -1) {
+    selectedMembers.value.splice(index, 1)
+  } else {
+    selectedMembers.value.push(memberId)
+  }
 }
 
 // Get active conversation object
