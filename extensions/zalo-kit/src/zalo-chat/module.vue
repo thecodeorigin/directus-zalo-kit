@@ -768,6 +768,47 @@ function handleNewMessage(data: any) {
   const senderAvatar = typeof senderIdRaw === 'object' ? senderIdRaw?.avatar_url : messageData.avatar
   const direction = senderId === currentUserId.value ? 'out' : 'in'
 
+  // Try to get attachments - fetch async in background if needed
+  let attachments = messageData.attachments || []
+
+  // If no attachments in message data, try to fetch them
+  if ((!attachments || attachments.length === 0) && messageId) {
+    // Fetch attachments asynchronously
+    ;(async () => {
+      try {
+        const attachmentsResponse = await api.get(`/items/zalo_attachments`, {
+          params: {
+            filter: { message_id: { _eq: messageId } },
+            fields: ['id', 'url', 'file_name', 'mime_type', 'file_size', 'width', 'height', 'thumbnail_url'],
+          },
+        })
+
+        if (attachmentsResponse?.data?.data && attachmentsResponse.data.data.length > 0) {
+          const baseUrl = window.location.origin
+          const fetchedAttachments = attachmentsResponse.data.data.map((att: any) => ({
+            id: att.id,
+            url: att.url.startsWith('http') ? att.url : `${baseUrl}${att.url}`,
+            filename: att.file_name,
+            type: att.mime_type,
+            size: att.file_size,
+            width: att.width,
+            height: att.height,
+            thumbnail: att.thumbnail_url || att.url,
+          }))
+
+          // Update message with attachments
+          const msgIndex = messages.value.findIndex(m => m.id === messageId)
+          if (msgIndex !== -1) {
+            messages.value[msgIndex].files = fetchedAttachments
+          }
+        }
+      }
+      catch (error) {
+        console.error('Failed to fetch attachments for message:', messageId, error)
+      }
+    })()
+  }
+
   messages.value.push({
     id: messageId,
     direction,
@@ -777,7 +818,7 @@ function handleNewMessage(data: any) {
     time: messageData.sent_at || messageData.time || new Date().toISOString(),
     avatar: senderAvatar,
     status: direction === 'out' ? 'sent' : undefined,
-    files: messageData.attachments || [],
+    files: attachments,
     reactions: messageData.reactions || [],
     isEdited: messageData.is_edited || messageData.isEdited || false,
     isUndone: messageData.is_undone || messageData.isUndone || false,

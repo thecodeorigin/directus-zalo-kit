@@ -27,18 +27,33 @@ export default defineEventHandler(async (context, { req, res }) => {
   }
 
   try {
-    const { conversationId, message, content, clientId, senderId } = req.body as {
+    const { conversationId, message, content, clientId, senderId, attachments } = req.body as {
       conversationId: string
       message?: string
       content?: string
       clientId?: string
       senderId?: string
+      attachments?: Array<{
+        file_id: string
+        url: string
+        filename: string
+        type: string
+        size: number
+      }>
     }
     const messageContent = message || content
 
-    if (!conversationId || !messageContent) {
+    if (!conversationId) {
       res.status(400).json({
-        error: 'conversationId and message are required',
+        error: 'conversationId is required',
+      })
+      return
+    }
+
+    // Allow sending attachments without text message
+    if (!messageContent && (!attachments || attachments.length === 0)) {
+      res.status(400).json({
+        error: 'Either message or attachments are required',
       })
       return
     }
@@ -122,12 +137,103 @@ export default defineEventHandler(async (context, { req, res }) => {
 
     // Gửi tin nhắn qua instance
     let zaloResult: any
+    const sentAttachments: string[] = []
+
     try {
-      zaloResult = await zaloService.sendMessage(
-        { msg: messageContent },
-        zaloThreadId,
-        threadType,
-      )
+      // Send text message if provided
+      if (messageContent) {
+        zaloResult = await zaloService.sendMessage(
+          { msg: messageContent },
+          zaloThreadId,
+          threadType,
+        )
+      }
+
+      // Send image attachments via ZCA-JS
+      if (attachments && attachments.length > 0) {
+        console.log(`📎 Sending ${attachments.length} attachments to Zalo...`)
+
+        for (const attachment of attachments) {
+          try {
+            // Check if it's an image
+            if (attachment.type.startsWith('image/')) {
+              console.log(`📷 Sending image: ${attachment.filename}`)
+
+              // Get file metadata from Directus to get width/height
+              let width: number | undefined
+              let height: number | undefined
+              let fileBuffer: InstanceType<typeof import('node:buffer').Buffer> | undefined
+
+              try {
+                const filesService = new context.services.ItemsService('directus_files', {
+                  schema: await context.getSchema(),
+                  accountability: { admin: true, role: null, user: null, roles: [], app: false, ip: null },
+                })
+
+                const fileData = await filesService.readOne(attachment.file_id, {
+                  fields: ['width', 'height', 'type', 'filename_disk'],
+                })
+
+                width = fileData.width
+                height = fileData.height
+
+                // Read file from Directus storage instead of HTTP download
+                const assetsService = new context.services.AssetsService({
+                  schema: await context.getSchema(),
+                  accountability: { admin: true, role: null, user: null, roles: [], app: false, ip: null },
+                })
+
+                const { stream } = await assetsService.getAsset(attachment.file_id)
+
+                // Convert stream to buffer
+                const chunks: any[] = []
+                for await (const chunk of stream) {
+                  chunks.push(chunk)
+                }
+                const BufferConstructor = (await import('node:buffer')).Buffer
+                fileBuffer = BufferConstructor.concat(chunks)
+              }
+              catch (err) {
+                console.warn('⚠️ Could not fetch file metadata from Directus:', err)
+              }
+
+              // Send image via ZCA-JS sendMessage with metadata
+              const imageResult = await zaloService.sendImage(
+                attachment.url, // Directus URL (fallback)
+                zaloThreadId,
+                threadType,
+                width,
+                height,
+                fileBuffer, // Pass buffer directly
+              )
+
+              if (imageResult) {
+                sentAttachments.push(attachment.file_id)
+                console.log(`✅ Image sent successfully: ${attachment.filename}`)
+              }
+            }
+            else {
+              // For non-image files, send as text message with file info
+              console.log(`📄 Sending file info: ${attachment.filename}`)
+              await zaloService.sendMessage(
+                { msg: `📎 File: ${attachment.filename} (${(attachment.size / 1024).toFixed(2)} KB)` },
+                zaloThreadId,
+                threadType,
+              )
+              sentAttachments.push(attachment.file_id)
+            }
+          }
+          catch (attachmentError: any) {
+            console.error(`❌ Failed to send attachment ${attachment.filename}:`, attachmentError.message)
+            // Continue with other attachments
+          }
+        }
+      }
+
+      // If no text message was sent, use first zalo result from attachments
+      if (!messageContent && !zaloResult) {
+        zaloResult = { success: true, attachments: sentAttachments }
+      }
     }
     catch (e: any) {
       console.error(`[Endpoint /send] Zalo API Error: ${e.message}`)
@@ -196,7 +302,7 @@ export default defineEventHandler(async (context, { req, res }) => {
         id: messageId,
         client_id: clientMsgId,
         conversation_id: conversationId,
-        content: messageContent,
+        content: messageContent || (attachments && attachments.length > 0 ? `📎 ${attachments.length} file(s)` : ''),
         sender_id: zaloUserId,
         sent_at: timestamp.toISOString(),
         received_at: timestamp.toISOString(),
@@ -207,6 +313,46 @@ export default defineEventHandler(async (context, { req, res }) => {
 
       // Use ItemsService to trigger WebSocket events
       await messagesService.createOne(messageToInsert)
+
+      // Save attachments to zalo_attachments table and link to message
+      if (attachments && attachments.length > 0) {
+        const attachmentsService = new context.services.ItemsService('zalo_attachments', {
+          schema: await context.getSchema(),
+          accountability: { admin: true, role: null, user: null, roles: [], app: false, ip: null },
+        })
+
+        for (const attachment of attachments) {
+          try {
+            // Check if attachment already exists for this message
+            const existing = await attachmentsService.readByQuery({
+              filter: {
+                _and: [
+                  { message_id: { _eq: messageId } },
+                  { url: { _eq: attachment.url } },
+                ],
+              },
+              limit: 1,
+            })
+
+            if (existing && existing.length === 0) {
+              // Create attachment record
+              await attachmentsService.createOne({
+                message_id: messageId,
+                url: attachment.url,
+                file_name: attachment.filename,
+                mime_type: attachment.type,
+                file_size: attachment.size,
+                created_at: timestamp.toISOString(),
+                updated_at: timestamp.toISOString(),
+              })
+            }
+          }
+          catch (attachmentError: any) {
+            console.error(`Failed to save attachment ${attachment.filename}:`, attachmentError.message)
+            // Continue with other attachments
+          }
+        }
+      }
 
       // Get ItemsService for conversations
       const conversationsService = new context.services.ItemsService('zalo_conversations', {
@@ -227,7 +373,9 @@ export default defineEventHandler(async (context, { req, res }) => {
 
       res.json({
         success: true,
-        message: 'Message sent successfully',
+        message: sentAttachments.length > 0
+          ? `Message sent successfully with ${sentAttachments.length} attachment(s)`
+          : 'Message sent successfully',
         data: {
           messageId,
           id: messageId,
@@ -237,6 +385,8 @@ export default defineEventHandler(async (context, { req, res }) => {
           sender_id: zaloUserId,
           client_id: clientMsgId,
           thread_id: zaloThreadId,
+          attachments_sent: sentAttachments.length,
+          sent_attachment_ids: sentAttachments,
           sender: {
             id: sender?.id,
             display_name: sender?.display_name,
