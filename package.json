@@ -28,5 +28,8 @@
     "vitest": "catalog:",
     "vue": "catalog:",
     "zca-js": "catalog:"
+  },
+  "dependencies": {
+    "image-size": "^2.0.2"
   }
 }
