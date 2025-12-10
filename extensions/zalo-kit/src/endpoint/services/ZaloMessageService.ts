@@ -119,6 +119,10 @@ class ZaloMessageService {
     return sendMessage(content, threadId, threadType)
   }
 
+  async sendImage(imageUrl: string, threadId: string, threadType: number): Promise<any> {
+    return sendImage(imageUrl, threadId, threadType)
+  }
+
   getCurrentUserId(): string | null {
     return getCurrentUserId()
   }
@@ -732,13 +736,83 @@ async function sendImage(
   imageUrl: string,
   threadId: string,
   threadType: number,
+  providedWidth?: number,
+  providedHeight?: number,
+  providedBuffer?: InstanceType<typeof import('node:buffer').Buffer>,
 ): Promise<any> {
   if (!api)
     throw new Error('Not logged in')
 
-  // ZCA-JS supports sending images from URL or local path
-  const result = await api.sendImageMessage?.(imageUrl, threadId, threadType)
-  return result
+  try {
+    // ZCA-JS sendMessage() tự động upload attachments
+    // Chỉ cần truyền AttachmentSource (Buffer + filename + metadata)
+
+    const path = await import('node:path')
+
+    // Use provided buffer or download from URL
+    let imageBuffer: InstanceType<typeof import('node:buffer').Buffer>
+
+    if (providedBuffer) {
+      console.warn(`✅ Using provided buffer: ${providedBuffer.length} bytes, dimensions: ${providedWidth}x${providedHeight}`)
+      imageBuffer = providedBuffer
+    }
+    else {
+      console.warn('⚠️ No buffer provided, downloading from URL:', imageUrl)
+      // Tải ảnh về buffer
+      const https = await import('node:https')
+      const http = await import('node:http')
+      const { Buffer: NodeBuffer } = await import('node:buffer')
+
+      imageBuffer = await new Promise<InstanceType<typeof NodeBuffer>>((resolve, reject) => {
+        const protocol = imageUrl.startsWith('https') ? https : http
+
+        protocol.get(imageUrl, (response) => {
+          const chunks: any[] = []
+          response.on('data', chunk => chunks.push(chunk))
+          response.on('end', () => resolve(NodeBuffer.concat(chunks)))
+          response.on('error', reject)
+        }).on('error', reject)
+      })
+    }
+
+    // Lấy extension từ URL hoặc dùng mặc định
+    const urlPath = new URL(imageUrl).pathname
+    const ext = path.extname(urlPath) || '.jpg'
+    const filename = `image_${Date.now()}${ext}`
+
+    // Use provided dimensions - KHÔNG cần detect nữa nếu đã có
+    const width = providedWidth || 1280
+    const height = providedHeight || 720
+
+    console.warn(`📐 Image dimensions: ${width}x${height}, buffer size: ${imageBuffer.length} bytes`)
+
+    // Tạo AttachmentSource object theo định dạng ZCA-JS
+    const attachmentSource = {
+      data: imageBuffer,
+      filename,
+      metadata: {
+        totalSize: imageBuffer.length,
+        width,
+        height,
+      },
+    }
+
+    // sendMessage() sẽ tự upload attachment và gửi
+    const result = await api.sendMessage?.(
+      {
+        msg: '', // Empty message, chỉ gửi ảnh
+        attachments: [attachmentSource], // Truyền AttachmentSource chưa upload
+      },
+      threadId,
+      threadType,
+    )
+
+    return result
+  }
+  catch (error: any) {
+    console.error('❌ Failed to send image via ZCA-JS:', error)
+    throw new Error(`Failed to send image: ${error.message}`)
+  }
 }
 
 async function sendReaction(
