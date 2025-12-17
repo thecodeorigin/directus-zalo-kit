@@ -34,7 +34,12 @@ function handleKeydown(event: KeyboardEvent) {
   }
 }
 
+function focus() {
+  messageInputRef.value?.focus()
+}
+
 defineExpose({
+  focus,
   messageInputRef,
 })
 </script>

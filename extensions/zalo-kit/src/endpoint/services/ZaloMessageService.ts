@@ -123,6 +123,23 @@ class ZaloMessageService {
     return sendImage(imageUrl, threadId, threadType)
   }
 
+  async forwardMessage(
+    payload: {
+      message: string
+      ttl?: number
+      reference?: {
+        id: string
+        ts: number
+        logSrcType: number
+        fwLvl: number
+      }
+    },
+    threadIds: string[],
+    threadType?: number,
+  ): Promise<any> {
+    return forwardMessage(payload, threadIds, threadType)
+  }
+
   getCurrentUserId(): string | null {
     return getCurrentUserId()
   }
@@ -547,6 +564,66 @@ async function listenerHandleMessageDirect(rawData: any): Promise<void> {
       return
     await syncStart(conversationId)
 
+    // ✅ FILTER: Skip system events (delete/undo notifications)
+    // These events have BOTH type AND actionType fields (system event signature)
+    // Example: {type:3, actionType:0, uidFrom:..., clientDelMsgId:..., globalDelMsgId:...}
+    if (rawData.type !== undefined && rawData.actionType !== undefined) {
+      console.error('[Listener] Skipping system event:', {
+        type: rawData.type,
+        actionType: rawData.actionType,
+        messageId,
+        hasDelMsgId: !!(rawData.globalDelMsgId || rawData.clientDelMsgId),
+      })
+
+      // If it has delete message IDs, remove that message from database
+      const msgIdToDelete = rawData.globalDelMsgId || rawData.clientDelMsgId
+      if (msgIdToDelete) {
+        const messagesService = await getService('zalo_messages')
+        try {
+          await messagesService.deleteOne(String(msgIdToDelete))
+          console.error(`[Listener] Deleted message ${msgIdToDelete} via system event`)
+        }
+        catch (deleteError: any) {
+          console.error(`[Listener] Failed to delete message ${msgIdToDelete}:`, deleteError.message)
+        }
+      }
+
+      return
+    }
+
+    // Also check message content - might be stringified system event
+    const messageContent = message.content || message.desc || rawData.content || ''
+
+    if (typeof messageContent === 'string' && messageContent.trim()) {
+      try {
+        const contentTrimmed = messageContent.trim()
+        if (contentTrimmed.startsWith('{') || contentTrimmed.startsWith('[')) {
+          const parsed = JSON.parse(contentTrimmed)
+          const data = Array.isArray(parsed) ? parsed[0] : parsed
+
+          // Check system event signature
+          if (typeof data === 'object' && data !== null) {
+            const hasSystemEventSignature = (
+              (data.type !== undefined && data.actionType !== undefined)
+              && (data.clientDelMsgId !== undefined || data.globalDelMsgId !== undefined)
+            )
+
+            if (hasSystemEventSignature) {
+              console.error('[Listener] ✅ BLOCKING stringified system event:', {
+                messageId,
+                type: data.type,
+                actionType: data.actionType,
+              })
+              return
+            }
+          }
+        }
+      }
+      catch {
+        // Not JSON, continue processing
+      }
+    }
+
     // 6. KIỂM TRA LẠI SENDER TỒN TẠI TRƯỚC KHI INSERT MESSAGE
     const usersService = await getService('zalo_users')
     const senderExists = await usersService.readByQuery({
@@ -651,6 +728,7 @@ async function listenerHandleMessageDirect(rawData: any): Promise<void> {
             time: sentAt.toISOString(),
             avatar: senderAvatar,
             direction: isFromMe ? 'out' : 'in',
+            raw_data: rawData,
           },
         })
 
@@ -825,6 +903,34 @@ async function sendReaction(
     throw new Error('Not logged in')
 
   const result = await api.sendReaction?.(messageId, reactionIcon, threadId, threadType)
+  return result
+}
+
+/**
+ * Forward a message to multiple conversations via Zalo API
+ */
+async function forwardMessage(
+  payload: {
+    message: string
+    ttl?: number
+    reference?: {
+      id: string
+      ts: number
+      logSrcType: number
+      fwLvl: number
+    }
+  },
+  threadIds: string[],
+  threadType: number = 1,
+): Promise<any> {
+  if (!api)
+    throw new Error('Not logged in')
+
+  if (!api.forwardMessage) {
+    throw new Error('Forward message API not available')
+  }
+
+  const result = await api.forwardMessage(payload, threadIds, threadType)
   return result
 }
 
@@ -1731,19 +1837,21 @@ export {
   // Database - Group Operations
   dbUpsertGroup,
 
+  // Message Operations
+  forwardMessage,
   // API Management
   getApi,
+
   getCurrentUserId,
-
   getGroupMembers,
-  getLoginStatus,
 
+  getLoginStatus,
   getRedisKeys,
+
   getRedisSession,
 
   // Redis Operations
   getRedisStatus,
-
   getRedisValue,
   // Initialization
   init,
@@ -1751,12 +1859,12 @@ export {
   initializeSyncGroups,
   labelAddToConversation,
   labelCreate,
-  labelDelete,
 
+  labelDelete,
   // Label Operations
   labelGet,
-  labelRemoveFromConversation,
 
+  labelRemoveFromConversation,
   labelUpdate,
   listenerHandleReactionQueued,
   // Listener Management
@@ -1771,7 +1879,6 @@ export {
   quickMessageGet,
   quickMessageUpdate,
   reprocessFailedMessages,
-  // Message Operations
   sendImage,
   sendMessage,
 

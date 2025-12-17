@@ -20,6 +20,9 @@ import qrLoginHandler from './routes/login/qr.post'
 import logoutHandler from './routes/logout.post'
 import meHandler from './routes/me.get'
 import messagesHandler from './routes/messages/[conversationId].get'
+import forwardMessageHandler from './routes/messages/forward.post'
+import undoMessageHandler from './routes/messages/[messageId].undo.ts'
+import deleteMessageHandler from './routes/messages/[messageId].delete.ts'
 import reactHandler from './routes/messages/react.post'
 import saveAttachmentHandler from './routes/messages/save-attachment.post'
 import sendMessageHandler from './routes/messages/send.post'
@@ -74,6 +77,9 @@ export default defineEndpoint(async (router, context) => {
   router.put('/conversations/:conversationId/archive', conversationArchiveHandler(context) as any)
 
   router.get('/messages/:conversationId', messagesHandler(context) as any)
+  router.post('/messages/forward', forwardMessageHandler(context) as any)
+  router.post('/messages/:messageId/undo', undoMessageHandler(context) as any)
+  router.delete('/messages/:messageId', deleteMessageHandler(context) as any)
   router.post('/messages/:messageId/react', reactHandler(context) as any)
   router.post('/messages/save-attachment', saveAttachmentHandler(context) as any)
   router.post('/messages/upload-attachment', uploadAttachmentHandler(context) as any)
