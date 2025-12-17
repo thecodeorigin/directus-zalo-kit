@@ -61,6 +61,15 @@ interface Message {
   reactions?: any[]
   isEdited?: boolean
   isUndone?: boolean
+  rawData?: any // Raw data from Zalo API
+  quote?: {
+    content: string
+    msgType: string
+    uidFrom: string
+    msgId: string
+    senderName?: string
+    avatar?: string
+  } // Quoted/replied message info
 }
 
 interface Group {
@@ -197,6 +206,34 @@ const _groups = ref<Group[]>([])
 const _groupMessages = ref<Record<string, Message[]>>({})
 
 const _processedMessageIds = new Set<string>()
+
+// Context menu states
+const showContextMenu = ref(false)
+const contextMenuPosition = ref({ x: 0, y: 0 })
+const contextMenuMessage = ref<Message | null>(null)
+
+// Reply states
+const replyingTo = ref<Message | null>(null)
+
+// Forward dialog states
+const showForwardDialog = ref(false)
+const forwardTargetConversations = ref<string[]>([])
+const forwardSearchQuery = ref('')
+
+// Selection mode states
+const isSelectionMode = ref(false)
+const selectedMessageIds = ref<Set<string>>(new Set())
+const longPressTimer = ref<any>(null)
+const longPressDuration = 800 // 800ms to trigger selection mode
+
+// Toast notification states
+const toastMessage = ref('')
+const toastType = ref<'success' | 'error' | 'info'>('success')
+const showToast = ref(false)
+let toastTimeout: ReturnType<typeof setTimeout> | null = null
+
+// Forward loading state
+const isForwarding = ref(false)
 
 function highlightSearchText(text: string, searchTerm: string): string {
   if (!searchTerm.trim())
@@ -360,10 +397,52 @@ async function sendMessage() {
   const clientId = `client_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
   const attachmentsToSend = [...pendingAttachments.value]
 
+  // Save quote data BEFORE clearing replyingTo
+  const quoteData = replyingTo.value
+
+  // Build quote object if replying
+  const quote = quoteData
+    ? {
+        content: quoteData.text,
+        msgType: 'text',
+        uidFrom: quoteData.senderId,
+        msgId: quoteData.id,
+        // cliMsgId is REQUIRED by Zalo API
+        // Priority: 1) clientId from Zalo API (for received messages)
+        //           2) Generate timestamp-based ID (for sent messages without cliMsgId)
+        cliMsgId: (() => {
+          const clientId = quoteData.clientId
+          // If clientId exists and is NOT our client-generated format, use it
+          if (clientId && !clientId.startsWith('client_')) {
+            return clientId
+          }
+          // Otherwise, generate a timestamp-based cliMsgId (similar to Zalo's format)
+          // Extract timestamp from quoteData if available, or use current time
+          const timestamp = quoteData.timestamp
+            ? new Date(quoteData.timestamp).getTime()
+            : Date.now()
+          return String(timestamp)
+        })(),
+        // Format ts as HH:mm - handle both ISO string and already formatted time
+        ts: (() => {
+          const time = quoteData.time
+          // If it's an ISO string (optimistic message), format it
+          if (time.includes('T') || time.includes('Z')) {
+            return new Date(time).toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit' })
+          }
+          // If it's already formatted (HH:mm), use as is
+          return time
+        })(),
+      }
+    : undefined
+
   // Clear input immediately
   messageText.value = ''
   pendingAttachments.value = []
   sendingMessage.value = true
+
+  // Clear reply state
+  replyingTo.value = null
 
   // ✅ Optimistic update - add message to UI immediately
   const optimisticMessage: Message = {
@@ -380,6 +459,16 @@ async function sendMessage() {
     isEdited: false,
     isUndone: false,
     clientId,
+    quote: quoteData
+      ? {
+          content: quoteData.text,
+          msgType: 'text',
+          uidFrom: quoteData.senderId,
+          msgId: quoteData.id,
+          senderName: quoteData.senderName,
+          avatar: quoteData.avatar,
+        }
+      : undefined,
   }
 
   messages.value.push(optimisticMessage)
@@ -392,8 +481,8 @@ async function sendMessage() {
   })
 
   try {
-    // Send via HTTP API - BE will broadcast via WebSocket
-    await api.post('/zalo/send', {
+    // Build payload
+    const payload: any = {
       conversationId: activeConversationId.value,
       message: content || (attachmentsToSend.length > 0 ? `📎 ${attachmentsToSend.length} file(s)` : ''),
       attachments: attachmentsToSend.map(att => ({
@@ -404,7 +493,15 @@ async function sendMessage() {
         size: att.size,
       })),
       clientId, // Send clientId to match with optimistic update
-    })
+    }
+
+    // Add quote if replying
+    if (quote) {
+      payload.quote = quote
+    }
+
+    // Send via HTTP API - BE will broadcast via WebSocket
+    await api.post('/zalo/send', payload)
 
     // Update conversation preview
     const now = new Date().toISOString()
@@ -428,11 +525,528 @@ async function sendMessage() {
     // Restore input
     messageText.value = content
     pendingAttachments.value = attachmentsToSend
+
+    // Restore reply state on error
+    if (quoteData) {
+      replyingTo.value = quoteData
+    }
   }
   finally {
     sendingMessage.value = false
   }
 }
+
+/**
+ * Copy message text to clipboard
+ */
+function copyMessage() {
+  if (!contextMenuMessage.value)
+    return
+
+  navigator.clipboard.writeText(contextMenuMessage.value.text)
+  closeContextMenu()
+  showToastNotification('Đã sao chép tin nhắn', 'success')
+}
+
+/**
+ * Reply to a message (quick action)
+ */
+function replyToMessage(message?: Message) {
+  const msg = message || contextMenuMessage.value
+  if (!msg || msg.isUndone)
+    return
+
+  closeContextMenu()
+
+  replyingTo.value = msg
+
+  nextTick(() => {
+    messageInputRef.value?.focus()
+  })
+}
+
+/**
+ * Cancel reply
+ */
+function cancelReply() {
+  replyingTo.value = null
+}
+
+/**
+ * Quick forward a single message
+ */
+function quickForwardMessage(message: Message) {
+  console.warn('[FORWARD] Quick forward triggered for message:', message.id)
+
+  closeContextMenu()
+
+  // Clear any existing selection
+  selectedMessageIds.value.clear()
+
+  // Add this message to selection
+  selectedMessageIds.value.add(message.id)
+
+  console.warn('[FORWARD] Selected message IDs:', Array.from(selectedMessageIds.value))
+
+  // Open forward dialog
+  showForwardDialog.value = true
+  forwardTargetConversations.value = []
+  forwardSearchQuery.value = ''
+
+  console.warn('[FORWARD] Dialog opened, available conversations:', conversations.value.length)
+}
+
+/**
+ * Show context menu for message
+ */
+function showMessageContextMenu(event: MouseEvent, message: Message) {
+  event.preventDefault()
+  event.stopPropagation()
+
+  // Don't show menu for undone messages
+  if (message.isUndone) {
+    return
+  }
+
+  contextMenuMessage.value = message
+
+  // Calculate position - show menu above the click point
+  const menuHeight = 280 // Approximate height of context menu
+  const menuWidth = 200
+
+  let x = event.clientX
+  let y = event.clientY - menuHeight // Position above the cursor
+
+  // Adjust if menu would go off screen
+  if (y < 0) {
+    y = event.clientY + 10 // Show below if not enough space above
+  }
+
+  if (x + menuWidth > window.innerWidth) {
+    x = window.innerWidth - menuWidth - 10
+  }
+
+  contextMenuPosition.value = { x, y }
+  showContextMenu.value = true
+
+  // Close menu when clicking outside - delay to avoid immediate close
+  setTimeout(() => {
+    document.addEventListener('click', closeContextMenu, { once: true })
+  }, 100)
+}
+
+/**
+ * Close context menu
+ */
+function closeContextMenu() {
+  showContextMenu.value = false
+  contextMenuMessage.value = null
+}
+
+/**
+ * Enter selection mode for multi-select
+ */
+function enterSelectionMode(initialMessageId?: string) {
+  isSelectionMode.value = true
+  selectedMessageIds.value.clear()
+  if (initialMessageId) {
+    selectedMessageIds.value.add(initialMessageId)
+  }
+  closeContextMenu()
+}
+
+/**
+ * Exit selection mode
+ */
+function exitSelectionMode() {
+  isSelectionMode.value = false
+  selectedMessageIds.value.clear()
+}
+
+/**
+ * Handle long press start (to enter selection mode)
+ */
+function handleLongPressStart(event: MouseEvent | TouchEvent, messageId: string) {
+  const message = messages.value.find(m => m.id === messageId)
+  if (!message || message.isUndone)
+    return
+
+  longPressTimer.value = setTimeout(() => {
+    // Vibrate if supported (mobile)
+    if ('vibrate' in navigator) {
+      navigator.vibrate(50)
+    }
+
+    enterSelectionMode(messageId)
+  }, longPressDuration)
+}
+
+/**
+ * Handle long press end (cancel timer if not held long enough)
+ */
+function handleLongPressEnd() {
+  if (longPressTimer.value) {
+    clearTimeout(longPressTimer.value)
+    longPressTimer.value = null
+  }
+}
+
+/**
+ * Handle message click (in selection mode)
+ */
+function handleMessageClick(messageId: string) {
+  if (isSelectionMode.value) {
+    toggleMessageSelection(messageId)
+  }
+}
+
+/**
+ * Select all messages
+ */
+function selectAllMessages() {
+  messages.value.forEach((msg) => {
+    if (!msg.isUndone) {
+      selectedMessageIds.value.add(msg.id)
+    }
+  })
+}
+
+/**
+ * Delete selected messages
+ */
+async function deleteSelectedMessages() {
+  if (selectedMessageIds.value.size === 0)
+    return
+
+  if (!confirm(`Delete ${selectedMessageIds.value.size} message(s)? They will only be removed for you.`)) {
+    return
+  }
+
+  const conversationId = activeConversation.value?.id
+  if (!conversationId)
+    return
+
+  let threadId: string
+  let threadType: number
+
+  if (conversationId.startsWith('group_')) {
+    const parts = conversationId.split('_')
+    threadId = parts[1] || conversationId
+    threadType = 2
+  }
+  else if (conversationId.startsWith('direct_')) {
+    const parts = conversationId.split('_')
+    const userId1 = parts[1]
+    const userId2 = parts[2]
+    threadId = (userId1 === currentUserId.value ? userId2 : userId1) || conversationId
+    threadType = 1
+  }
+  else {
+    threadId = conversationId
+    threadType = 1
+  }
+
+  try {
+    const deletePromises = Array.from(selectedMessageIds.value).map(messageId =>
+      api.delete(`/zalo/messages/${messageId}?threadId=${threadId}&threadType=${threadType}`),
+    )
+
+    await Promise.all(deletePromises)
+
+    // Remove from local list
+    messages.value = messages.value.filter(m => !selectedMessageIds.value.has(m.id))
+
+    exitSelectionMode()
+
+    // Reload to ensure cleanup
+    setTimeout(() => {
+      loadMessages(activeConversationId.value)
+    }, 500)
+  }
+  catch (error: any) {
+    console.error('Failed to delete messages:', error)
+    showToastNotification('Failed to delete some messages. Please try again.', 'error')
+  }
+}
+
+/**
+ * Toggle message selection
+ */
+function toggleMessageSelection(messageId: string) {
+  if (selectedMessageIds.value.has(messageId)) {
+    selectedMessageIds.value.delete(messageId)
+  }
+  else {
+    selectedMessageIds.value.add(messageId)
+  }
+
+  // Exit selection mode if no messages selected
+  if (selectedMessageIds.value.size === 0) {
+    exitSelectionMode()
+  }
+}
+
+/**
+ * Select message (from context menu)
+ */
+function selectMessage() {
+  if (contextMenuMessage.value) {
+    enterSelectionMode(contextMenuMessage.value.id)
+  }
+}
+
+/**
+ * Open forward dialog for selected messages
+ */
+async function forwardSelectedMessages() {
+  if (selectedMessageIds.value.size === 0)
+    return
+
+  showForwardDialog.value = true
+  forwardTargetConversations.value = []
+  forwardSearchQuery.value = ''
+}
+
+/**
+ * Toggle conversation selection for forward
+ */
+function toggleForwardConversation(conversationId: string) {
+  const index = forwardTargetConversations.value.indexOf(conversationId)
+  if (index > -1) {
+    forwardTargetConversations.value.splice(index, 1)
+  }
+  else {
+    forwardTargetConversations.value.push(conversationId)
+  }
+}
+
+/**
+ * Close forward dialog
+ */
+function closeForwardDialog() {
+  showForwardDialog.value = false
+  forwardTargetConversations.value = []
+  forwardSearchQuery.value = ''
+}
+
+/**
+ * Confirm and execute forward
+ */
+async function confirmForward() {
+  if (forwardTargetConversations.value.length === 0 || selectedMessageIds.value.size === 0)
+    return
+
+  isForwarding.value = true
+
+  try {
+    // Get selected messages
+    const messagesToForward = messages.value.filter(m =>
+      selectedMessageIds.value.has(m.id),
+    )
+
+    // Combine message texts
+    const combinedText = messagesToForward.map(m => m.text).join('\n')
+
+    // Forward to each selected conversation
+    for (const targetConvId of forwardTargetConversations.value) {
+      await api.post(`/zalo/messages/forward`, {
+        message: combinedText,
+        conversationIds: [targetConvId],
+        referenceMessageId: messagesToForward[0]?.id,
+      })
+    }
+
+    showToastNotification(`Đã chuyển tiếp tin nhắn đến ${forwardTargetConversations.value.length} cuộc trò chuyện`, 'success')
+
+    // Close dialog and exit selection mode
+    closeForwardDialog()
+    exitSelectionMode()
+  }
+  catch (error) {
+    console.error('Error forwarding messages:', error)
+    showToastNotification('Không thể chia sẻ tin nhắn. Vui lòng thử lại.', 'error')
+  }
+  finally {
+    isForwarding.value = false
+  }
+}
+
+/**
+ * Filtered conversations for forward dialog
+ */
+const forwardFilteredConversations = computed(() => {
+  if (!forwardSearchQuery.value.trim()) {
+    return conversations.value.filter(c => c.id !== activeConversationId.value)
+  }
+
+  const query = forwardSearchQuery.value.toLowerCase()
+  return conversations.value.filter(
+    c => c.id !== activeConversationId.value && c.name.toLowerCase().includes(query),
+  )
+})
+
+/**
+ * Show toast notification
+ */
+function showToastNotification(message: string, type: 'success' | 'error' | 'info' = 'success') {
+  toastMessage.value = message
+  toastType.value = type
+  showToast.value = true
+
+  // Clear existing timeout
+  if (toastTimeout) {
+    clearTimeout(toastTimeout)
+  }
+
+  // Auto hide after 3 seconds
+  toastTimeout = setTimeout(() => {
+    showToast.value = false
+  }, 3000)
+}
+
+/**
+ * Undo/recall message
+ */
+async function undoMessage(message?: Message) {
+  const msg = message || contextMenuMessage.value
+  if (!msg)
+    return
+
+  closeContextMenu()
+
+  if (msg.senderId !== currentUserId.value) {
+    showToastNotification('Bạn chỉ có thể thu hồi tin nhắn của mình', 'error')
+    return
+  }
+
+  try {
+    // Parse conversationId to get threadId and threadType
+    const conversationId = activeConversationId.value
+    let threadId = conversationId
+    let threadType = 1 // Default to User (direct chat)
+
+    // Determine thread type based on conversation
+    const conversation = conversations.value.find(c => c.id === conversationId)
+    if (conversation) {
+      threadType = conversation.type === 'group' ? 2 : 1
+    }
+
+    const response = await api.post(`/zalo/messages/${msg.id}/undo`, {
+      threadId,
+      threadType,
+    })
+
+    if (response.data.success) {
+      // Update local message
+      const msgIndex = messages.value.findIndex(m => m.id === msg.id)
+      if (msgIndex !== -1) {
+        messages.value[msgIndex]!.isUndone = true
+        messages.value[msgIndex]!.text = 'Tin nhắn đã được thu hồi'
+      }
+
+      // ✅ Reload conversations to update lastMessage
+      await loadConversations()
+
+      showToastNotification('Đã thu hồi tin nhắn', 'success')
+    }
+    else {
+      showToastNotification(response.data.message || 'Không thể thu hồi tin nhắn', 'error')
+    }
+  }
+  catch (error: any) {
+    console.error('Error undoing message:', error)
+    showToastNotification(error.response?.data?.message || 'Không thể thu hồi tin nhắn', 'error')
+  }
+}
+
+/**
+ * Delete message (only for current user)
+ */
+async function deleteMessage(message?: Message) {
+  const msg = message || contextMenuMessage.value
+  if (!msg)
+    return
+
+  closeContextMenu()
+
+  try {
+    // Parse conversationId to get threadId and threadType
+    const conversationId = activeConversationId.value
+    let threadId = conversationId
+    let threadType = 1
+
+    const conversation = conversations.value.find(c => c.id === conversationId)
+    if (conversation) {
+      threadType = conversation.type === 'group' ? 2 : 1
+    }
+
+    const response = await api.delete(`/zalo/messages/${msg.id}`, {
+      params: {
+        threadId,
+        threadType,
+      },
+    })
+
+    if (response.data.success) {
+      // Remove from local messages
+      const msgIndex = messages.value.findIndex(m => m.id === msg.id)
+      if (msgIndex !== -1) {
+        messages.value.splice(msgIndex, 1)
+      }
+
+      // ✅ Update conversation lastMessage immediately from response
+      const responseData = response.data.data
+      console.log('[UI DELETE] Response data:', {
+        conversationId: responseData?.conversationId,
+        activeConversationId: activeConversationId.value,
+        newLastMessage: responseData?.newLastMessage,
+        conversationsCount: conversations.value.length,
+      })
+
+      if (responseData?.conversationId && responseData?.newLastMessage) {
+        const conv = conversations.value.find(c => c.id === responseData.conversationId)
+        console.log('[UI DELETE] Found conversation:', !!conv, conv?.id)
+        if (conv) {
+          conv.lastMessage = responseData.newLastMessage.content || ''
+          conv.timestamp = formatTime(responseData.newLastMessage.time)
+          conv.timestampRaw = responseData.newLastMessage.time
+          conv.lastMessageTimestamp = new Date(responseData.newLastMessage.time).getTime()
+          console.log('[UI DELETE] ✅ Updated conversation lastMessage to:', responseData.newLastMessage.content)
+
+          // Force re-sort and trigger reactivity
+          sortConversations()
+        }
+        else {
+          console.warn('[UI DELETE] ⚠️ Conversation not found in list:', responseData.conversationId)
+        }
+      }
+      else if (responseData?.conversationId && !responseData?.newLastMessage) {
+        // No messages left - clear lastMessage
+        const conv = conversations.value.find(c => c.id === responseData.conversationId)
+        if (conv) {
+          conv.lastMessage = ''
+          conv.timestamp = ''
+        }
+      }
+
+      // ✅ Force reload conversations from backend to ensure sync
+      setTimeout(async () => {
+        await loadConversations()
+        console.log('[UI DELETE] Reloaded conversations from backend')
+      }, 200)
+
+      showToastNotification('Đã xóa tin nhắn', 'success')
+    }
+    else {
+      showToastNotification(response.data.message || 'Không thể xóa tin nhắn', 'error')
+    }
+  }
+  catch (error: any) {
+    console.error('Error deleting message:', error)
+    showToastNotification(error.response?.data?.message || 'Không thể xóa tin nhắn', 'error')
+  }
+}
+
 async function autoLogin() {
   try {
     const res = await api.get('/zalo/status')
@@ -501,6 +1115,22 @@ async function autoLogin() {
 function scrollToBottom() {
   if (messagesContainer.value) {
     messagesContainer.value.scrollTop = messagesContainer.value.scrollHeight
+  }
+}
+
+/**
+ * Navigate to quoted message (scroll and highlight)
+ */
+function navigateToMessage(messageId: string) {
+  const messageElement = document.querySelector(`[data-message-id="${messageId}"]`)
+  if (messageElement) {
+    messageElement.scrollIntoView({ behavior: 'smooth', block: 'center' })
+
+    // Highlight temporarily
+    highlightedMessageId.value = messageId
+    setTimeout(() => {
+      highlightedMessageId.value = null
+    }, 2000)
   }
 }
 
@@ -616,7 +1246,7 @@ async function subscribeToAllMessages() {
     const { subscription, unsubscribe } = await directusClient.subscribe('zalo_messages', {
       event: 'create',
       query: {
-        fields: ['*', 'sender_id.*'],
+        fields: ['*', 'sender_id.*', 'reply_to_message_id.*', 'reply_to_message_id.sender_id.*'],
         // no filter - listen to all conversations
         sort: ['sent_at'],
       },
@@ -706,7 +1336,74 @@ function handleNewMessage(data: any) {
     extractedConversationId: conversationId,
     messageId: messageData?.id,
     activeConversationId: activeConversationId.value,
+    replyToMessageId: messageData?.reply_to_message_id,
+    replyToType: typeof messageData?.reply_to_message_id,
+    hasReplyTo: !!messageData?.reply_to_message_id,
+    messageDataKeys: Object.keys(messageData || {}),
   })
+
+  // ✅ COMPREHENSIVE FILTER: Block system events (delete/undo notifications)
+  // System events have signature: type + actionType + (clientDelMsgId OR globalDelMsgId)
+  const messageText = messageData.content || messageData.text || ''
+
+  if (messageText && messageText.trim()) {
+    let contentToCheck = messageText.trim()
+    let maxDepth = 3
+
+    // Multi-level JSON unwrapping
+    while (maxDepth > 0 && (contentToCheck.startsWith('{') || contentToCheck.startsWith('['))) {
+      try {
+        const parsed = JSON.parse(contentToCheck)
+        const data = Array.isArray(parsed) ? parsed[0] : parsed
+
+        // Check comprehensive system event signature
+        if (typeof data === 'object' && data !== null) {
+          const hasSystemEventSignature = (
+            (data.type !== undefined && data.actionType !== undefined)
+            && (data.clientDelMsgId !== undefined || data.globalDelMsgId !== undefined)
+          )
+
+          if (hasSystemEventSignature) {
+            console.log('[UI] ✅ BLOCKING real-time system event:', {
+              messageId: messageData.id,
+              type: data.type,
+              actionType: data.actionType,
+            })
+
+            // Extract the message ID to delete
+            const msgIdToDelete = data.globalDelMsgId || data.clientDelMsgId
+            if (msgIdToDelete) {
+              // Remove the deleted message from UI
+              const index = messages.value.findIndex(m => m.id === String(msgIdToDelete))
+              if (index !== -1) {
+                console.log('[UI] Removing deleted message from UI:', msgIdToDelete)
+                messages.value.splice(index, 1)
+              }
+            }
+
+            // Don't add this system event message to UI
+            return
+          }
+        }
+
+        // Try to unwrap one more level
+        if (typeof parsed === 'string') {
+          contentToCheck = parsed.trim()
+        }
+        else if (typeof data === 'string') {
+          contentToCheck = data.trim()
+        }
+        else {
+          break
+        }
+      }
+      catch {
+        break
+      }
+
+      maxDepth--
+    }
+  }
 
   if (conversationId !== activeConversationId.value) {
     console.log('[UI] Message not for active conversation, skipping UI update')
@@ -736,6 +1433,38 @@ function handleNewMessage(data: any) {
       const senderAvatar = typeof senderIdRaw === 'object' ? senderIdRaw?.avatar_url : messageData.avatar
       const direction = senderId === currentUserId.value ? 'out' : 'in'
 
+      // Build quote object if this is a reply
+      let quoteData = null
+      if (messageData.reply_to_message_id) {
+        if (typeof messageData.reply_to_message_id === 'object') {
+          // reply_to_message_id is already expanded object
+          const quotedMsg = messageData.reply_to_message_id
+          quoteData = {
+            msgId: quotedMsg.id,
+            content: quotedMsg.content || '',
+            senderName: quotedMsg.sender_id?.display_name || 'Unknown',
+            avatar: quotedMsg.sender_id?.avatar_url || null,
+          }
+          console.log('[UI] Built quote data from object (replace optimistic):', quoteData)
+        }
+        else if (typeof messageData.reply_to_message_id === 'string') {
+          // reply_to_message_id is just an ID string, find the message in local messages
+          const quotedMsg = messages.value.find(m => m.id === messageData.reply_to_message_id)
+          if (quotedMsg) {
+            quoteData = {
+              msgId: quotedMsg.id,
+              content: quotedMsg.text || '',
+              senderName: quotedMsg.senderName || 'Unknown',
+              avatar: quotedMsg.avatar || null,
+            }
+            console.log('[UI] Built quote data from local message (replace optimistic):', quoteData)
+          }
+          else {
+            console.log('[UI] Could not find quoted message in local messages:', messageData.reply_to_message_id)
+          }
+        }
+      }
+
       messages.value[optimisticIndex] = {
         id: messageId,
         direction,
@@ -750,6 +1479,8 @@ function handleNewMessage(data: any) {
         isEdited: messageData.is_edited || messageData.isEdited || false,
         isUndone: messageData.is_undone || messageData.isUndone || false,
         clientId,
+        rawData: messageData.raw_data || messageData.rawData || null,
+        quote: quoteData,
       }
       return
     }
@@ -767,6 +1498,38 @@ function handleNewMessage(data: any) {
   const senderName = typeof senderIdRaw === 'object' ? senderIdRaw?.display_name : (messageData.sender_name || messageData.senderName || 'Unknown')
   const senderAvatar = typeof senderIdRaw === 'object' ? senderIdRaw?.avatar_url : messageData.avatar
   const direction = senderId === currentUserId.value ? 'out' : 'in'
+
+  // Build quote object if this is a reply
+  let quoteData = null
+  if (messageData.reply_to_message_id) {
+    if (typeof messageData.reply_to_message_id === 'object') {
+      // reply_to_message_id is already expanded object
+      const quotedMsg = messageData.reply_to_message_id
+      quoteData = {
+        msgId: quotedMsg.id,
+        content: quotedMsg.content || '',
+        senderName: quotedMsg.sender_id?.display_name || 'Unknown',
+        avatar: quotedMsg.sender_id?.avatar_url || null,
+      }
+      console.log('[UI] Built quote data from object (push new):', quoteData)
+    }
+    else if (typeof messageData.reply_to_message_id === 'string') {
+      // reply_to_message_id is just an ID string, find the message in local messages
+      const quotedMsg = messages.value.find(m => m.id === messageData.reply_to_message_id)
+      if (quotedMsg) {
+        quoteData = {
+          msgId: quotedMsg.id,
+          content: quotedMsg.text || '',
+          senderName: quotedMsg.senderName || 'Unknown',
+          avatar: quotedMsg.avatar || null,
+        }
+        console.log('[UI] Built quote data from local message (push new):', quoteData)
+      }
+      else {
+        console.log('[UI] Could not find quoted message in local messages:', messageData.reply_to_message_id)
+      }
+    }
+  }
 
   // Try to get attachments - fetch async in background if needed
   let attachments = messageData.attachments || []
@@ -823,6 +1586,8 @@ function handleNewMessage(data: any) {
     isEdited: messageData.is_edited || messageData.isEdited || false,
     isUndone: messageData.is_undone || messageData.isUndone || false,
     clientId,
+    rawData: messageData.raw_data || messageData.rawData || null,
+    quote: quoteData,
   })
 
   updateConversationOnNewMessage(conversationId, messageData)
@@ -959,57 +1724,73 @@ async function loadConversations() {
       return
     }
 
-    const newConversations = data.map((conv: any) => {
-      const rawTimestamp = conv.timestamp || conv.lastMessageTime || new Date().toISOString()
-      const timestampDate = new Date(rawTimestamp)
-      const timestampMs = timestampDate.getTime()
+    const newConversations = data
+      .map((conv: any) => {
+        const rawTimestamp = conv.timestamp || conv.lastMessageTime || new Date().toISOString()
+        const timestampDate = new Date(rawTimestamp)
+        const timestampMs = timestampDate.getTime()
 
-      // ✅ Filter JSON string trong lastMessage
-      let lastMessage = conv.lastMessage || ''
-      if (lastMessage && typeof lastMessage === 'string') {
-        const trimmed = lastMessage.trim()
-        if ((trimmed.startsWith('{') && trimmed.endsWith('}'))
-          || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
-          try {
-            JSON.parse(trimmed)
-            lastMessage = '📎 Attachment' // Hiển thị "Attachment" thay vì JSON
-          }
-          catch {
-            // Not JSON, keep as-is
+        let lastMessage = conv.lastMessage || ''
+
+        // Check if lastMessage is JSON system event
+        if (lastMessage && lastMessage.trim()) {
+          const trimmed = lastMessage.trim()
+          // Check if it's JSON with "type" and "actionType" (system event)
+          if ((trimmed.startsWith('{') || trimmed.startsWith('['))
+            && trimmed.includes('"type":') && trimmed.includes('"actionType":')) {
+            console.warn('[UI] Hiding system event JSON in conversation:', conv.id)
+            lastMessage = '' // Hide JSON system events
           }
         }
-      }
 
-      return {
-        id: conv.id,
-        name: conv.name || 'Unknown',
-        avatar: conv.avatar || `https://ui-avatars.com/api?name=U&background=random`,
-        lastMessage,
-        timestamp: formatTime(rawTimestamp),
-        timestampRaw: rawTimestamp,
-        lastMessageTimestamp: timestampMs,
-        unreadCount: conv.unreadCount || 0,
-        online: true,
-        type: conv.type || 'direct',
-        members: Array.isArray(conv.members)
-          ? conv.members.map((m: any) => ({
-              id: m.id,
-              name: m.name || 'Unknown',
-              avatar: m.avatar || `https://ui-avatars.com/api?name=U&background=random`,
-            }))
-          : [],
-        hasRealAvatar: !!conv.avatar && !conv.avatar.includes('ui-avatars.com'),
+        return {
+          id: conv.id,
+          name: conv.name || 'Unknown',
+          avatar: conv.avatar || `https://ui-avatars.com/api?name=U&background=random`,
+          lastMessage,
+          timestamp: formatTime(rawTimestamp),
+          timestampRaw: rawTimestamp,
+          lastMessageTimestamp: timestampMs,
+          unreadCount: conv.unreadCount || 0,
+          online: true,
+          type: conv.type || 'direct',
+          members: Array.isArray(conv.members)
+            ? conv.members.map((m: any) => ({
+                id: m.id,
+                name: m.name || 'Unknown',
+                avatar: m.avatar || `https://ui-avatars.com/api?name=U&background=random`,
+              }))
+            : [],
+          hasRealAvatar: !!conv.avatar && !conv.avatar.includes('ui-avatars.com'),
+        }
+      })
+
+    //  DEDUPLICATE: If multiple conversations have same name, keep the newest one
+    const conversationMap = new Map<string, any>()
+    newConversations.forEach((conv: any) => {
+      const existing = conversationMap.get(conv.name)
+      if (!existing || conv.lastMessageTimestamp > existing.lastMessageTimestamp) {
+        // Keep newer conversation (or first if no existing)
+        conversationMap.set(conv.name, conv)
+      }
+      else {
+        console.log('[UI] 🗑️ Removing duplicate conversation:', {
+          name: conv.name,
+          id: conv.id,
+          kept: existing.id,
+        })
       }
     })
+    const deduplicatedConversations = Array.from(conversationMap.values())
 
     // ✅ CHỈ update nếu có thay đổi thực sự
-    const hasConversationChanges = conversations.value.length !== newConversations.length
+    const hasConversationChanges = conversations.value.length !== deduplicatedConversations.length
       || JSON.stringify(conversations.value.map((c: Conversation) => ({ id: c.id, lastMessage: c.lastMessage, unreadCount: c.unreadCount })))
-      !== JSON.stringify(newConversations.map((c: Conversation) => ({ id: c.id, lastMessage: c.lastMessage, unreadCount: c.unreadCount })))
+      !== JSON.stringify(deduplicatedConversations.map((c: Conversation) => ({ id: c.id, lastMessage: c.lastMessage, unreadCount: c.unreadCount })))
 
     if (hasConversationChanges) {
       console.warn('🔄 Conversations changed, updating...')
-      conversations.value = newConversations
+      conversations.value = deduplicatedConversations
       sortConversations()
     }
     else {
@@ -1164,27 +1945,98 @@ async function loadMessages(conversationId: string) {
     const messagesResponse = await api.get(`/zalo/messages/${conversationId}`)
     const data = messagesResponse.data.data
 
-    messages.value = data.map((msg: any) => ({
-      id: msg.id,
-      direction: msg.direction,
-      text: msg.text || '',
-      senderName: msg.senderName,
-      senderId: msg.senderId,
-      time: msg.time,
-      avatar: msg.avatar,
-      status: msg.status,
-      files: msg.attachments || [],
-      reactions: msg.reactions || [],
-      isEdited: msg.isEdited,
-      isUndone: msg.isUndone,
-      clientId: msg.clientId,
-    }))
+    console.log('[UI] Loaded messages from GET endpoint:', {
+      totalMessages: data.length,
+      messagesWithQuote: data.filter((m: any) => m.quote).length,
+      sampleMessageWithQuote: data.find((m: any) => m.quote),
+    })
+
+    messages.value = data
+      .filter((msg: any) => {
+        // ✅ COMPREHENSIVE FILTER: Block system events (delete/undo notifications)
+        // System events have signature: type + actionType + (clientDelMsgId OR globalDelMsgId)
+        const text = msg.text || ''
+
+        if (!text || !text.trim()) {
+          return true // Keep empty messages
+        }
+
+        const trimmed = text.trim()
+
+        // Multi-level JSON unwrapping (up to 3 levels deep)
+        let contentToCheck = trimmed
+        let maxDepth = 3
+
+        while (maxDepth > 0 && (contentToCheck.startsWith('{') || contentToCheck.startsWith('['))) {
+          try {
+            const parsed = JSON.parse(contentToCheck)
+            const data = Array.isArray(parsed) ? parsed[0] : parsed
+
+            // Check comprehensive system event signature
+            if (typeof data === 'object' && data !== null) {
+              const hasSystemEventSignature = (
+                (data.type !== undefined && data.actionType !== undefined)
+                && (data.clientDelMsgId !== undefined || data.globalDelMsgId !== undefined)
+              )
+
+              if (hasSystemEventSignature) {
+                console.log('[UI] ✅ BLOCKING system event message:', {
+                  id: msg.id,
+                  type: data.type,
+                  actionType: data.actionType,
+                  hasDelMsgId: !!(data.clientDelMsgId || data.globalDelMsgId),
+                })
+                return false
+              }
+            }
+
+            // Try to unwrap one more level if still stringified
+            if (typeof parsed === 'string') {
+              contentToCheck = parsed.trim()
+            }
+            else if (typeof data === 'string') {
+              contentToCheck = data.trim()
+            }
+            else {
+              break // No more unwrapping possible
+            }
+          }
+          catch {
+            // Not valid JSON, stop unwrapping
+            break
+          }
+
+          maxDepth--
+        }
+
+        return true
+      })
+      .map((msg: any) => ({
+        id: msg.id,
+        direction: msg.direction,
+        text: msg.text || '',
+        senderName: msg.senderName,
+        senderId: msg.senderId,
+        time: msg.time,
+        avatar: msg.avatar,
+        status: msg.status,
+        files: msg.attachments || [],
+        reactions: msg.reactions || [],
+        isEdited: msg.isEdited,
+        isUndone: msg.isUndone,
+        clientId: msg.clientId,
+        rawData: msg.rawData || null, // Store raw data
+        quote: msg.quote || null, // Map quote data for reply display
+      }))
 
     // Auto scroll to bottom after loading
     nextTick(() => {
-      if (messagesContainer.value) {
-        messagesContainer.value.scrollTop = messagesContainer.value.scrollHeight
-      }
+      // Add small delay to ensure DOM is fully rendered
+      setTimeout(() => {
+        if (messagesContainer.value) {
+          messagesContainer.value.scrollTop = messagesContainer.value.scrollHeight
+        }
+      }, 100)
     })
   }
   catch (error: any) {
@@ -1447,24 +2299,6 @@ const selectedMemberObjects = computed(() => {
     selectedMembers.value.includes(member.id),
   )
 })
-
-function navigateToMessage(messageId: string) {
-  highlightedMessageId.value = messageId
-
-  nextTick(() => {
-    const messageElement = document.querySelector(`[data-message-id="${messageId}"]`)
-    if (messageElement && messagesContainer.value) {
-      messageElement.scrollIntoView({
-        behavior: 'smooth',
-        block: 'center',
-      })
-
-      setTimeout(() => {
-        highlightedMessageId.value = null
-      }, 3000)
-    }
-  })
-}
 
 function handleFilter() {
   showFilterDropdown.value = !showFilterDropdown.value
@@ -1744,6 +2578,90 @@ const filteredMembers = computed(() => {
 
     <!-- Main Chat Area với absolute positioning -->
     <div class="chat-container">
+      <!-- Selection Action Bar - Shows when in selection mode -->
+      <div
+        v-if="isSelectionMode"
+        class="fixed top-0 left-0 right-0 z-50 bg-blue-500 text-white px-6 py-4 shadow-lg flex items-center justify-between"
+      >
+        <div class="flex items-center gap-4">
+          <button
+            class="w-8 h-8 flex items-center justify-center rounded-full hover:bg-white/20 transition-colors"
+            @click="exitSelectionMode"
+          >
+            <svg
+              width="20"
+              height="20"
+              viewBox="0 0 20 20"
+              fill="none"
+              xmlns="http://www.w3.org/2000/svg"
+            >
+              <path
+                d="M15 5L5 15M5 5L15 15"
+                stroke="white"
+                stroke-width="2"
+                stroke-linecap="round"
+              />
+            </svg>
+          </button>
+          <span class="font-semibold text-lg">
+            {{ selectedMessageIds.size }} selected
+          </span>
+        </div>
+
+        <div class="flex items-center gap-3">
+          <button
+            class="px-4 py-2 rounded-lg hover:bg-white/20 transition-colors font-medium"
+            @click="selectAllMessages"
+          >
+            Select All
+          </button>
+          <button
+            v-if="selectedMessageIds.size > 0"
+            class="px-4 py-2 rounded-lg hover:bg-white/20 transition-colors font-medium flex items-center gap-2"
+            @click="forwardSelectedMessages"
+          >
+            <svg
+              width="18"
+              height="18"
+              viewBox="0 0 18 18"
+              fill="none"
+              xmlns="http://www.w3.org/2000/svg"
+            >
+              <path
+                d="M9 3L15 9M15 9L9 15M15 9H3"
+                stroke="white"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              />
+            </svg>
+            Forward
+          </button>
+          <button
+            v-if="selectedMessageIds.size > 0"
+            class="px-4 py-2 bg-red-500 hover:bg-red-600 rounded-lg transition-colors font-medium flex items-center gap-2"
+            @click="deleteSelectedMessages"
+          >
+            <svg
+              width="18"
+              height="18"
+              viewBox="0 0 18 18"
+              fill="none"
+              xmlns="http://www.w3.org/2000/svg"
+            >
+              <path
+                d="M3 5H15M6 5V3H12V5M7 9V13M11 9V13M4 5L5 15H13L14 5"
+                stroke="white"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              />
+            </svg>
+            Delete
+          </button>
+        </div>
+      </div>
+
       <!-- App Initialization Loading State -->
       <div
         v-if="isInitializing"
@@ -1815,14 +2733,21 @@ const filteredMembers = computed(() => {
                 v-for="message in currentMessages"
                 :key="message.id"
                 :data-message-id="message.id"
-                class="flex gap-4 px-8 py-3 transition-all duration-300"
+                class="group flex gap-4 px-8 py-3 transition-all duration-300 relative"
                 :class="[
                   {
                     'justify-center': message.type === 'system',
                     'justify-start': message.type !== 'system',
                     'bg-gray-200': highlightedMessageId === message.id,
+                    'bg-blue-50': isSelectionMode && selectedMessageIds.has(message.id),
                   },
                 ]"
+                @mousedown="message.type !== 'system' ? handleLongPressStart($event, message.id) : null"
+                @mouseup="message.type !== 'system' ? handleLongPressEnd() : null"
+                @mouseleave="message.type !== 'system' ? handleLongPressEnd() : null"
+                @touchstart="message.type !== 'system' ? handleLongPressStart($event, message.id) : null"
+                @touchend="message.type !== 'system' ? handleLongPressEnd() : null"
+                @click="message.type !== 'system' ? handleMessageClick(message.id) : null"
               >
                 <!-- System Message (Group creation, etc.) -->
                 <div v-if="message.type === 'system'" class="flex flex-col items-center w-full gap-8">
@@ -1892,6 +2817,38 @@ const filteredMembers = computed(() => {
 
                 <!-- Regular Messages -->
                 <template v-else>
+                  <!-- Selection Checkbox (only in selection mode) -->
+                  <div
+                    v-if="isSelectionMode"
+                    class="w-6 h-6 flex items-center justify-center flex-shrink-0 mt-14"
+                  >
+                    <div
+                      class="w-5 h-5 rounded border-2 flex items-center justify-center transition-all"
+                      :class="
+                        selectedMessageIds.has(message.id)
+                          ? 'bg-blue-500 border-blue-500'
+                          : 'bg-white border-gray-300'
+                      "
+                    >
+                      <svg
+                        v-if="selectedMessageIds.has(message.id)"
+                        width="12"
+                        height="12"
+                        viewBox="0 0 12 12"
+                        fill="none"
+                        xmlns="http://www.w3.org/2000/svg"
+                      >
+                        <path
+                          d="M2 6L5 9L10 3"
+                          stroke="white"
+                          stroke-width="2"
+                          stroke-linecap="round"
+                          stroke-linejoin="round"
+                        />
+                      </svg>
+                    </div>
+                  </div>
+
                   <!-- Avatar -->
                   <div class="w-14 h-14 relative rounded-full overflow-hidden bg-neutral-100 border border-black/8 flex-shrink-0">
                     <img
@@ -1907,7 +2864,7 @@ const filteredMembers = computed(() => {
                     >
                   </div>
 
-                  <div class="flex flex-col max-w-[70%]">
+                  <div class="flex flex-col max-w-[70%] relative">
                     <!-- Message header with name and time -->
                     <div class="flex items-center gap-2 mb-2">
                       <span class="font-semibold text-sm text-text-secondary">
@@ -1974,9 +2931,93 @@ const filteredMembers = computed(() => {
                       v-if="message.text && !message.text.startsWith('📎')"
                       class="rounded-lg max-w-full break-words text-sm text-text-secondary leading-relaxed border-neutral-200"
                     >
-                      <p class="">
+                      <!-- Quoted/Replied Message - Discord style -->
+                      <div
+                        v-if="message.quote"
+                        class="mb-1.5 flex items-start gap-2 cursor-pointer hover:bg-gray-50 -ml-1 pl-1 pr-2 py-1 rounded transition-colors"
+                        @click="navigateToMessage(message.quote.msgId)"
+                      >
+                        <!-- Reply line -->
+                        <div class="flex flex-col items-center pt-1">
+                          <div class="w-0.5 h-2.5 bg-gray-300 rounded-full" />
+                          <div class="w-0.5 h-2.5 bg-gray-300 rounded-full -mt-0.5" />
+                          <svg width="10" height="10" viewBox="0 0 10 10" fill="none" xmlns="http://www.w3.org/2000/svg" class="-ml-0.5 -mt-0.5">
+                            <path d="M1.5 5 L1.5 2.5 Q1.5 1.5 2.5 1.5 L8 1.5" stroke="#D1D5DB" stroke-width="1.5" stroke-linecap="round" />
+                          </svg>
+                        </div>
+
+                        <!-- Avatar + Content -->
+                        <div class="flex items-start gap-1.5 min-w-0 flex-1">
+                          <!-- Small avatar -->
+                          <div class="w-4 h-4 rounded-full overflow-hidden bg-gray-200 flex-shrink-0 mt-0.5">
+                            <img
+                              :src="message.quote.avatar || `https://ui-avatars.com/api/?name=${encodeURIComponent(message.quote.senderName?.charAt(0) || '?')}&background=random&size=16`"
+                              :alt="message.quote.senderName"
+                              class="w-full h-full object-cover"
+                            >
+                          </div>
+
+                          <!-- Name + message preview -->
+                          <div class="flex flex-col min-w-0 flex-1">
+                            <span class="text-xs font-semibold text-gray-700">
+                              {{ message.quote.senderName || 'Someone' }}
+                            </span>
+                            <span class="text-xs text-gray-500 truncate">
+                              {{ message.quote.content }}
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+
+                      <!-- Message text -->
+                      <p v-if="!message.isUndone" class="whitespace-pre-wrap pr-2">
                         {{ message.text }}
                       </p>
+                      <p v-else class="italic text-neutral-400 text-xs">
+                        Tin nhắn đã được thu hồi
+                      </p>
+                    </div>
+
+                    <!-- Quick action icons (Reply, Forward, More) - Positioned absolutely on the right -->
+                    <div
+                      v-if="!message.isUndone"
+                      class="opacity-0 group-hover:opacity-100 absolute -right-2 top-0 flex items-center gap-0.5 transition-opacity"
+                      style="transform: translateX(100%);"
+                    >
+                      <!-- Quote/Reply icon (format_quote style) -->
+                      <button
+                        class="w-8 h-8 flex items-center justify-center rounded-full bg-white hover:bg-gray-200 transition-colors shadow-sm"
+                        title="Trả lời"
+                        @click.stop="replyToMessage(message)"
+                      >
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                          <path d="M6 17h3l2-4V7H5v6h3zm8 0h3l2-4V7h-6v6h3z" fill="#6B7280" />
+                        </svg>
+                      </button>
+
+                      <!-- Forward icon (zi-share-solid - mũi tên cong sang phải) -->
+                      <button
+                        class="w-8 h-8 flex items-center justify-center rounded-full bg-white hover:bg-gray-200 transition-colors shadow-sm"
+                        title="Chuyển tiếp"
+                        @click.stop="quickForwardMessage(message)"
+                      >
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                          <path d="M14 9V5l7 7-7 7v-4.1c-5 0-8.5 1.6-11 5.1 1-5 4-10 11-11z" fill="#6B7280" />
+                        </svg>
+                      </button>
+
+                      <!-- More menu icon (3 chấm ngang) -->
+                      <button
+                        class="w-8 h-8 flex items-center justify-center rounded-full bg-white hover:bg-gray-200 transition-colors shadow-sm"
+                        title="Tùy chọn khác"
+                        @click.stop="showMessageContextMenu($event, message)"
+                      >
+                        <svg width="18" height="18" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
+                          <circle cx="4" cy="10" r="1.5" fill="#6B7280" />
+                          <circle cx="10" cy="10" r="1.5" fill="#6B7280" />
+                          <circle cx="16" cy="10" r="1.5" fill="#6B7280" />
+                        </svg>
+                      </button>
                     </div>
                   </div>
                 </template>
@@ -1984,6 +3025,41 @@ const filteredMembers = computed(() => {
             </div>
           </div>
           <!-- End Messages Content -->
+        </div>
+
+        <!-- Reply Preview Bar -->
+        <div
+          v-if="replyingTo"
+          class="reply-preview-bar"
+        >
+          <div class="flex items-center gap-3 px-4 py-3 bg-blue-50 border-t border-blue-200">
+            <!-- Reply Icon -->
+            <div class="flex-shrink-0">
+              <svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <path d="M8 5L4 10L8 15M4 10H16" stroke="#2563EB" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+              </svg>
+            </div>
+
+            <!-- Reply Content -->
+            <div class="flex-1 min-w-0">
+              <div class="text-xs font-medium text-blue-600">
+                Trả lời {{ replyingTo.senderName }}
+              </div>
+              <div class="text-sm text-gray-600 truncate mt-0.5">
+                {{ replyingTo.text }}
+              </div>
+            </div>
+
+            <!-- Close Button -->
+            <button
+              class="flex-shrink-0 p-2 hover:bg-blue-100 rounded-md transition-colors"
+              @click="cancelReply"
+            >
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <path d="M12 4L4 12M4 4L12 12" stroke="#2563EB" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+              </svg>
+            </button>
+          </div>
         </div>
 
         <!-- Message input - Fixed tại bottom -->
@@ -2267,6 +3343,355 @@ const filteredMembers = computed(() => {
       @remove-member="removeMember"
       @create-group="createGroup"
     />
+
+    <!-- Context Menu (Zalo-style) -->
+    <Teleport to="body">
+      <div
+        v-if="showContextMenu"
+        :style="{
+          position: 'fixed',
+          left: `${contextMenuPosition.x}px`,
+          top: `${contextMenuPosition.y}px`,
+          zIndex: 9999,
+        }"
+        class="context-menu"
+      >
+        <div class="bg-white rounded-lg shadow-lg border border-neutral-200 py-2 min-w-[200px]">
+          <!-- Copy message -->
+          <button
+            class="w-full px-4 py-2 text-left hover:bg-neutral-50 flex items-center gap-3 text-sm"
+            @click="copyMessage"
+          >
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <rect x="5" y="5" width="9" height="9" rx="1" stroke="currentColor" stroke-width="1.5" />
+              <path d="M3 11V3C3 2.45 3.45 2 4 2H10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+            </svg>
+            <span>Copy tin nhắn</span>
+          </button>
+
+          <!-- Reply to message -->
+          <button
+            class="w-full px-4 py-2 text-left hover:bg-neutral-50 flex items-center gap-3 text-sm"
+            @click="replyToMessage()"
+          >
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M6 4L3 8L6 12M3 8H13" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+            <span>Trả lời</span>
+          </button>
+
+          <!-- Forward message -->
+          <button
+            class="w-full px-4 py-2 text-left hover:bg-neutral-50 flex items-center gap-3 text-sm"
+            @click="quickForwardMessage(contextMenuMessage!)"
+          >
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M10 4L13 8L10 12M13 8H3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+            <span>Chuyển tiếp</span>
+          </button>
+
+          <!-- Select multiple messages -->
+          <button
+            class="w-full px-4 py-2 text-left hover:bg-neutral-50 flex items-center gap-3 text-sm border-b border-neutral-100"
+            @click="selectMessage"
+          >
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <rect x="2" y="2" width="5" height="5" rx="1" stroke="currentColor" stroke-width="1.5" />
+              <rect x="9" y="2" width="5" height="5" rx="1" stroke="currentColor" stroke-width="1.5" />
+              <rect x="2" y="9" width="5" height="5" rx="1" stroke="currentColor" stroke-width="1.5" />
+              <rect x="9" y="9" width="5" height="5" rx="1" stroke="currentColor" stroke-width="1.5" />
+            </svg>
+            <span>Chọn nhiều tin nhắn</span>
+          </button>
+
+          <!-- Recall message (only for own messages) -->
+          <button
+            v-if="contextMenuMessage?.senderId === currentUserId"
+            class="w-full px-4 py-2 text-left hover:bg-red-50 flex items-center gap-3 text-sm text-red-600"
+            @click="undoMessage()"
+          >
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M3 8C3 5.24 5.24 3 8 3C9.65 3 11.1 3.77 12 5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+              <path d="M10 5H12.5V7.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+            <span>Thu hồi</span>
+          </button>
+
+          <!-- Delete message (for all messages) -->
+          <button
+            class="w-full px-4 py-2 text-left hover:bg-red-50 flex items-center gap-3 text-sm text-red-600"
+            @click="deleteMessage()"
+          >
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M3 4H13M5 4V3C5 2.45 5.45 2 6 2H10C10.55 2 11 2.45 11 3V4M6.5 7.5V11.5M9.5 7.5V11.5M4 4H12L11 13C11 13.55 10.55 14 10 14H6C5.45 14 5 13.55 5 13L4 4Z" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+            <span>Xóa chỉ ở phía tôi</span>
+          </button>
+        </div>
+      </div>
+    </Teleport>
+
+    <!-- Forward Dialog -->
+    <Teleport to="body">
+      <div
+        v-if="showForwardDialog"
+        class="fixed inset-0 z-[10000] flex items-center justify-center bg-black/50"
+        @click.self="closeForwardDialog"
+      >
+        <div class="bg-white rounded-2xl shadow-2xl w-full max-w-md max-h-[80vh] flex flex-col">
+          <!-- Header -->
+          <div class="px-6 py-4 border-b border-neutral-200">
+            <div class="flex items-center justify-between">
+              <h3 class="text-lg font-semibold text-neutral-900">
+                Forward to
+              </h3>
+              <button
+                class="p-2 hover:bg-neutral-100 rounded-lg transition-colors"
+                @click="closeForwardDialog"
+              >
+                <svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
+                  <path d="M15 5L5 15M5 5L15 15" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+                </svg>
+              </button>
+            </div>
+            <p class="text-sm text-neutral-500 mt-1">
+              {{ selectedMessageIds.size }} message(s) selected
+            </p>
+          </div>
+
+          <!-- Search -->
+          <div class="px-6 py-3 border-b border-neutral-200">
+            <div class="relative">
+              <svg
+                class="absolute left-3 top-1/2 -translate-y-1/2 text-neutral-400"
+                width="18"
+                height="18"
+                viewBox="0 0 18 18"
+                fill="none"
+                xmlns="http://www.w3.org/2000/svg"
+              >
+                <circle cx="8" cy="8" r="5.5" stroke="currentColor" stroke-width="1.5" />
+                <path d="M12 12L15.5 15.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+              </svg>
+              <input
+                v-model="forwardSearchQuery"
+                type="text"
+                placeholder="Search conversations..."
+                class="w-full pl-10 pr-4 py-2 border border-neutral-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+              >
+            </div>
+          </div>
+
+          <!-- Conversation List -->
+          <div class="flex-1 overflow-y-auto px-6 py-3">
+            <div v-if="forwardFilteredConversations.length === 0" class="text-center py-8 text-neutral-500">
+              No conversations found
+            </div>
+            <div v-else class="space-y-2">
+              <button
+                v-for="conv in forwardFilteredConversations"
+                :key="conv.id"
+                class="w-full flex items-center gap-3 p-3 rounded-lg hover:bg-neutral-50 transition-colors"
+                :class="forwardTargetConversations.includes(conv.id) ? 'bg-blue-50 hover:bg-blue-100' : ''"
+                @click="toggleForwardConversation(conv.id)"
+              >
+                <!-- Checkbox -->
+                <div
+                  class="w-5 h-5 rounded border-2 flex items-center justify-center flex-shrink-0"
+                  :class="forwardTargetConversations.includes(conv.id)
+                    ? 'bg-blue-500 border-blue-500'
+                    : 'border-neutral-300'"
+                >
+                  <svg
+                    v-if="forwardTargetConversations.includes(conv.id)"
+                    width="12"
+                    height="12"
+                    viewBox="0 0 12 12"
+                    fill="none"
+                    xmlns="http://www.w3.org/2000/svg"
+                  >
+                    <path d="M2 6L5 9L10 3" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+                  </svg>
+                </div>
+
+                <!-- Avatar -->
+                <div class="relative flex-shrink-0">
+                  <img
+                    v-if="conv.avatar"
+                    :src="conv.avatar"
+                    :alt="conv.name"
+                    class="w-10 h-10 rounded-full object-cover"
+                    @error="(e) => handleImageError(e, conv.name)"
+                  >
+                  <div
+                    v-else
+                    class="w-10 h-10 rounded-full flex items-center justify-center text-white font-semibold text-sm"
+                    :style="{ background: `linear-gradient(135deg, #667eea 0%, #764ba2 100%)` }"
+                  >
+                    {{ getInitials(conv.name) }}
+                  </div>
+                </div>
+
+                <!-- Info -->
+                <div class="flex-1 min-w-0 text-left">
+                  <div class="font-medium text-neutral-900 truncate">
+                    {{ conv.name }}
+                  </div>
+                  <div class="text-xs text-neutral-500 truncate">
+                    {{ conv.type === 'group' ? 'Group' : 'Direct' }}
+                  </div>
+                </div>
+              </button>
+            </div>
+          </div>
+
+          <!-- Footer -->
+          <div class="px-6 py-4 border-t border-neutral-200 flex items-center justify-between">
+            <div class="text-sm text-neutral-600">
+              {{ forwardTargetConversations.length }} selected
+            </div>
+            <div class="flex gap-2">
+              <button
+                class="px-4 py-2 text-neutral-700 hover:bg-neutral-100 rounded-lg transition-colors"
+                @click="closeForwardDialog"
+              >
+                Cancel
+              </button>
+              <button
+                class="px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+                :disabled="forwardTargetConversations.length === 0 || isForwarding"
+                @click="confirmForward"
+              >
+                <svg
+                  v-if="isForwarding"
+                  class="animate-spin"
+                  width="16"
+                  height="16"
+                  viewBox="0 0 16 16"
+                  fill="none"
+                  xmlns="http://www.w3.org/2000/svg"
+                >
+                  <circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="2" stroke-opacity="0.25" />
+                  <path d="M8 2C4.69 2 2 4.69 2 8" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+                </svg>
+                <span>{{ isForwarding ? 'Forwarding...' : 'Forward' }}</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </Teleport>
+
+    <!-- Toast Notification -->
+    <Teleport to="body">
+      <Transition
+        enter-active-class="transition-all duration-300 ease-out"
+        enter-from-class="opacity-0 translate-y-2"
+        enter-to-class="opacity-100 translate-y-0"
+        leave-active-class="transition-all duration-200 ease-in"
+        leave-from-class="opacity-100 translate-y-0"
+        leave-to-class="opacity-0 -translate-y-2"
+      >
+        <div
+          v-if="showToast"
+          class="fixed top-6 left-1/2 -translate-x-1/2 z-[10001] pointer-events-none"
+        >
+          <div
+            class="bg-[#2D2D2D] text-white rounded-xl shadow-2xl px-6 py-4 flex items-center gap-4 min-w-[320px] max-w-md pointer-events-auto"
+            :class="{
+              'bg-[#2D2D2D]': toastType === 'success',
+              'bg-red-600': toastType === 'error',
+              'bg-blue-600': toastType === 'info',
+            }"
+          >
+            <!-- Icon -->
+            <div class="flex-shrink-0">
+              <!-- Success Icon (Checkmark in Circle) -->
+              <div v-if="toastType === 'success'" class="relative">
+                <svg
+                  width="32"
+                  height="32"
+                  viewBox="0 0 32 32"
+                  fill="none"
+                  xmlns="http://www.w3.org/2000/svg"
+                  class="animate-scale-in"
+                >
+                  <!-- Circle background -->
+                  <circle
+                    cx="16"
+                    cy="16"
+                    r="14"
+                    stroke="white"
+                    stroke-width="2"
+                    fill="none"
+                    class="animate-draw-circle"
+                  />
+                  <!-- Checkmark -->
+                  <path
+                    d="M9 16L14 21L23 11"
+                    stroke="white"
+                    stroke-width="2.5"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    class="animate-draw-check"
+                  />
+                </svg>
+              </div>
+
+              <!-- Error Icon (X in Circle) -->
+              <div v-if="toastType === 'error'">
+                <svg
+                  width="32"
+                  height="32"
+                  viewBox="0 0 32 32"
+                  fill="none"
+                  xmlns="http://www.w3.org/2000/svg"
+                >
+                  <circle cx="16" cy="16" r="14" stroke="white" stroke-width="2" fill="none" />
+                  <path d="M11 11L21 21M21 11L11 21" stroke="white" stroke-width="2.5" stroke-linecap="round" />
+                </svg>
+              </div>
+
+              <!-- Info Icon -->
+              <div v-if="toastType === 'info'">
+                <svg
+                  width="32"
+                  height="32"
+                  viewBox="0 0 32 32"
+                  fill="none"
+                  xmlns="http://www.w3.org/2000/svg"
+                >
+                  <circle cx="16" cy="16" r="14" stroke="white" stroke-width="2" fill="none" />
+                  <path d="M16 12V16M16 20V21" stroke="white" stroke-width="2.5" stroke-linecap="round" />
+                </svg>
+              </div>
+            </div>
+
+            <!-- Message -->
+            <div class="flex-1 font-medium text-[15px] leading-snug">
+              {{ toastMessage }}
+            </div>
+
+            <!-- Close button -->
+            <button
+              class="flex-shrink-0 p-1 hover:bg-white/10 rounded-lg transition-colors"
+              @click="showToast = false"
+            >
+              <svg
+                width="16"
+                height="16"
+                viewBox="0 0 16 16"
+                fill="none"
+                xmlns="http://www.w3.org/2000/svg"
+              >
+                <path d="M12 4L4 12M4 4L12 12" stroke="white" stroke-width="2" stroke-linecap="round" />
+              </svg>
+            </button>
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
   </PrivateView>
 </template>
 
@@ -2333,5 +3758,104 @@ const filteredMembers = computed(() => {
   flex: 1;
   min-height: 0;
   background: #F0F4F9;
+}
+
+/* Toast Animations */
+@keyframes scale-in {
+  from {
+    transform: scale(0);
+    opacity: 0;
+  }
+  to {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+@keyframes draw-circle {
+  from {
+    stroke-dasharray: 0 100;
+  }
+  to {
+    stroke-dasharray: 88 100;
+  }
+}
+
+@keyframes draw-check {
+  from {
+    stroke-dasharray: 0 50;
+    opacity: 0;
+  }
+  to {
+    stroke-dasharray: 50 50;
+    opacity: 1;
+  }
+}
+
+.animate-scale-in {
+  animation: scale-in 0.3s ease-out;
+}
+
+.animate-draw-circle {
+  stroke-dasharray: 88 100;
+  animation: draw-circle 0.4s ease-out;
+}
+
+.animate-draw-check {
+  stroke-dasharray: 50 50;
+  animation: draw-check 0.3s ease-out 0.2s both;
+}
+
+/* Context menu styles */
+.context-menu {
+  animation: fadeIn 0.15s ease-out;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+/* Reply preview bar */
+.reply-preview-bar {
+  position: relative;
+  z-index: 9;
+  animation: slideDown 0.2s ease-out;
+}
+
+@keyframes slideDown {
+  from {
+    opacity: 0;
+    transform: translateY(-10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Selection mode styles */
+.message-selectable {
+  cursor: pointer;
+  user-select: none;
+}
+
+.message-selected {
+  background-color: #EFF6FF !important;
+  border-left: 4px solid #3B82F6;
+}
+
+.selection-checkbox {
+  transition: all 0.2s ease;
+}
+
+.selection-checkbox:hover {
+  transform: scale(1.1);
 }
 </style>
