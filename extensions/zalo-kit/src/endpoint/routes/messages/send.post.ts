@@ -27,7 +27,7 @@ export default defineEventHandler(async (context, { req, res }) => {
   }
 
   try {
-    const { conversationId, message, content, clientId, senderId, attachments } = req.body as {
+    const { conversationId, message, content, clientId, senderId, attachments, quote } = req.body as {
       conversationId: string
       message?: string
       content?: string
@@ -40,6 +40,14 @@ export default defineEventHandler(async (context, { req, res }) => {
         type: string
         size: number
       }>
+      quote?: {
+        content: string
+        msgType: string
+        uidFrom: string
+        msgId: string
+        cliMsgId?: string
+        ts?: string
+      }
     }
     const messageContent = message || content
 
@@ -142,8 +150,28 @@ export default defineEventHandler(async (context, { req, res }) => {
     try {
       // Send text message if provided
       if (messageContent) {
+        // Build message payload
+        const messagePayload: any = { msg: messageContent }
+
+        // Add quote if replying to a message
+        if (quote) {
+          console.log('[Endpoint /send] Quote data received:', JSON.stringify(quote, null, 2))
+
+          // Send quote fields to Zalo API (cliMsgId is required)
+          messagePayload.quote = {
+            content: quote.content,
+            msgType: quote.msgType,
+            uidFrom: quote.uidFrom,
+            msgId: quote.msgId,
+            cliMsgId: quote.cliMsgId,
+            ts: quote.ts,
+          }
+
+          console.log('[Endpoint /send] Full messagePayload to Zalo:', JSON.stringify(messagePayload, null, 2))
+        }
+
         zaloResult = await zaloService.sendMessage(
-          { msg: messageContent },
+          messagePayload,
           zaloThreadId,
           threadType,
         )
@@ -249,7 +277,19 @@ export default defineEventHandler(async (context, { req, res }) => {
         || zaloResult?.data?.msgId
         || `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
 
-    const clientMsgId = clientId || messageId
+    // Debug: Log Zalo API response structure
+    console.log('[Endpoint /send] Zalo API response:', JSON.stringify(zaloResult, null, 2))
+
+    // Extract cliMsgId from Zalo API response (priority order):
+    // 1. zaloResult.data.cliMsgId (Zalo's cliMsgId from response)
+    // 2. clientId from frontend (optimistic ID)
+    // 3. messageId as fallback
+    const clientMsgId = zaloResult?.data?.cliMsgId || clientId || messageId
+    console.log('[Endpoint /send] Extracted clientMsgId:', clientMsgId, 'from:', {
+      'zaloResult.data.cliMsgId': zaloResult?.data?.cliMsgId,
+      'clientId': clientId,
+      'messageId': messageId,
+    })
 
     // Get ItemsService for users
     const usersService = new context.services.ItemsService('zalo_users', {
@@ -309,6 +349,8 @@ export default defineEventHandler(async (context, { req, res }) => {
         is_edited: false,
         is_undone: false,
         raw_data: zaloResult,
+        // Save reply_to_message_id if this is a reply
+        reply_to_message_id: quote?.msgId || null,
       }
 
       // Use ItemsService to trigger WebSocket events
