@@ -5,13 +5,15 @@
     "moduleResolution": "Bundler",
     "resolveJsonModule": true,
     "types": [
-      "vitest/globals"
+      "vitest/globals",
+      "vue"
     ],
     "allowSyntheticDefaultImports": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["./src/**/*.ts", "./src/**/*.d.ts", "./src/**/*.vue"],
-  "vueCompilerOptions": {
-    "strictTemplates": true
-  }
+  "include": [
+    "./src/**/*.d.ts",
+    "./src/**/*.ts",
+    "./src/**/*.vue"
+  ]
 }

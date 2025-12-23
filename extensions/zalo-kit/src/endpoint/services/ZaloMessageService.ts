@@ -119,8 +119,15 @@ class ZaloMessageService {
     return sendMessage(content, threadId, threadType)
   }
 
-  async sendImage(imageUrl: string, threadId: string, threadType: number): Promise<any> {
-    return sendImage(imageUrl, threadId, threadType)
+  async sendImage(
+    imageUrl: string,
+    threadId: string,
+    threadType: number,
+    providedWidth?: number,
+    providedHeight?: number,
+    providedBuffer?: InstanceType<typeof import('node:buffer').Buffer>,
+  ): Promise<any> {
+    return sendImage(imageUrl, threadId, threadType, providedWidth, providedHeight, providedBuffer)
   }
 
   async forwardMessage(
