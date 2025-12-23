@@ -153,7 +153,7 @@ const {
   isUploading,
   FILE_CONFIGS,
   MAX_FILES,
-} = useFileUpload()
+} = useFileUpload(api)
 const fileInput = ref<HTMLInputElement | null>(null)
 const selectedFiles = ref<File[]>([])
 const showFilePreviewDialog = ref(false)
@@ -484,7 +484,7 @@ async function sendMessage() {
     // Build payload
     const payload: any = {
       conversationId: activeConversationId.value,
-      message: content || (attachmentsToSend.length > 0 ? `📎 ${attachmentsToSend.length} file(s)` : ''),
+      message: content || '',
       attachments: attachmentsToSend.map(att => ({
         file_id: att.id,
         url: att.url,
@@ -506,7 +506,7 @@ async function sendMessage() {
     // Update conversation preview
     const now = new Date().toISOString()
     updateConversationOnNewMessage(activeConversationId.value, {
-      content: content || `📎 ${attachmentsToSend.length} file(s)`,
+      content: content || (attachmentsToSend.length > 0 ? '📎 Attachment' : ''),
       sent_at: now,
     })
 
@@ -1325,6 +1325,298 @@ async function disconnectWebSocket() {
   }
 }
 
+// function handleNewMessage(data: any) {
+//   // Extract message data (could be wrapped or direct)
+//   const messageData = data.message || data.data || data
+//   const conversationId = data.conversationId || messageData.conversation_id
+
+//   console.log('[UI] handleNewMessage called with full data:', {
+//     rawData: data,
+//     extractedMessageData: messageData,
+//     extractedConversationId: conversationId,
+//     messageId: messageData?.id,
+//     activeConversationId: activeConversationId.value,
+//     replyToMessageId: messageData?.reply_to_message_id,
+//     replyToType: typeof messageData?.reply_to_message_id,
+//     hasReplyTo: !!messageData?.reply_to_message_id,
+//     messageDataKeys: Object.keys(messageData || {}),
+//   })
+
+//   // ✅ COMPREHENSIVE FILTER: Block system events (delete/undo notifications)
+//   // System events have signature: type + actionType + (clientDelMsgId OR globalDelMsgId)
+//   const messageText = messageData.content || messageData.text || ''
+
+//   if (messageText && messageText.trim()) {
+//     let contentToCheck = messageText.trim()
+//     let maxDepth = 3
+
+//     // Multi-level JSON unwrapping
+//     while (maxDepth > 0 && (contentToCheck.startsWith('{') || contentToCheck.startsWith('['))) {
+//       try {
+//         const parsed = JSON.parse(contentToCheck)
+//         const data = Array.isArray(parsed) ? parsed[0] : parsed
+
+//         // Check comprehensive system event signature
+//         if (typeof data === 'object' && data !== null) {
+//           const hasSystemEventSignature = (
+//             (data.type !== undefined && data.actionType !== undefined)
+//             && (data.clientDelMsgId !== undefined || data.globalDelMsgId !== undefined)
+//           )
+
+//           if (hasSystemEventSignature) {
+//             console.log('[UI] ✅ BLOCKING real-time system event:', {
+//               messageId: messageData.id,
+//               type: data.type,
+//               actionType: data.actionType,
+//             })
+
+//             // Extract the message ID to delete
+//             const msgIdToDelete = data.globalDelMsgId || data.clientDelMsgId
+//             if (msgIdToDelete) {
+//               // Remove the deleted message from UI
+//               const index = messages.value.findIndex(m => m.id === String(msgIdToDelete))
+//               if (index !== -1) {
+//                 console.log('[UI] Removing deleted message from UI:', msgIdToDelete)
+//                 messages.value.splice(index, 1)
+//               }
+//             }
+
+//             // Don't add this system event message to UI
+//             return
+//           }
+//         }
+
+//         // Try to unwrap one more level
+//         if (typeof parsed === 'string') {
+//           contentToCheck = parsed.trim()
+//         }
+//         else if (typeof data === 'string') {
+//           contentToCheck = data.trim()
+//         }
+//         else {
+//           break
+//         }
+//       }
+//       catch {
+//         break
+//       }
+
+//       maxDepth--
+//     }
+//   }
+
+//   if (conversationId !== activeConversationId.value) {
+//     console.log('[UI] Message not for active conversation, skipping UI update')
+//     // Still update conversation preview even if not active
+//     updateConversationOnNewMessage(conversationId, messageData)
+//     return
+//   }
+
+//   const messageId = messageData.id
+//   const clientId = messageData.client_id || messageData.clientId
+
+//   // Check if already processed
+//   if (processedMessageIds.has(messageId)) {
+//     return
+//   }
+
+//   processedMessageIds.add(messageId)
+
+//   // Check if this is replacing an optimistic update
+//   if (clientId) {
+//     const optimisticIndex = messages.value.findIndex(m => m.clientId === clientId)
+//     if (optimisticIndex !== -1) {
+//       // Replace optimistic message with real one
+//       const senderIdRaw = messageData.sender_id || messageData.senderId
+//       const senderId = typeof senderIdRaw === 'object' ? senderIdRaw?.id : senderIdRaw
+//       const senderName = typeof senderIdRaw === 'object' ? senderIdRaw?.display_name : (messageData.sender_name || messageData.senderName || 'Unknown')
+//       const senderAvatar = typeof senderIdRaw === 'object' ? senderIdRaw?.avatar_url : messageData.avatar
+//       const direction = senderId === currentUserId.value ? 'out' : 'in'
+
+//       // Build quote object if this is a reply
+//       let quoteData = null
+//       if (messageData.reply_to_message_id) {
+//         if (typeof messageData.reply_to_message_id === 'object') {
+//           // reply_to_message_id is already expanded object
+//           const quotedMsg = messageData.reply_to_message_id
+//           quoteData = {
+//             msgId: quotedMsg.id,
+//             content: quotedMsg.content || '',
+//             senderName: quotedMsg.sender_id?.display_name || 'Unknown',
+//             avatar: quotedMsg.sender_id?.avatar_url || null,
+//           }
+//           console.log('[UI] Built quote data from object (replace optimistic):', quoteData)
+//         }
+//         else if (typeof messageData.reply_to_message_id === 'string') {
+//           // reply_to_message_id is just an ID string, find the message in local messages
+//           const quotedMsg = messages.value.find(m => m.id === messageData.reply_to_message_id)
+//           if (quotedMsg) {
+//             quoteData = {
+//               msgId: quotedMsg.id,
+//               content: quotedMsg.text || '',
+//               senderName: quotedMsg.senderName || 'Unknown',
+//               avatar: quotedMsg.avatar || null,
+//             }
+//             console.log('[UI] Built quote data from local message (replace optimistic):', quoteData)
+//           }
+//           else {
+//             console.log('[UI] Could not find quoted message in local messages:', messageData.reply_to_message_id)
+//           }
+//         }
+//       }
+
+//       messages.value[optimisticIndex] = {
+//         id: messageId,
+//         direction,
+//         text: messageData.content || messageData.text || '',
+//         senderName,
+//         senderId,
+//         time: messageData.sent_at || messageData.time || new Date().toISOString(),
+//         avatar: senderAvatar,
+//         status: direction === 'out' ? 'sent' : undefined,
+//         files: attachments,
+//         reactions: messageData.reactions || [],
+//         isEdited: messageData.is_edited || messageData.isEdited || false,
+//         isUndone: messageData.is_undone || messageData.isUndone || false,
+//         clientId,
+//         rawData: messageData.raw_data || messageData.rawData || null,
+//         quote: quoteData,
+//       }
+//       return
+//     }
+//   }
+
+//   // Check if message already exists (by ID)
+//   const exists = messages.value.some(m => m.id === messageId)
+//   if (exists) {
+//     return
+//   }
+
+//   // Add new message
+//   const senderIdRaw = messageData.sender_id || messageData.senderId
+//   const senderId = typeof senderIdRaw === 'object' ? senderIdRaw?.id : senderIdRaw
+//   const senderName = typeof senderIdRaw === 'object' ? senderIdRaw?.display_name : (messageData.sender_name || messageData.senderName || 'Unknown')
+//   const senderAvatar = typeof senderIdRaw === 'object' ? senderIdRaw?.avatar_url : messageData.avatar
+//   const direction = senderId === currentUserId.value ? 'out' : 'in'
+
+//   // Build quote object if this is a reply
+//   let quoteData = null
+//   if (messageData.reply_to_message_id) {
+//     if (typeof messageData.reply_to_message_id === 'object') {
+//       // reply_to_message_id is already expanded object
+//       const quotedMsg = messageData.reply_to_message_id
+//       quoteData = {
+//         msgId: quotedMsg.id,
+//         content: quotedMsg.content || '',
+//         senderName: quotedMsg.sender_id?.display_name || 'Unknown',
+//         avatar: quotedMsg.sender_id?.avatar_url || null,
+//       }
+//       console.log('[UI] Built quote data from object (push new):', quoteData)
+//     }
+//     else if (typeof messageData.reply_to_message_id === 'string') {
+//       // reply_to_message_id is just an ID string, find the message in local messages
+//       const quotedMsg = messages.value.find(m => m.id === messageData.reply_to_message_id)
+//       if (quotedMsg) {
+//         quoteData = {
+//           msgId: quotedMsg.id,
+//           content: quotedMsg.text || '',
+//           senderName: quotedMsg.senderName || 'Unknown',
+//           avatar: quotedMsg.avatar || null,
+//         }
+//         console.log('[UI] Built quote data from local message (push new):', quoteData)
+//       }
+//       else {
+//         console.log('[UI] Could not find quoted message in local messages:', messageData.reply_to_message_id)
+//       }
+//     }
+//   }
+
+//   // Try to get attachments - fetch async if needed
+//   let attachments = messageData.attachments || []
+
+//   // ✅ Filter JSON content - same logic as API endpoint
+//   let textContent = messageData.content || messageData.text || ''
+//   if (textContent) {
+//     const trimmed = textContent.trim()
+//     // Check if it's a JSON object string (starts with { or [)
+//     if ((trimmed.startsWith('{') && trimmed.endsWith('}'))
+//       || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+//       try {
+//         // Try to parse - if successful, it's JSON, don't display
+//         JSON.parse(trimmed)
+//         textContent = '' // Hide JSON object
+//       }
+//       catch {
+//         // Not valid JSON, display as-is
+//       }
+//     }
+//   }
+
+//   // If no attachments in message data, try to fetch them
+//   if ((!attachments || attachments.length === 0) && messageId) {
+//     // Fetch attachments asynchronously
+//     ;(async () => {
+//       try {
+//         const attachmentsResponse = await api.get(`/items/zalo_attachments`, {
+//           params: {
+//             filter: { message_id: { _eq: messageId } },
+//             fields: ['id', 'url', 'file_name', 'mime_type', 'file_size', 'width', 'height', 'thumbnail_url'],
+//           },
+//         })
+
+//         if (attachmentsResponse?.data?.data && attachmentsResponse.data.data.length > 0) {
+//           const baseUrl = window.location.origin
+//           const fetchedAttachments = attachmentsResponse.data.data.map((att: any) => ({
+//             id: att.id,
+//             url: att.url.startsWith('http') ? att.url : `${baseUrl}${att.url}`,
+//             filename: att.file_name,
+//             type: att.mime_type,
+//             size: att.file_size,
+//             width: att.width,
+//             height: att.height,
+//             thumbnail: att.thumbnail_url || att.url,
+//           }))
+
+//           // Update message with attachments
+//           const msgIndex = messages.value.findIndex(m => m.id === messageId)
+//           if (msgIndex !== -1) {
+//             messages.value[msgIndex].files = fetchedAttachments
+//           }
+//         }
+//       }
+//       catch (error) {
+//         console.error('Failed to fetch attachments for message:', messageId, error)
+//       }
+//     })()
+//   }
+
+//   messages.value.push({
+//     id: messageId,
+//     direction,
+//     text: textContent,
+//     senderName,
+//     senderId,
+//     time: messageData.sent_at || messageData.time || new Date().toISOString(),
+//     avatar: senderAvatar,
+//     status: direction === 'out' ? 'sent' : undefined,
+//     files: attachments,
+//     reactions: messageData.reactions || [],
+//     isEdited: messageData.is_edited || messageData.isEdited || false,
+//     isUndone: messageData.is_undone || messageData.isUndone || false,
+//     clientId,
+//     rawData: messageData.raw_data || messageData.rawData || null,
+//     quote: quoteData,
+//   })
+
+//   updateConversationOnNewMessage(conversationId, messageData)
+
+//   // Auto scroll to bottom
+//   nextTick(() => {
+//     if (messagesContainer.value) {
+//       messagesContainer.value.scrollTop = messagesContainer.value.scrollHeight
+//     }
+//   })
+// }
 function handleNewMessage(data: any) {
   // Extract message data (could be wrapped or direct)
   const messageData = data.message || data.data || data
@@ -1337,26 +1629,21 @@ function handleNewMessage(data: any) {
     messageId: messageData?.id,
     activeConversationId: activeConversationId.value,
     replyToMessageId: messageData?.reply_to_message_id,
-    replyToType: typeof messageData?.reply_to_message_id,
-    hasReplyTo: !!messageData?.reply_to_message_id,
-    messageDataKeys: Object.keys(messageData || {}),
+    hasAttachments: !!(messageData?.attachments?.length),
   })
 
-  // ✅ COMPREHENSIVE FILTER: Block system events (delete/undo notifications)
-  // System events have signature: type + actionType + (clientDelMsgId OR globalDelMsgId)
+  // ✅ COMPREHENSIVE FILTER: Block system events
   const messageText = messageData.content || messageData.text || ''
 
   if (messageText && messageText.trim()) {
     let contentToCheck = messageText.trim()
     let maxDepth = 3
 
-    // Multi-level JSON unwrapping
     while (maxDepth > 0 && (contentToCheck.startsWith('{') || contentToCheck.startsWith('['))) {
       try {
         const parsed = JSON.parse(contentToCheck)
         const data = Array.isArray(parsed) ? parsed[0] : parsed
 
-        // Check comprehensive system event signature
         if (typeof data === 'object' && data !== null) {
           const hasSystemEventSignature = (
             (data.type !== undefined && data.actionType !== undefined)
@@ -1370,23 +1657,18 @@ function handleNewMessage(data: any) {
               actionType: data.actionType,
             })
 
-            // Extract the message ID to delete
             const msgIdToDelete = data.globalDelMsgId || data.clientDelMsgId
             if (msgIdToDelete) {
-              // Remove the deleted message from UI
               const index = messages.value.findIndex(m => m.id === String(msgIdToDelete))
               if (index !== -1) {
                 console.log('[UI] Removing deleted message from UI:', msgIdToDelete)
                 messages.value.splice(index, 1)
               }
             }
-
-            // Don't add this system event message to UI
             return
           }
         }
 
-        // Try to unwrap one more level
         if (typeof parsed === 'string') {
           contentToCheck = parsed.trim()
         }
@@ -1407,7 +1689,6 @@ function handleNewMessage(data: any) {
 
   if (conversationId !== activeConversationId.value) {
     console.log('[UI] Message not for active conversation, skipping UI update')
-    // Still update conversation preview even if not active
     updateConversationOnNewMessage(conversationId, messageData)
     return
   }
@@ -1422,49 +1703,84 @@ function handleNewMessage(data: any) {
 
   processedMessageIds.add(messageId)
 
+  // ✅ Helper function to build quote data
+  const buildQuoteData = (replyToData: any) => {
+    if (!replyToData)
+      return null
+
+    if (typeof replyToData === 'object') {
+      return {
+        msgId: replyToData.id,
+        content: replyToData.content || '',
+        senderName: replyToData.sender_id?.display_name || 'Unknown',
+        avatar: replyToData.sender_id?.avatar_url || null,
+      }
+    }
+    else if (typeof replyToData === 'string') {
+      const quotedMsg = messages.value.find(m => m.id === replyToData)
+      if (quotedMsg) {
+        return {
+          msgId: quotedMsg.id,
+          content: quotedMsg.text || '',
+          senderName: quotedMsg.senderName || 'Unknown',
+          avatar: quotedMsg.avatar || null,
+        }
+      }
+    }
+    return null
+  }
+
+  // ✅ Helper function to fetch attachments asynchronously
+  const fetchAttachmentsForMessage = async (msgId: string) => {
+    try {
+      const attachmentsResponse = await api.get(`/items/zalo_attachments`, {
+        params: {
+          filter: { message_id: { _eq: msgId } },
+          fields: ['id', 'url', 'file_name', 'mime_type', 'file_size', 'width', 'height', 'thumbnail_url'],
+        },
+      })
+
+      if (attachmentsResponse?.data?.data && attachmentsResponse.data.data.length > 0) {
+        const baseUrl = window.location.origin
+        return attachmentsResponse.data.data.map((att: any) => ({
+          id: att.id,
+          url: att.url.startsWith('http') ? att.url : `${baseUrl}${att.url}`,
+          filename: att.file_name,
+          type: att.mime_type,
+          size: att.file_size,
+          width: att.width,
+          height: att.height,
+          thumbnail: att.thumbnail_url || att.url,
+        }))
+      }
+      return []
+    }
+    catch (error) {
+      console.error('Failed to fetch attachments for message:', msgId, error)
+      return []
+    }
+  }
+
   // Check if this is replacing an optimistic update
   if (clientId) {
     const optimisticIndex = messages.value.findIndex(m => m.clientId === clientId)
     if (optimisticIndex !== -1) {
-      // Replace optimistic message with real one
+      console.log('[UI] Replacing optimistic message with real one')
+
+      // Extract sender info
       const senderIdRaw = messageData.sender_id || messageData.senderId
       const senderId = typeof senderIdRaw === 'object' ? senderIdRaw?.id : senderIdRaw
       const senderName = typeof senderIdRaw === 'object' ? senderIdRaw?.display_name : (messageData.sender_name || messageData.senderName || 'Unknown')
       const senderAvatar = typeof senderIdRaw === 'object' ? senderIdRaw?.avatar_url : messageData.avatar
       const direction = senderId === currentUserId.value ? 'out' : 'in'
 
-      // Build quote object if this is a reply
-      let quoteData = null
-      if (messageData.reply_to_message_id) {
-        if (typeof messageData.reply_to_message_id === 'object') {
-          // reply_to_message_id is already expanded object
-          const quotedMsg = messageData.reply_to_message_id
-          quoteData = {
-            msgId: quotedMsg.id,
-            content: quotedMsg.content || '',
-            senderName: quotedMsg.sender_id?.display_name || 'Unknown',
-            avatar: quotedMsg.sender_id?.avatar_url || null,
-          }
-          console.log('[UI] Built quote data from object (replace optimistic):', quoteData)
-        }
-        else if (typeof messageData.reply_to_message_id === 'string') {
-          // reply_to_message_id is just an ID string, find the message in local messages
-          const quotedMsg = messages.value.find(m => m.id === messageData.reply_to_message_id)
-          if (quotedMsg) {
-            quoteData = {
-              msgId: quotedMsg.id,
-              content: quotedMsg.text || '',
-              senderName: quotedMsg.senderName || 'Unknown',
-              avatar: quotedMsg.avatar || null,
-            }
-            console.log('[UI] Built quote data from local message (replace optimistic):', quoteData)
-          }
-          else {
-            console.log('[UI] Could not find quoted message in local messages:', messageData.reply_to_message_id)
-          }
-        }
-      }
+      // Build quote data
+      const quoteData = buildQuoteData(messageData.reply_to_message_id)
 
+      // ✅ Get attachments - try from messageData first, then fetch
+      let attachments = messageData.attachments || []
+
+      // ✅ CRITICAL FIX: Replace optimistic message immediately
       messages.value[optimisticIndex] = {
         id: messageId,
         direction,
@@ -1474,7 +1790,7 @@ function handleNewMessage(data: any) {
         time: messageData.sent_at || messageData.time || new Date().toISOString(),
         avatar: senderAvatar,
         status: direction === 'out' ? 'sent' : undefined,
-        files: messageData.attachments || [],
+        files: attachments, // Use current attachments (might be empty)
         reactions: messageData.reactions || [],
         isEdited: messageData.is_edited || messageData.isEdited || false,
         isUndone: messageData.is_undone || messageData.isUndone || false,
@@ -1482,7 +1798,23 @@ function handleNewMessage(data: any) {
         rawData: messageData.raw_data || messageData.rawData || null,
         quote: quoteData,
       }
-      return
+
+      // ✅ CRITICAL FIX: Fetch attachments asynchronously if not present
+      if ((!attachments || attachments.length === 0) && messageId) {
+        console.log('[UI] Fetching attachments for replaced optimistic message:', messageId)
+        ;(async () => {
+          const fetchedAttachments = await fetchAttachmentsForMessage(messageId)
+          if (fetchedAttachments.length > 0) {
+            const msgIndex = messages.value.findIndex(m => m.id === messageId)
+            if (msgIndex !== -1) {
+              console.log('[UI] ✅ Updated message with fetched attachments:', fetchedAttachments.length)
+              messages.value[msgIndex].files = fetchedAttachments
+            }
+          }
+        })()
+      }
+
+      return // ✅ Exit after replacing optimistic message
     }
   }
 
@@ -1499,83 +1831,33 @@ function handleNewMessage(data: any) {
   const senderAvatar = typeof senderIdRaw === 'object' ? senderIdRaw?.avatar_url : messageData.avatar
   const direction = senderId === currentUserId.value ? 'out' : 'in'
 
-  // Build quote object if this is a reply
-  let quoteData = null
-  if (messageData.reply_to_message_id) {
-    if (typeof messageData.reply_to_message_id === 'object') {
-      // reply_to_message_id is already expanded object
-      const quotedMsg = messageData.reply_to_message_id
-      quoteData = {
-        msgId: quotedMsg.id,
-        content: quotedMsg.content || '',
-        senderName: quotedMsg.sender_id?.display_name || 'Unknown',
-        avatar: quotedMsg.sender_id?.avatar_url || null,
-      }
-      console.log('[UI] Built quote data from object (push new):', quoteData)
-    }
-    else if (typeof messageData.reply_to_message_id === 'string') {
-      // reply_to_message_id is just an ID string, find the message in local messages
-      const quotedMsg = messages.value.find(m => m.id === messageData.reply_to_message_id)
-      if (quotedMsg) {
-        quoteData = {
-          msgId: quotedMsg.id,
-          content: quotedMsg.text || '',
-          senderName: quotedMsg.senderName || 'Unknown',
-          avatar: quotedMsg.avatar || null,
-        }
-        console.log('[UI] Built quote data from local message (push new):', quoteData)
-      }
-      else {
-        console.log('[UI] Could not find quoted message in local messages:', messageData.reply_to_message_id)
-      }
-    }
-  }
+  // Build quote data
+  const quoteData = buildQuoteData(messageData.reply_to_message_id)
 
-  // Try to get attachments - fetch async in background if needed
+  // Get attachments
   let attachments = messageData.attachments || []
 
-  // If no attachments in message data, try to fetch them
-  if ((!attachments || attachments.length === 0) && messageId) {
-    // Fetch attachments asynchronously
-    ;(async () => {
+  // ✅ Filter JSON content
+  let textContent = messageData.content || messageData.text || ''
+  if (textContent) {
+    const trimmed = textContent.trim()
+    if ((trimmed.startsWith('{') && trimmed.endsWith('}'))
+      || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
       try {
-        const attachmentsResponse = await api.get(`/items/zalo_attachments`, {
-          params: {
-            filter: { message_id: { _eq: messageId } },
-            fields: ['id', 'url', 'file_name', 'mime_type', 'file_size', 'width', 'height', 'thumbnail_url'],
-          },
-        })
-
-        if (attachmentsResponse?.data?.data && attachmentsResponse.data.data.length > 0) {
-          const baseUrl = window.location.origin
-          const fetchedAttachments = attachmentsResponse.data.data.map((att: any) => ({
-            id: att.id,
-            url: att.url.startsWith('http') ? att.url : `${baseUrl}${att.url}`,
-            filename: att.file_name,
-            type: att.mime_type,
-            size: att.file_size,
-            width: att.width,
-            height: att.height,
-            thumbnail: att.thumbnail_url || att.url,
-          }))
-
-          // Update message with attachments
-          const msgIndex = messages.value.findIndex(m => m.id === messageId)
-          if (msgIndex !== -1) {
-            messages.value[msgIndex].files = fetchedAttachments
-          }
-        }
+        JSON.parse(trimmed)
+        textContent = ''
       }
-      catch (error) {
-        console.error('Failed to fetch attachments for message:', messageId, error)
+      catch {
+        // Not valid JSON, display as-is
       }
-    })()
+    }
   }
 
+  // ✅ Add new message to list
   messages.value.push({
     id: messageId,
     direction,
-    text: messageData.content || messageData.text || '',
+    text: textContent,
     senderName,
     senderId,
     time: messageData.sent_at || messageData.time || new Date().toISOString(),
@@ -1590,6 +1872,21 @@ function handleNewMessage(data: any) {
     quote: quoteData,
   })
 
+  // ✅ Fetch attachments asynchronously if not present
+  if ((!attachments || attachments.length === 0) && messageId) {
+    console.log('[UI] Fetching attachments for new message:', messageId)
+    ;(async () => {
+      const fetchedAttachments = await fetchAttachmentsForMessage(messageId)
+      if (fetchedAttachments.length > 0) {
+        const msgIndex = messages.value.findIndex(m => m.id === messageId)
+        if (msgIndex !== -1) {
+          console.log('[UI] ✅ Updated new message with fetched attachments:', fetchedAttachments.length)
+          messages.value[msgIndex].files = fetchedAttachments
+        }
+      }
+    })()
+  }
+
   updateConversationOnNewMessage(conversationId, messageData)
 
   // Auto scroll to bottom
@@ -1599,7 +1896,6 @@ function handleNewMessage(data: any) {
     }
   })
 }
-
 function handleConversationUpdate(data: any) {
   const conversationData = data.data
   const conversationId = conversationData.id
@@ -2061,7 +2357,24 @@ function updateConversationOnNewMessage(conversationId: string, message: any) {
   if (!conversation)
     return
 
-  const messagePreview = message.content || message.text || ''
+  let messagePreview = message.content || message.text || ''
+
+  // ✅ Filter JSON content before displaying in conversation list
+  if (messagePreview) {
+    const trimmed = messagePreview.trim()
+    // Check if it's a JSON object/array string
+    if ((trimmed.startsWith('{') && trimmed.endsWith('}'))
+      || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+      try {
+        JSON.parse(trimmed)
+        // It's valid JSON (Zalo attachment metadata), replace with attachment indicator
+        messagePreview = '📎 Attachment'
+      }
+      catch {
+        // Not valid JSON, keep original text
+      }
+    }
+  }
   const messageTime = message.sent_at || message.time || message.sentAt || new Date().toISOString()
   const messageTimestamp = new Date(messageTime).getTime()
 
@@ -2167,7 +2480,7 @@ async function confirmAndUploadFiles() {
 
   try {
     // Use the composable to upload files
-    const { uploadFiles } = useFileUpload()
+    const { uploadFiles } = useFileUpload(api)
 
     console.log('📤 Uploading files to Directus...')
     const result = await uploadFiles(selectedFiles.value, activeConversationId.value)
